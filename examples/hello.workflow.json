@@ -1,0 +1,23 @@
+{
+  "version": "1",
+  "name": "hello",
+  "inputs": { "name": "string" },
+  "policy": { "network": false, "filesystem": false, "max_parallel": 2 },
+  "steps": [
+    {
+      "kind": "agent",
+      "id": "greet",
+      "agent": "hermes.greeter",
+      "input": { "subject": "$ref:inputs.name" },
+      "output_schema": { "greeting": "string" }
+    },
+    {
+      "kind": "agent",
+      "id": "shout",
+      "agent": "hermes.uppercaser",
+      "input": { "text": "$ref:greet.output.greeting" },
+      "output_schema": { "result": "string" },
+      "depends_on": ["greet"]
+    }
+  ]
+}
