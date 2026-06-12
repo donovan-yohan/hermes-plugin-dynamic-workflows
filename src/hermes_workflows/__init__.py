@@ -1,24 +1,27 @@
 """hermes_workflows — sandboxed, deterministic workflow orchestration for Hermes.
 
-A pure-stdlib (Python 3.11) Hermes agent plugin exposing three primitives for
-declarative, JS-like orchestration over Hermes agents:
+A pure-stdlib (Python 3.11) Hermes agent plugin exposing a model-facing
+``workflow`` facade plus debug primitives for declarative, script-led
+orchestration over Hermes agents and Kanban-backed awaitables:
 
+* :func:`workflow` — validate, run, or inspect a workflow through one entry point.
 * :func:`workflow_validate` — statically check a definition (parse, schema,
   sandbox-policy lint) without running anything.
 * :func:`workflow_run` — execute a validated definition in the deterministic,
-  network-free runtime, fanning out to Hermes agents via an injected
+  network-free runtime, fanning out through an injected
   :class:`~hermes_workflows.agents.AgentRunner`.
 * :func:`workflow_status` — query a run's state/progress by id from a pluggable
-  run registry (in-memory by default).
+  run registry (in-memory by default, file-backed for plugin persistence).
 
 The runtime is a SKELETON: it interprets declarative JSON, never executes code,
-and enforces a default-deny capability policy (no network, no filesystem). See
-:mod:`hermes_workflows.sandbox` and ``DESIGN.md`` for the security model.
+and enforces a default-deny capability policy. Workflow definitions get no direct
+network or filesystem authority; parent-owned stores may persist run metadata.
+See :mod:`hermes_workflows.sandbox` and ``DESIGN.md`` for the security model.
 """
 
 from __future__ import annotations
 
-from .primitives import workflow_validate, workflow_run, workflow_status
+from .primitives import workflow, workflow_validate, workflow_run, workflow_status
 from .models import (
     Diagnostic,
     ValidationResult,
@@ -27,10 +30,18 @@ from .models import (
     StepStatus,
     Progress,
 )
-from .agents import AgentRunner, StubAgentRunner, KNOWN_AGENTS, is_known_agent
+from .agents import (
+    AgentRunner,
+    StubAgentRunner,
+    KNOWN_AGENTS,
+    is_known_agent,
+    kanban_runner_id,
+    is_kanban_runner_id,
+)
 from .registry import (
     RunStore,
     InMemoryRunStore,
+    FileRunStore,
     KanbanRunStore,
     RunRecord,
     get_default_store,
@@ -47,6 +58,7 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     # primitives
+    "workflow",
     "workflow_validate",
     "workflow_run",
     "workflow_status",
@@ -62,9 +74,12 @@ __all__ = [
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
+    "kanban_runner_id",
+    "is_kanban_runner_id",
     # registry
     "RunStore",
     "InMemoryRunStore",
+    "FileRunStore",
     "KanbanRunStore",
     "RunRecord",
     "get_default_store",

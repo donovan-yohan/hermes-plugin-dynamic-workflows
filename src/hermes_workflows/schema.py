@@ -28,10 +28,11 @@ __all__ = [
 ]
 
 SUPPORTED_VERSION = "1"
-STEP_KINDS = ("agent", "parallel", "pipeline", "phase")
+STEP_KINDS = ("agent", "kanban_agent", "parallel", "pipeline", "phase")
 
 # Keys that hold nested step lists, by kind, used for recursive descent.
 _CHILD_KEYS = {"parallel": "branches", "pipeline": "steps", "phase": "steps"}
+_EFFECT_STEP_KINDS = {"agent", "kanban_agent"}
 
 
 def parse_definition(definition: dict[str, Any] | str) -> tuple[dict[str, Any] | None, Diagnostic | None]:
@@ -169,6 +170,8 @@ def _validate_steps(
 
         if kind == "agent":
             _validate_agent_step(step, ptr, diags)
+        elif kind == "kanban_agent":
+            _validate_kanban_agent_step(step, ptr, diags)
         else:
             child_key = _CHILD_KEYS[kind]
             children = step.get(child_key)
@@ -188,6 +191,34 @@ def _validate_agent_step(step: dict[str, Any], ptr: str, diags: list[Diagnostic]
     if not isinstance(agent, str) or not agent:
         diags.append(_e(err.E_SCHEMA_STEP, "agent step requires a non-empty 'agent' id", f"{ptr}/agent"))
 
+    _validate_effect_input_contract(step, ptr, diags)
+
+
+def _validate_kanban_agent_step(step: dict[str, Any], ptr: str, diags: list[Diagnostic]) -> None:
+    """Validate the durable Kanban-backed agent awaitable step shape."""
+    profile = step.get("profile")
+    if not isinstance(profile, str) or not profile:
+        diags.append(
+            _e(err.E_SCHEMA_STEP, "kanban_agent step requires a non-empty 'profile'", f"{ptr}/profile")
+        )
+    elif not _is_identifier_safe(profile):
+        diags.append(
+            _e(err.E_SCHEMA_STEP, "kanban_agent 'profile' must be identifier-safe", f"{ptr}/profile")
+        )
+
+    if "task" not in step:
+        diags.append(_e(err.E_SCHEMA_STEP, "kanban_agent step requires 'task'", f"{ptr}/task"))
+    elif not isinstance(step["task"], (dict, str)):
+        diags.append(_e(err.E_SCHEMA_STEP, "kanban_agent 'task' must be an object or string", f"{ptr}/task"))
+
+    if "wait" in step and not isinstance(step["wait"], bool):
+        diags.append(_e(err.E_SCHEMA_STEP, "kanban_agent 'wait' must be a boolean", f"{ptr}/wait"))
+
+    _validate_effect_input_contract(step, ptr, diags)
+
+
+def _validate_effect_input_contract(step: dict[str, Any], ptr: str, diags: list[Diagnostic]) -> None:
+    """Validate fields shared by effectful leaf steps."""
     if "input" in step and not isinstance(step["input"], (dict, str)):
         diags.append(_e(err.E_SCHEMA_STEP, "'input' must be an object or a $ref string", f"{ptr}/input"))
 
@@ -216,7 +247,7 @@ def _iter_agent_steps(steps: list[Any], base_pointer: str):
             continue
         ptr = f"{base_pointer}/{i}"
         kind = step.get("kind")
-        if kind == "agent":
+        if kind in _EFFECT_STEP_KINDS:
             yield step, ptr
         elif kind in _CHILD_KEYS:
             child_key = _CHILD_KEYS[kind]

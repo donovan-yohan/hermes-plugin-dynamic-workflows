@@ -23,6 +23,8 @@ __all__ = [
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
+    "kanban_runner_id",
+    "is_kanban_runner_id",
 ]
 
 
@@ -47,9 +49,21 @@ def is_known_agent(agent_id: str) -> bool:
 
     Recognises the fixed :data:`KNOWN_AGENTS` roster plus any id under the
     reserved ``hermes.`` namespace, so example/stub workflows validate without
-    hard-coding every possible agent.
+    hard-coding every possible agent. ``kanban.<profile>`` ids are intentionally
+    excluded from ordinary agent steps; they are only produced by
+    ``kanban_agent`` through :func:`kanban_runner_id`.
     """
     return agent_id in KNOWN_AGENTS or agent_id.startswith("hermes.")
+
+
+def kanban_runner_id(profile: str) -> str:
+    """Return the reserved runner id for a Kanban-backed profile."""
+    return f"kanban.{profile}"
+
+
+def is_kanban_runner_id(agent_id: str) -> bool:
+    """Return ``True`` for reserved Kanban runner ids."""
+    return agent_id.startswith("kanban.")
 
 
 @runtime_checkable
@@ -94,6 +108,15 @@ class StubAgentRunner:
 
         if agent_id == "hermes.noop":
             return {}
+
+        if agent_id.startswith("kanban."):
+            profile = agent_id.split(".", 1)[1]
+            return {
+                "task_id": f"kb_{digest}",
+                "profile": profile,
+                "status": "succeeded",
+                "result": {"echo": dict(input), "digest": digest},
+            }
 
         # Generic echo agent (covers "hermes.echo" and any other known id).
         return {"echo": dict(input), "digest": digest}

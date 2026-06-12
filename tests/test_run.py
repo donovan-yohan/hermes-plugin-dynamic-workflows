@@ -117,7 +117,7 @@ def test_run_records_both_steps():
     assert {"greet", "shout"} <= recorded
 
     for s in status.steps:
-        assert s.kind in ("agent", "parallel", "pipeline", "phase")
+        assert s.kind in ("agent", "kanban_agent", "parallel", "pipeline", "phase")
         assert isinstance(s.status, str) and s.status
         # The two top-level steps are agent steps.
         if s.step_id in {"greet", "shout"}:
@@ -193,6 +193,37 @@ def test_validate_false_skips_gate():
     )
     assert handle.run_id
     assert len(list(store.list())) == 1
+
+
+def test_validate_false_unavailable_step_ref_fails_run():
+    """Runtime refuses impossible step refs even when static validation is skipped."""
+    store = InMemoryRunStore()
+    definition = hello_definition()
+    definition["steps"][0]["input"] = {"subject": "$ref:shout.output.result"}
+
+    handle = workflow_run(definition, inputs={"name": "world"}, registry=store, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.status == "failed"
+    assert status.error is not None
+    assert "not available" in status.error["message"]
+
+
+def test_validate_false_forward_depends_on_fails_run():
+    """Runtime refuses impossible depends_on edges even when validation is skipped."""
+    store = InMemoryRunStore()
+    definition = hello_definition()
+    definition["steps"][0]["depends_on"] = ["shout"]
+    definition["steps"][1].pop("depends_on")
+
+    handle = workflow_run(definition, inputs={"name": "world"}, registry=store, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.status == "failed"
+    assert status.error is not None
+    assert "depends on 'shout'" in status.error["message"]
 
 
 def test_default_registry_is_process_global_when_omitted():

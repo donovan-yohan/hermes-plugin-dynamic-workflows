@@ -1,13 +1,12 @@
 name: hermes-dynamic-workflows
 version: "0.1.0"
 description: >-
-  Sandboxed, JS-like orchestration over Hermes agents. Provides workflow_validate,
-  workflow_run, and workflow_status primitives with agent/parallel/pipeline/phase
-  composition, schema-validated structured output, and a default-deny sandbox
-  policy. Pure-stdlib skeleton; no runtime network or filesystem access.
+  Sandboxed, script-led orchestration over Hermes agents. Provides one model-facing
+  workflow tool backed by workflow_validate, workflow_run, and workflow_status
+  debug/operator primitives with agent/kanban_agent/parallel/pipeline/phase composition,
+  schema-validated structured output, parent-owned journaled run persistence,
+  and a default-deny sandbox policy.
 author: Hermes
 license: MIT
 provides_tools:
-  - workflow_validate
-  - workflow_run
-  - workflow_status
+  - workflow

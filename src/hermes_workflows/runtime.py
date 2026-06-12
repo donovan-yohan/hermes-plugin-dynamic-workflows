@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .agents import AgentRunner, StubAgentRunner
+from .agents import AgentRunner, StubAgentRunner, kanban_runner_id
 from .errors import SandboxPolicyError
 from .models import StepStatus
 from .registry import RunStore, utc_now_iso
@@ -76,9 +76,12 @@ def _exec_sequence(steps: list[dict[str, Any]], ctx: RunContext) -> None:
 
 def _exec_step(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Dispatch a single step by kind; return its output dict."""
+    _check_depends_on(step, ctx)
     kind = step.get("kind")
     if kind == "agent":
         return _exec_agent(step, ctx)
+    if kind == "kanban_agent":
+        return _exec_kanban_agent(step, ctx)
     if kind == "parallel":
         return _exec_parallel(step, ctx)
     if kind == "pipeline":
@@ -88,23 +91,86 @@ def _exec_step(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     raise SandboxPolicyError(f"unsupported step kind at runtime: {kind!r}")
 
 
+def _check_depends_on(step: dict[str, Any], ctx: RunContext) -> None:
+    """Fail fast when validate=False skips static dependency-order checks."""
+    step_id = step.get("id", "<unknown>")
+    for dep in step.get("depends_on", []) or []:
+        if isinstance(dep, str) and dep not in ctx.outputs:
+            raise SandboxPolicyError(
+                f"step {step_id!r} depends on {dep!r}, but that output is not available"
+            )
+
+
 def _exec_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute an ``agent`` step through the injected runner and record it."""
-    step_id = step["id"]
     agent_id = step["agent"]
+    return _exec_effect_step(
+        step,
+        ctx,
+        kind="agent",
+        agent_id=agent_id,
+        payload=_effect_input(step, ctx),
+        error_label=f"agent {agent_id!r}",
+    )
+
+
+def _exec_kanban_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
+    """Start/await a durable Kanban-backed agent task through the runner boundary.
+
+    The skeleton does not talk to Kanban directly. It normalizes the workflow
+    step into a reserved ``kanban.<profile>`` agent call so a real deployment can
+    bind that effect boundary to the Kanban backend, while tests remain
+    deterministic with :class:`StubAgentRunner`.
+    """
+    profile = step["profile"]
+    agent_id = kanban_runner_id(profile)
+    return _exec_effect_step(
+        step,
+        ctx,
+        kind="kanban_agent",
+        agent_id=agent_id,
+        payload={
+            "profile": profile,
+            "task": _resolve(step.get("task", {}), ctx),
+            "input": _effect_input(step, ctx),
+            "wait": step.get("wait", True),
+            "durable": True,
+        },
+        error_label=f"kanban agent {profile!r}",
+    )
+
+
+def _effect_input(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
+    """Resolve a leaf-effect ``input`` value into the runner payload shape."""
+    resolved = _resolve(step.get("input", {}), ctx)
+    return resolved if isinstance(resolved, dict) else {"value": resolved}
+
+
+def _exec_effect_step(
+    step: dict[str, Any],
+    ctx: RunContext,
+    *,
+    kind: str,
+    agent_id: str,
+    payload: dict[str, Any],
+    error_label: str,
+) -> dict[str, Any]:
+    """Shared lifecycle for leaf steps that cross the AgentRunner boundary."""
+    step_id = step["id"]
     status = StepStatus(
-        step_id=step_id, kind="agent", status="running", agent=agent_id, started_at=utc_now_iso()
+        step_id=step_id,
+        kind=kind,  # type: ignore[arg-type]
+        status="running",
+        agent=agent_id,
+        started_at=utc_now_iso(),
     )
     ctx.store.update_step(ctx.run_id, status)
 
     try:
-        resolved_input = _resolve(step.get("input", {}), ctx)
-        if not isinstance(resolved_input, dict):
-            resolved_input = {"value": resolved_input}
-        output = ctx.agent_runner(agent_id, resolved_input)
+        output = ctx.agent_runner(agent_id, payload)
         if not isinstance(output, dict):
             raise SandboxPolicyError(
-                f"agent {agent_id!r} returned {type(output).__name__}, expected dict"
+                f"{error_label} returned {type(output).__name__}, expected dict"
             )
         _validate_output(output, step.get("output_schema"))
     except Exception as exc:  # record failure, then re-raise for run-level handling.
@@ -230,20 +296,20 @@ def _resolve(value: Any, ctx: RunContext) -> Any:
 
     ``$ref:inputs.<key>`` resolves against ``ctx.inputs``;
     ``$ref:<step_id>.output[.<field>]`` resolves against recorded step outputs.
-    Non-ref values pass through unchanged. Unresolvable refs (which validation
-    should have caught) yield ``None`` rather than raising, keeping the
-    deterministic executor total.
+    Non-ref values pass through unchanged. Malformed or unavailable step-output
+    refs raise :class:`SandboxPolicyError` so ``validate=False`` runs cannot
+    silently consume impossible dependency edges as ``None``.
     """
     if isinstance(value, str) and value.startswith("$ref:"):
         ref = parse_ref(value)
         if not ref or ref.get("kind") == "invalid":
-            return None
+            raise SandboxPolicyError(f"malformed reference {value!r}")
         if ref["kind"] == "input":
             return ctx.inputs.get(ref["key"])
         # step output reference.
         out = ctx.outputs.get(ref["step_id"])
         if out is None:
-            return None
+            raise SandboxPolicyError(f"step output reference {value!r} is not available")
         field_path = ref.get("field")
         if not field_path:
             return out

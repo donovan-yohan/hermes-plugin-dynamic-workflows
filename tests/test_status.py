@@ -75,7 +75,7 @@ def test_status_shape_full():
     assert len(status.steps) >= 2
     for s in status.steps:
         assert isinstance(s.step_id, str) and s.step_id
-        assert s.kind in ("agent", "parallel", "pipeline", "phase")
+        assert s.kind in ("agent", "kanban_agent", "parallel", "pipeline", "phase")
         assert isinstance(s.status, str)
         # agent may be None for non-agent steps; for these it is a str.
         assert s.agent is None or isinstance(s.agent, str)

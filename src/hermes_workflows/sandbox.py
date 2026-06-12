@@ -36,7 +36,7 @@ from typing import Any
 from .models import Diagnostic
 from . import errors as err
 from . import schema as _schema
-from .agents import is_known_agent
+from .agents import is_kanban_runner_id, is_known_agent
 
 __all__ = [
     "KNOWN_CAPABILITIES",
@@ -106,6 +106,7 @@ def policy_lint(definition: dict[str, Any]) -> list[Diagnostic]:
     known_step_ids |= _collect_all_step_ids(steps)
 
     diags.extend(_lint_agent_steps(steps, declared_inputs, known_step_ids))
+    diags.extend(_lint_execution_order(steps))
     diags.extend(_lint_cycles(steps))
     return diags
 
@@ -175,8 +176,21 @@ def _lint_agent_steps(
 ) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     for step, ptr in _schema.iter_agent_steps(steps):
+        kind = step.get("kind")
         agent = step.get("agent")
-        if isinstance(agent, str) and agent and not is_known_agent(agent):
+        if kind == "agent" and isinstance(agent, str) and is_kanban_runner_id(agent):
+            diags.append(
+                Diagnostic(
+                    severity="error",
+                    code=err.E_UNKNOWN_AGENT,
+                    message=(
+                        f"reserved Kanban runner id {agent!r} cannot be called by an agent step; "
+                        "use kind='kanban_agent' with a profile instead"
+                    ),
+                    pointer=f"{ptr}/agent",
+                )
+            )
+        elif kind == "agent" and isinstance(agent, str) and agent and not is_known_agent(agent):
             diags.append(
                 Diagnostic(
                     severity="error",
@@ -191,12 +205,14 @@ def _lint_agent_steps(
                 Diagnostic(
                     severity="warning",
                     code=err.W_NO_OUTPUT_SCHEMA,
-                    message="agent step has no 'output_schema'; output will be recorded unvalidated",
+                    message="effect step has no 'output_schema'; output will be recorded unvalidated",
                     pointer=ptr,
                 )
             )
 
         diags.extend(_lint_refs(step.get("input"), f"{ptr}/input", declared_inputs, known_step_ids))
+        if kind == "kanban_agent":
+            diags.extend(_lint_refs(step.get("task"), f"{ptr}/task", declared_inputs, known_step_ids))
 
         # depends_on references must point at known step ids.
         for j, dep in enumerate(step.get("depends_on", []) or []):
@@ -262,6 +278,89 @@ def _lint_refs(
 
     walk(value, ptr)
     return diags
+
+
+# ---------------------------------------------------------------------------
+# Execution-order validation.
+# ---------------------------------------------------------------------------
+
+def _lint_execution_order(steps: list[Any]) -> list[Diagnostic]:
+    """Reject refs/depends_on edges the sequential skeleton cannot satisfy.
+
+    The runtime executes steps in declaration order, recursively entering
+    containers. A step may only reference or depend on step ids that have already
+    completed in that deterministic order.
+    """
+    diags: list[Diagnostic] = []
+    available: set[str] = set()
+
+    def walk_step(step: Any, ptr: str) -> None:
+        if not isinstance(step, dict):
+            return
+        kind = step.get("kind")
+        step_id = step.get("id")
+        if kind in {"agent", "kanban_agent"}:
+            for j, dep in enumerate(step.get("depends_on", []) or []):
+                if isinstance(dep, str) and dep not in available:
+                    diags.append(
+                        Diagnostic(
+                            severity="error",
+                            code=err.E_UNRESOLVED_REF,
+                            message=(
+                                f"depends_on references step id {dep!r} before it is available "
+                                "in declaration order"
+                            ),
+                            pointer=f"{ptr}/depends_on/{j}",
+                        )
+                    )
+            _lint_step_refs_available(step.get("input"), f"{ptr}/input", available, diags)
+            if kind == "kanban_agent":
+                _lint_step_refs_available(step.get("task"), f"{ptr}/task", available, diags)
+            if isinstance(step_id, str):
+                available.add(step_id)
+        elif kind in {"parallel", "pipeline", "phase"}:
+            child_key = "branches" if kind == "parallel" else "steps"
+            children = step.get(child_key)
+            if isinstance(children, list):
+                for i, child in enumerate(children):
+                    walk_step(child, f"{ptr}/{child_key}/{i}")
+            if isinstance(step_id, str):
+                available.add(step_id)
+
+    for i, step in enumerate(steps):
+        walk_step(step, f"/steps/{i}")
+    return diags
+
+
+def _lint_step_refs_available(
+    value: Any,
+    ptr: str,
+    available_step_ids: set[str],
+    diags: list[Diagnostic],
+) -> None:
+    def walk(v: Any, p: str) -> None:
+        if isinstance(v, str) and v.startswith("$ref:"):
+            ref = parse_ref(v)
+            if isinstance(ref, dict) and ref.get("kind") == "step" and ref["step_id"] not in available_step_ids:
+                diags.append(
+                    Diagnostic(
+                        severity="error",
+                        code=err.E_UNRESOLVED_REF,
+                        message=(
+                            f"reference to step id {ref['step_id']!r} before it is available "
+                            "in declaration order"
+                        ),
+                        pointer=p,
+                    )
+                )
+        elif isinstance(v, dict):
+            for k, sub in v.items():
+                walk(sub, f"{p}/{k}")
+        elif isinstance(v, list):
+            for i, sub in enumerate(v):
+                walk(sub, f"{p}/{i}")
+
+    walk(value, ptr)
 
 
 # ---------------------------------------------------------------------------
