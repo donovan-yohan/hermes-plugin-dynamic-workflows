@@ -170,14 +170,11 @@ deterministic `kb_<hash>` task id for tests.
 
 ```mermaid
 flowchart LR
-  LLM[Hermes agent / user] --> W[workflow\npreferred facade]
-  LLM --> V[workflow_validate]
-  LLM --> R[workflow_run]
-  LLM --> S[workflow_status]
+  LLM[Hermes agent / user] --> W[workflow\nmodel-facing tool]
 
-  W --> V
-  W --> R
-  W --> S
+  W --> V[workflow_validate\nlibrary primitive]
+  W --> R[workflow_run\nlibrary primitive]
+  W --> S[workflow_status\nlibrary primitive]
   V --> SC[schema.py\nparse + structural checks]
   V --> SB[sandbox.py\ndefault-deny policy lint]
 

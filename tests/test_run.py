@@ -210,6 +210,22 @@ def test_validate_false_unavailable_step_ref_fails_run():
     assert "not available" in status.error["message"]
 
 
+def test_validate_false_forward_depends_on_fails_run():
+    """Runtime refuses impossible depends_on edges even when validation is skipped."""
+    store = InMemoryRunStore()
+    definition = hello_definition()
+    definition["steps"][0]["depends_on"] = ["shout"]
+    definition["steps"][1].pop("depends_on")
+
+    handle = workflow_run(definition, inputs={"name": "world"}, registry=store, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.status == "failed"
+    assert status.error is not None
+    assert "depends on 'shout'" in status.error["message"]
+
+
 def test_default_registry_is_process_global_when_omitted():
     """Omitting registry uses the process-global InMemoryRunStore; the run is
     still queryable by id via the same default."""

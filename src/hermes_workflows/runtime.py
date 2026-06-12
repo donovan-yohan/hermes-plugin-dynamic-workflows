@@ -76,6 +76,7 @@ def _exec_sequence(steps: list[dict[str, Any]], ctx: RunContext) -> None:
 
 def _exec_step(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Dispatch a single step by kind; return its output dict."""
+    _check_depends_on(step, ctx)
     kind = step.get("kind")
     if kind == "agent":
         return _exec_agent(step, ctx)
@@ -88,6 +89,16 @@ def _exec_step(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     if kind == "phase":
         return _exec_phase(step, ctx)
     raise SandboxPolicyError(f"unsupported step kind at runtime: {kind!r}")
+
+
+def _check_depends_on(step: dict[str, Any], ctx: RunContext) -> None:
+    """Fail fast when validate=False skips static dependency-order checks."""
+    step_id = step.get("id", "<unknown>")
+    for dep in step.get("depends_on", []) or []:
+        if isinstance(dep, str) and dep not in ctx.outputs:
+            raise SandboxPolicyError(
+                f"step {step_id!r} depends on {dep!r}, but that output is not available"
+            )
 
 
 def _exec_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
