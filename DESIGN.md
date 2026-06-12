@@ -3,10 +3,10 @@
 A Hermes agent plugin that exposes one model-facing tool facade plus debug
 primitives for sandboxed, script-led orchestration over Hermes agents:
 
-- `workflow` — the model-facing facade: dry-run validate, run a definition, or inspect an existing run id.
-- `workflow_validate` — statically check a workflow definition (parse, schema, sandbox-policy lint) without running anything.
-- `workflow_run` — execute a validated definition in a deterministic, sandboxed runtime, fanning out to Hermes agents or durable Kanban awaitables.
-- `workflow_status` — query the state/progress of a run by id.
+- `workflow` — the only model-facing Hermes tool: dry-run validate, run a definition, or inspect an existing run id.
+- `workflow_validate` — library/operator primitive that statically checks a workflow definition (parse, schema, sandbox-policy lint) without running anything.
+- `workflow_run` — library/operator primitive that executes a validated definition in a deterministic, sandboxed runtime, fanning out to Hermes agents or durable Kanban awaitables.
+- `workflow_status` — library/operator primitive that queries the state/progress of a run by id.
 
 This document describes the architecture, the design decisions behind it, what we
 borrow from Claude Dynamic Workflows and how we differ, the sandbox security
@@ -26,7 +26,7 @@ YAML is intentionally unsupported (stdlib `json` only) so that `PyYAML` is not p
 ### 1.1 Public tool surface
 
 The plugin's public surface is `hermes_workflows.primitives`, which exports the
-single model-facing `workflow` facade plus narrower debug/operator primitives.
+single model-facing `workflow` Hermes tool plus narrower library/operator primitives.
 Each is a thin, side-effect-honest entry point over the internal components.
 
 ```python

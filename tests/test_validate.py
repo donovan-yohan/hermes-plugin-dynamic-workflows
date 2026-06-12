@@ -186,6 +186,31 @@ def test_cyclic_depends_on_is_error():
     assert "E_CYCLE" in _codes(result.errors)
 
 
+def test_forward_depends_on_is_error():
+    """The sequential skeleton rejects dependency edges it cannot satisfy."""
+    d = valid_definition()
+    d["steps"][0]["depends_on"] = ["shout"]
+    d["steps"][1].pop("depends_on")
+
+    result = workflow_validate(d)
+
+    assert result.ok is False
+    assert "E_UNRESOLVED_REF" in _codes(result.errors)
+    assert any(e.pointer == "/steps/0/depends_on/0" for e in result.errors)
+
+
+def test_forward_step_output_ref_is_error():
+    """Step output refs must point at already-completed declaration-order steps."""
+    d = valid_definition()
+    d["steps"][0]["input"] = {"subject": "$ref:shout.output.result"}
+
+    result = workflow_validate(d)
+
+    assert result.ok is False
+    assert "E_UNRESOLVED_REF" in _codes(result.errors)
+    assert any(e.pointer == "/steps/0/input/subject" for e in result.errors)
+
+
 def test_strict_promotes_lint_warning_to_error():
     """strict=True promotes sandbox-policy lint warnings to errors.
 

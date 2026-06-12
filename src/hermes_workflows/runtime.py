@@ -285,20 +285,20 @@ def _resolve(value: Any, ctx: RunContext) -> Any:
 
     ``$ref:inputs.<key>`` resolves against ``ctx.inputs``;
     ``$ref:<step_id>.output[.<field>]`` resolves against recorded step outputs.
-    Non-ref values pass through unchanged. Unresolvable refs (which validation
-    should have caught) yield ``None`` rather than raising, keeping the
-    deterministic executor total.
+    Non-ref values pass through unchanged. Malformed or unavailable step-output
+    refs raise :class:`SandboxPolicyError` so ``validate=False`` runs cannot
+    silently consume impossible dependency edges as ``None``.
     """
     if isinstance(value, str) and value.startswith("$ref:"):
         ref = parse_ref(value)
         if not ref or ref.get("kind") == "invalid":
-            return None
+            raise SandboxPolicyError(f"malformed reference {value!r}")
         if ref["kind"] == "input":
             return ctx.inputs.get(ref["key"])
         # step output reference.
         out = ctx.outputs.get(ref["step_id"])
         if out is None:
-            return None
+            raise SandboxPolicyError(f"step output reference {value!r} is not available")
         field_path = ref.get("field")
         if not field_path:
             return out

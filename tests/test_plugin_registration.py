@@ -60,7 +60,7 @@ def test_register_exposes_workflow_tools():
     ctx = FakeContext()
     plugin.register(ctx)
 
-    assert set(ctx.tools) == {"workflow", "workflow_validate", "workflow_run", "workflow_status"}
+    assert set(ctx.tools) == {"workflow"}
     for name, registered in ctx.tools.items():
         assert registered["toolset"] == "dynamic_workflows"
         assert registered["schema"]["name"] == name
@@ -86,19 +86,21 @@ def _assert_registered_handlers_return_json_success_payloads():
     plugin.register(ctx)
 
     definition = _hello_definition()
-    validate_payload = json.loads(ctx.tools["workflow_validate"]["handler"]({"definition": definition}))
+    validate_payload = json.loads(
+        ctx.tools["workflow"]["handler"]({"definition": definition, "action": "validate"})
+    )
     assert validate_payload["success"] is True
-    assert validate_payload["data"]["ok"] is True
+    assert validate_payload["data"]["validation"]["ok"] is True
 
     run_payload = json.loads(
-        ctx.tools["workflow_run"]["handler"]({"definition": definition, "inputs": {"name": "world"}})
+        ctx.tools["workflow"]["handler"]({"definition": definition, "inputs": {"name": "world"}})
     )
     assert run_payload["success"] is True
-    run_id = run_payload["data"]["run_id"]
+    run_id = run_payload["data"]["handle"]["run_id"]
 
-    status_payload = json.loads(ctx.tools["workflow_status"]["handler"]({"run_id": run_id}))
+    status_payload = json.loads(ctx.tools["workflow"]["handler"]({"run_id": run_id}))
     assert status_payload["success"] is True
-    assert status_payload["data"]["status"] == "succeeded"
+    assert status_payload["data"]["status"]["status"] == "succeeded"
 
     unified_payload = json.loads(
         ctx.tools["workflow"]["handler"](

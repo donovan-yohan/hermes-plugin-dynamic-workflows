@@ -4,9 +4,10 @@ A prototype Hermes Agent plugin for **Claude Code–style dynamic workflows**: a
 sandboxed orchestration runtime where an agent can validate, run, and inspect workflow definitions
 made of `agent`, `kanban_agent`, `parallel`, `pipeline`, and `phase` steps.
 
-The product-shaped surface is now the single `workflow` tool: validate with `dry_run`, run with a
-workflow definition, or inspect an existing run with `run_id`. The older `workflow_validate`,
-`workflow_run`, and `workflow_status` tools remain as explicit debug/operator primitives.
+The product-shaped surface is now the single model-facing `workflow` tool: validate with `dry_run`,
+run with a workflow definition, or inspect an existing run with `run_id`. The lower-level
+`workflow_validate`, `workflow_run`, and `workflow_status` functions remain as explicit
+library/debug/operator primitives.
 
 This repo is intentionally small: pure Python 3.11 stdlib, no runtime dependencies, no network, and
 no generated-code execution. Workflow definitions are declarative JSON and all real work crosses one
@@ -18,12 +19,12 @@ journal events.
 
 ## What this provides
 
-| Tool | Purpose |
+| Surface | Purpose |
 | --- | --- |
-| `workflow` | Single model-facing entry point: dry-run validate, run a definition, or inspect an existing run id. |
-| `workflow_validate` | Parse and statically validate a workflow definition without side effects. |
-| `workflow_run` | Execute a validated workflow in the deterministic skeleton runtime. |
-| `workflow_status` | Query status/progress/result for a workflow run id. |
+| `workflow` tool | Single model-facing entry point: dry-run validate, run a definition, or inspect an existing run id. |
+| `workflow_validate` function | Parse and statically validate a workflow definition without side effects. |
+| `workflow_run` function | Execute a validated workflow in the deterministic skeleton runtime. |
+| `workflow_status` function | Query status/progress/result for a workflow run id. |
 
 The current runtime supports:
 
@@ -99,14 +100,15 @@ ln -s "$PWD" "$HERMES_HOME/plugins/hermes-dynamic-workflows"
 hermes plugins list
 ```
 
-The plugin registers these tools in the `dynamic_workflows` toolset:
+The plugin registers this tool in the `dynamic_workflows` toolset:
 
-- `workflow` — preferred model-facing entry point
-- `workflow_validate` — debug/operator primitive
-- `workflow_run` — debug/operator primitive
-- `workflow_status` — debug/operator primitive
+- `workflow` — the single model-facing entry point
 
-If Hermes does not show them after restart, check:
+The lower-level `workflow_validate`, `workflow_run`, and `workflow_status` functions remain available
+for tests, library callers, and operator/debug integrations, but they are not registered as
+model-facing Hermes tools by default.
+
+If Hermes does not show `workflow` after restart, check:
 
 1. the symlink points at this repo root, not `src/`
 2. `plugin.yaml` is present at the plugin root

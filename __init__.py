@@ -282,24 +282,3 @@ def register(ctx: Any) -> None:
         handler=_handle_workflow,
         description="Validate, run, or inspect a dynamic workflow via one model-facing entry point.",
     )
-    ctx.register_tool(
-        name="workflow_validate",
-        toolset=TOOLSET,
-        schema=WORKFLOW_VALIDATE_SCHEMA,
-        handler=_handle_validate,
-        description="Validate a dynamic workflow definition without execution.",
-    )
-    ctx.register_tool(
-        name="workflow_run",
-        toolset=TOOLSET,
-        schema=WORKFLOW_RUN_SCHEMA,
-        handler=_handle_run,
-        description="Run a dynamic workflow in the deterministic skeleton runtime.",
-    )
-    ctx.register_tool(
-        name="workflow_status",
-        toolset=TOOLSET,
-        schema=WORKFLOW_STATUS_SCHEMA,
-        handler=_handle_status,
-        description="Query dynamic workflow run status by id.",
-    )
