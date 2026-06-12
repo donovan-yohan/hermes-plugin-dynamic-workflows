@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes_workflows"
 version = "0.1.0"
-description = "Sandboxed, JS-like dynamic workflow orchestration over Hermes agents (pure-stdlib skeleton)."
+description = "Sandboxed, script-led dynamic workflow orchestration over Hermes agents and Kanban awaitables (pure-stdlib skeleton)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 # Zero runtime dependencies: pure Python 3.11 stdlib only
-# (json, dataclasses, hashlib, uuid, datetime, typing, threading).
+# (json, dataclasses, hashlib, uuid, datetime, typing, threading, pathlib, os, re).
 # YAML is intentionally unsupported to avoid PyYAML.
 dependencies = []
 

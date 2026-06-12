@@ -18,7 +18,55 @@ from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
 
-__all__ = ["workflow_validate", "workflow_run", "workflow_status"]
+__all__ = ["workflow", "workflow_validate", "workflow_run", "workflow_status"]
+
+
+def workflow(
+    *,
+    definition: Optional[dict[str, Any] | str] = None,
+    inputs: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    action: Optional[str] = None,
+    dry_run: bool = False,
+    registry: Optional[RunStore] = None,
+    agent_runner: Optional[AgentRunner] = None,
+    validate: bool = True,
+    max_parallel: int = 8,
+    include_steps: bool = True,
+) -> dict[str, Any]:
+    """Model-facing workflow tool facade.
+
+    ``workflow`` is the single product-shaped entry point: validate when asked
+    for a dry run, run when supplied a definition, and query status when supplied
+    only a ``run_id``. The narrower primitives remain available for tests and
+    operator/debug usage.
+    """
+    op = action or ("validate" if dry_run else "status" if definition is None and run_id else "run")
+    if op == "validate":
+        if definition is None:
+            raise ValueError("workflow validate requires 'definition'")
+        validation = workflow_validate(definition, strict=validate)
+        return {"operation": "validate", "validation": validation.as_dict()}
+    if op == "status":
+        if not run_id:
+            raise ValueError("workflow status requires 'run_id'")
+        status = workflow_status(run_id, registry=registry, include_steps=include_steps)
+        return {"operation": "status", "status": status.as_dict()}
+    if op == "run":
+        if definition is None:
+            raise ValueError("workflow run requires 'definition'")
+        handle = workflow_run(
+            definition,
+            inputs=inputs,
+            registry=registry,
+            agent_runner=agent_runner,
+            validate=validate,
+            max_parallel=max_parallel,
+            run_id=run_id,
+        )
+        status = workflow_status(handle.run_id, registry=registry, include_steps=include_steps)
+        return {"operation": "run", "handle": handle.as_dict(), "status": status.as_dict()}
+    raise ValueError("workflow action must be one of: validate, run, status")
 
 
 def workflow_validate(

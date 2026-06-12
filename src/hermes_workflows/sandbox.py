@@ -36,7 +36,7 @@ from typing import Any
 from .models import Diagnostic
 from . import errors as err
 from . import schema as _schema
-from .agents import is_known_agent
+from .agents import is_kanban_runner_id, is_known_agent
 
 __all__ = [
     "KNOWN_CAPABILITIES",
@@ -175,8 +175,21 @@ def _lint_agent_steps(
 ) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     for step, ptr in _schema.iter_agent_steps(steps):
+        kind = step.get("kind")
         agent = step.get("agent")
-        if isinstance(agent, str) and agent and not is_known_agent(agent):
+        if kind == "agent" and isinstance(agent, str) and is_kanban_runner_id(agent):
+            diags.append(
+                Diagnostic(
+                    severity="error",
+                    code=err.E_UNKNOWN_AGENT,
+                    message=(
+                        f"reserved Kanban runner id {agent!r} cannot be called by an agent step; "
+                        "use kind='kanban_agent' with a profile instead"
+                    ),
+                    pointer=f"{ptr}/agent",
+                )
+            )
+        elif kind == "agent" and isinstance(agent, str) and agent and not is_known_agent(agent):
             diags.append(
                 Diagnostic(
                     severity="error",
@@ -191,12 +204,14 @@ def _lint_agent_steps(
                 Diagnostic(
                     severity="warning",
                     code=err.W_NO_OUTPUT_SCHEMA,
-                    message="agent step has no 'output_schema'; output will be recorded unvalidated",
+                    message="effect step has no 'output_schema'; output will be recorded unvalidated",
                     pointer=ptr,
                 )
             )
 
         diags.extend(_lint_refs(step.get("input"), f"{ptr}/input", declared_inputs, known_step_ids))
+        if kind == "kanban_agent":
+            diags.extend(_lint_refs(step.get("task"), f"{ptr}/task", declared_inputs, known_step_ids))
 
         # depends_on references must point at known step ids.
         for j, dep in enumerate(step.get("depends_on", []) or []):

@@ -1,10 +1,11 @@
 # DESIGN.md — `hermes_workflows`
 
-A Hermes agent plugin that exposes three primitives for sandboxed, JS-like
-orchestration over Hermes agents:
+A Hermes agent plugin that exposes one model-facing tool facade plus debug
+primitives for sandboxed, script-led orchestration over Hermes agents:
 
+- `workflow` — the model-facing facade: dry-run validate, run a definition, or inspect an existing run id.
 - `workflow_validate` — statically check a workflow definition (parse, schema, sandbox-policy lint) without running anything.
-- `workflow_run` — execute a validated definition in a deterministic, sandboxed runtime, fanning out to Hermes agents.
+- `workflow_run` — execute a validated definition in a deterministic, sandboxed runtime, fanning out to Hermes agents or durable Kanban awaitables.
 - `workflow_status` — query the state/progress of a run by id.
 
 This document describes the architecture, the design decisions behind it, what we
@@ -12,21 +13,37 @@ borrow from Claude Dynamic Workflows and how we differ, the sandbox security
 model, the optional Kanban run-status backend, and the roadmap.
 
 The package is **pure Python 3.11 stdlib** (`json`, `dataclasses`, `hashlib`,
-`uuid`, `datetime`, `typing`, `threading`). It has **zero runtime dependencies**
-and performs **no network or filesystem I/O**. YAML is intentionally unsupported
-(stdlib `json` only) so that `PyYAML` is not pulled in.
+`uuid`, `datetime`, `typing`, `threading`, `pathlib`). It has **zero runtime dependencies**
+and workflow definitions themselves still get **no direct network or filesystem authority**.
+The plugin-owned `FileRunStore` is the parent process persistence boundary: it writes
+`snapshot.json` and compact `journal.jsonl` events under the configured Hermes state dir.
+YAML is intentionally unsupported (stdlib `json` only) so that `PyYAML` is not pulled in.
 
 ---
 
 ## 1. Architecture & component overview
 
-### 1.1 The three primitives
+### 1.1 Public tool surface
 
-The plugin's public surface is `hermes_workflows.primitives`, which exports three
-functions. Each is a thin, side-effect-honest entry point over the internal
-components.
+The plugin's public surface is `hermes_workflows.primitives`, which exports the
+single model-facing `workflow` facade plus narrower debug/operator primitives.
+Each is a thin, side-effect-honest entry point over the internal components.
 
 ```python
+def workflow(
+    *,
+    definition: dict | str | None = None,
+    inputs: dict | None = None,
+    run_id: str | None = None,
+    action: str | None = None,
+    dry_run: bool = False,
+    registry: RunStore | None = None,
+    agent_runner: AgentRunner | None = None,
+    validate: bool = True,
+    max_parallel: int = 8,
+    include_steps: bool = True,
+) -> dict
+
 def workflow_validate(
     definition: dict | str,
     *,
@@ -52,6 +69,10 @@ def workflow_status(
     include_steps: bool = True,
 ) -> RunStatus
 ```
+
+- **`workflow`** chooses the operation from supplied fields: `dry_run` or
+  `action='validate'` validates only, a `definition` runs, and `run_id` without a
+  definition reads status. It is the tool shape meant for model use.
 
 - **`workflow_validate`** parses (`definition` may be a parsed `dict` or a JSON
   string), validates the schema, and runs the sandbox-policy lint. It has **no
@@ -79,7 +100,7 @@ def workflow_status(
 ```
           ┌─────────────────────────────────────────────────────────┐
           │                 hermes_workflows.primitives               │
-          │   workflow_validate   workflow_run   workflow_status      │
+          │ workflow facade + validate/run/status debug primitives      │
           └───────┬───────────────────┬───────────────────┬──────────┘
                   │                   │                   │
           ┌───────▼───────┐   ┌───────▼────────┐   ┌──────▼─────────┐
@@ -103,12 +124,12 @@ def workflow_status(
 
 | File | Responsibility |
 |------|----------------|
-| `primitives.py` | Public entry points; orchestrates validate → run → status. |
+| `primitives.py` | Public entry points; `workflow` facade plus explicit validate/run/status primitives. |
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
-| `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
-| `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `KanbanRunStore` documented/stubbed. |
-| `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`. |
+| `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
+| `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `FileRunStore` snapshots/journals; `KanbanRunStore` documented/stubbed. |
+| `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
 | `errors.py` | `WorkflowError` base, `WorkflowValidationError`, `RunNotFound`, `SandboxPolicyError`. |
 
@@ -129,6 +150,7 @@ A definition is a plain JSON object. Top-level shape:
 Step kinds are discriminated by `"kind"`:
 
 - **`agent`** — `{ "kind":"agent", "id", "agent", "input", "output_schema"?, "depends_on"? }`
+- **`kanban_agent`** — `{ "kind":"kanban_agent", "id", "profile", "task", "input"?, "wait"?, "output_schema"?, "depends_on"? }` (durable Kanban-backed awaitable contract; skeleton routes through `kanban.<profile>` runner id)
 - **`parallel`** — `{ "kind":"parallel", "id", "branches": [Step, ...] }` (fan-out, joins all branches)
 - **`pipeline`** — `{ "kind":"pipeline", "id", "steps": [Step, ...] }` (each step's output feeds the next; no-barrier by default)
 - **`phase`** — `{ "kind":"phase", "id", "label", "steps": [Step, ...] }` (explicit barrier: all inner steps complete before the next phase)

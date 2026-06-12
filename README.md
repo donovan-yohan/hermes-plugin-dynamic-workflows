@@ -2,11 +2,16 @@
 
 A prototype Hermes Agent plugin for **Claude Code–style dynamic workflows**: a lightweight,
 sandboxed orchestration runtime where an agent can validate, run, and inspect workflow definitions
-made of `agent`, `parallel`, `pipeline`, and `phase` steps.
+made of `agent`, `kanban_agent`, `parallel`, `pipeline`, and `phase` steps.
+
+The product-shaped surface is now the single `workflow` tool: validate with `dry_run`, run with a
+workflow definition, or inspect an existing run with `run_id`. The older `workflow_validate`,
+`workflow_run`, and `workflow_status` tools remain as explicit debug/operator primitives.
 
 This repo is intentionally small: pure Python 3.11 stdlib, no runtime dependencies, no network, and
 no generated-code execution. Workflow definitions are declarative JSON and all real work crosses one
-explicit `AgentRunner` boundary.
+explicit `AgentRunner` boundary; parent-owned persistence writes only run snapshots and compact
+journal events.
 
 > status: research/prototype scaffold. useful for modeling the plugin surface and runtime shape;
 > not a production sandbox yet.
@@ -15,6 +20,7 @@ explicit `AgentRunner` boundary.
 
 | Tool | Purpose |
 | --- | --- |
+| `workflow` | Single model-facing entry point: dry-run validate, run a definition, or inspect an existing run id. |
 | `workflow_validate` | Parse and statically validate a workflow definition without side effects. |
 | `workflow_run` | Execute a validated workflow in the deterministic skeleton runtime. |
 | `workflow_status` | Query status/progress/result for a workflow run id. |
@@ -23,10 +29,11 @@ The current runtime supports:
 
 - declarative JSON workflow definitions
 - `$ref:inputs.<key>` and `$ref:<step>.output.<field>` data wiring
-- deterministic `agent` / `parallel` / `pipeline` / `phase` composition
+- deterministic `agent` / `kanban_agent` / `parallel` / `pipeline` / `phase` composition
 - flat structured-output schema checks
 - default-deny sandbox policy linting
-- in-memory run storage, with a documented Kanban backend option
+- in-memory run storage for library use
+- parent-owned filesystem run storage for plugin use: `snapshot.json` + compact `journal.jsonl`
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
 
 ## Quick start as a Python package
@@ -94,9 +101,10 @@ hermes plugins list
 
 The plugin registers these tools in the `dynamic_workflows` toolset:
 
-- `workflow_validate`
-- `workflow_run`
-- `workflow_status`
+- `workflow` — preferred model-facing entry point
+- `workflow_validate` — debug/operator primitive
+- `workflow_run` — debug/operator primitive
+- `workflow_status` — debug/operator primitive
 
 If Hermes does not show them after restart, check:
 
@@ -135,14 +143,39 @@ If Hermes does not show them after restart, check:
 }
 ```
 
+### Kanban-backed awaitable step
+
+`kanban_agent` is the durable-backend contract. The skeleton does not call Kanban directly; it
+normalizes the step into the reserved runner id `kanban.<profile>`. A production runner can bind that
+id to a Hermes Kanban board/profile, persist the task id, and wake the workflow from task events.
+
+```json
+{
+  "kind": "kanban_agent",
+  "id": "plan_issue",
+  "profile": "relayplanner",
+  "task": { "issue": "$ref:inputs.issue", "goal": "triage and plan" },
+  "input": { "repo": "donovan-yohan/relay-ide" },
+  "output_schema": { "task_id": "string", "status": "string", "result": "object" }
+}
+```
+
+This is the first replacement seam for timer watchdog orchestration: workflows await a durable task
+result instead of polling status just to decide the next step. The current stub runner returns a
+deterministic `kb_<hash>` task id for tests.
+
 ## Architecture at a glance
 
 ```mermaid
 flowchart LR
-  LLM[Hermes agent / user] --> V[workflow_validate]
+  LLM[Hermes agent / user] --> W[workflow\npreferred facade]
+  LLM --> V[workflow_validate]
   LLM --> R[workflow_run]
   LLM --> S[workflow_status]
 
+  W --> V
+  W --> R
+  W --> S
   V --> SC[schema.py\nparse + structural checks]
   V --> SB[sandbox.py\ndefault-deny policy lint]
 
@@ -150,7 +183,8 @@ flowchart LR
   R --> RT[runtime.py\ndeterministic AST interpreter]
   RT --> AR[AgentRunner boundary]
   AR --> HA[Hermes agents / stub runner]
-  RT --> STORE[RunStore\nInMemory now, Kanban later]
+  AR --> KB[Kanban backend via kanban.profile runner]
+  RT --> STORE[RunStore\nInMemory library, FileRunStore plugin]
 
   S --> STORE
 ```

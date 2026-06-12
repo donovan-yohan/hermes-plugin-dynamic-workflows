@@ -8,6 +8,7 @@ can be installed or symlinked under ``~/.hermes/plugins/hermes-dynamic-workflows
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -23,10 +24,12 @@ if _SRC.exists():
 
 from hermes_workflows.errors import WorkflowError  # noqa: E402
 from hermes_workflows.primitives import (  # noqa: E402
+    workflow as _workflow,
     workflow_run as _workflow_run,
     workflow_status as _workflow_status,
     workflow_validate as _workflow_validate,
 )
+from hermes_workflows.registry import FileRunStore  # noqa: E402
 
 TOOLSET = "dynamic_workflows"
 
@@ -55,6 +58,64 @@ def _error(exc: Exception) -> str:
         payload["validation"] = _jsonable(result)
     return json.dumps(payload, ensure_ascii=False)
 
+
+def _plugin_store() -> FileRunStore:
+    root = os.getenv("HERMES_WORKFLOWS_STATE_DIR")
+    if not root:
+        hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+        root = str(hermes_home / "dynamic-workflows" / "runs")
+    return FileRunStore(root)
+
+
+WORKFLOW_SCHEMA = {
+    "name": "workflow",
+    "description": (
+        "Single dynamic workflow entry point. Validate with dry_run/action=validate, "
+        "run with a definition, or query status with run_id. Uses a parent-owned "
+        "filesystem run store with compact journal events."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": ["string", "null"],
+                "enum": ["validate", "run", "status", None],
+                "description": "Optional explicit operation. Defaults from supplied fields.",
+                "default": None,
+            },
+            "definition": {
+                "description": "Workflow definition as a JSON object or JSON string.",
+                "oneOf": [{"type": "object"}, {"type": "string"}, {"type": "null"}],
+                "default": None,
+            },
+            "inputs": {
+                "type": ["object", "null"],
+                "description": "Run inputs referenced by $ref:inputs.<key>.",
+                "default": None,
+            },
+            "run_id": {
+                "type": ["string", "null"],
+                "description": "Existing run id for status, or caller-supplied id for run.",
+                "default": None,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Validate only, without creating a run.",
+                "default": False,
+            },
+            "validate": {"type": "boolean", "default": True},
+            "max_parallel": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8},
+            "include_steps": {"type": "boolean", "default": True},
+            "include_journal": {
+                "type": "boolean",
+                "description": "Include recent compact journal events for file-backed runs.",
+                "default": False,
+            },
+            "journal_limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+        },
+        "additionalProperties": False,
+    },
+}
 
 WORKFLOW_VALIDATE_SCHEMA = {
     "name": "workflow_validate",
@@ -145,6 +206,32 @@ WORKFLOW_STATUS_SCHEMA = {
 }
 
 
+def _handle_workflow(params: dict[str, Any], **_: Any) -> str:
+    try:
+        store = _plugin_store()
+        result = _workflow(
+            action=params.get("action"),
+            definition=params.get("definition"),
+            inputs=params.get("inputs"),
+            run_id=params.get("run_id"),
+            dry_run=params.get("dry_run", False),
+            registry=store,
+            validate=params.get("validate", True),
+            max_parallel=params.get("max_parallel", 8),
+            include_steps=params.get("include_steps", True),
+        )
+        if params.get("include_journal") and params.get("run_id"):
+            result["journal"] = store.journal(params["run_id"], limit=params.get("journal_limit", 100))
+        elif params.get("include_journal") and result.get("handle"):
+            rid = result["handle"]["run_id"]
+            result["journal"] = store.journal(rid, limit=params.get("journal_limit", 100))
+        return _ok(result)
+    except WorkflowError as exc:
+        return _error(exc)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return _error(exc)
+
+
 def _handle_validate(params: dict[str, Any], **_: Any) -> str:
     try:
         result = _workflow_validate(
@@ -162,6 +249,7 @@ def _handle_run(params: dict[str, Any], **_: Any) -> str:
         handle = _workflow_run(
             params["definition"],
             inputs=params.get("inputs"),
+            registry=_plugin_store(),
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             run_id=params.get("run_id"),
@@ -177,6 +265,7 @@ def _handle_status(params: dict[str, Any], **_: Any) -> str:
     try:
         status = _workflow_status(
             params["run_id"],
+            registry=_plugin_store(),
             include_steps=params.get("include_steps", True),
         )
         return _ok(status)
@@ -186,6 +275,13 @@ def _handle_status(params: dict[str, Any], **_: Any) -> str:
 
 def register(ctx: Any) -> None:
     """Register dynamic workflow tools with Hermes."""
+    ctx.register_tool(
+        name="workflow",
+        toolset=TOOLSET,
+        schema=WORKFLOW_SCHEMA,
+        handler=_handle_workflow,
+        description="Validate, run, or inspect a dynamic workflow via one model-facing entry point.",
+    )
     ctx.register_tool(
         name="workflow_validate",
         toolset=TOOLSET,
