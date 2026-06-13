@@ -14,6 +14,7 @@ from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
 from .agents import AgentRunner, StubAgentRunner
+from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
@@ -26,9 +27,11 @@ def workflow(
     definition: Optional[dict[str, Any] | str] = None,
     inputs: Optional[dict[str, Any]] = None,
     run_id: Optional[str] = None,
+    template_name: Optional[str] = None,
     action: Optional[str] = None,
     dry_run: bool = False,
     registry: Optional[RunStore] = None,
+    catalog: Optional[FileWorkflowCatalog] = None,
     agent_runner: Optional[AgentRunner] = None,
     validate: bool = True,
     max_parallel: int = 8,
@@ -41,7 +44,9 @@ def workflow(
     only a ``run_id``. The narrower primitives remain available for tests and
     operator/debug usage.
     """
-    op = action or ("validate" if dry_run else "status" if definition is None and run_id else "run")
+    op = action or (
+        "validate" if dry_run else "run_template" if template_name else "status" if definition is None and run_id else "run"
+    )
     if op == "validate":
         if definition is None:
             raise ValueError("workflow validate requires 'definition'")
@@ -55,7 +60,7 @@ def workflow(
     if op == "run":
         if definition is None:
             raise ValueError("workflow run requires 'definition'")
-        handle = workflow_run(
+        handle, status = _run_and_status(
             definition,
             inputs=inputs,
             registry=registry,
@@ -63,10 +68,59 @@ def workflow(
             validate=validate,
             max_parallel=max_parallel,
             run_id=run_id,
+            include_steps=include_steps,
         )
-        status = workflow_status(handle.run_id, registry=registry, include_steps=include_steps)
         return {"operation": "run", "handle": handle.as_dict(), "status": status.as_dict()}
-    raise ValueError("workflow action must be one of: validate, run, status")
+    if op == "catalog":
+        active_catalog = catalog if catalog is not None else FileWorkflowCatalog()
+        return {"operation": "catalog", "templates": active_catalog.list_templates()}
+    if op == "run_template":
+        if not template_name:
+            raise ValueError("workflow run_template requires 'template_name'")
+        active_catalog = catalog if catalog is not None else FileWorkflowCatalog()
+        loaded = active_catalog.load_template(template_name)
+        handle, status = _run_and_status(
+            loaded,
+            inputs=inputs,
+            registry=registry,
+            agent_runner=agent_runner,
+            validate=validate,
+            max_parallel=max_parallel,
+            run_id=run_id,
+            include_steps=include_steps,
+        )
+        return {
+            "operation": "run_template",
+            "template_name": template_name,
+            "template_hash": handle.def_hash,
+            "handle": handle.as_dict(),
+            "status": status.as_dict(),
+        }
+    raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template")
+
+
+def _run_and_status(
+    definition: dict[str, Any] | str,
+    *,
+    inputs: Optional[dict[str, Any]],
+    registry: Optional[RunStore],
+    agent_runner: Optional[AgentRunner],
+    validate: bool,
+    max_parallel: int,
+    run_id: Optional[str],
+    include_steps: bool,
+) -> tuple[RunHandle, RunStatus]:
+    handle = workflow_run(
+        definition,
+        inputs=inputs,
+        registry=registry,
+        agent_runner=agent_runner,
+        validate=validate,
+        max_parallel=max_parallel,
+        run_id=run_id,
+    )
+    status = workflow_status(handle.run_id, registry=registry, include_steps=include_steps)
+    return handle, status
 
 
 def workflow_validate(
@@ -122,6 +176,16 @@ def workflow_validate(
         normalized=parsed,
         def_hash=h,
     )
+
+
+def _effective_max_parallel(definition: dict[str, Any], override: int) -> int:
+    """Return the runtime fan-out bound from explicit arg capped by policy."""
+    policy = definition.get("policy") if isinstance(definition.get("policy"), dict) else {}
+    policy_value = policy.get("max_parallel") if isinstance(policy, dict) else None
+    candidates = [override]
+    if isinstance(policy_value, int) and not isinstance(policy_value, bool) and policy_value > 0:
+        candidates.append(policy_value)
+    return max(1, min(candidates))
 
 
 def workflow_run(
@@ -185,7 +249,7 @@ def workflow_run(
         store=store,
         agent_runner=runner,
         inputs=dict(inputs or {}),
-        max_parallel=max_parallel,
+        max_parallel=_effective_max_parallel(normalized, max_parallel),
     )
 
     try:

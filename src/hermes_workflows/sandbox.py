@@ -99,13 +99,10 @@ def policy_lint(definition: dict[str, Any]) -> list[Diagnostic]:
         return diags  # structure validation already reported this.
 
     declared_inputs = set(definition.get("inputs", {}) or {})
-    known_step_ids = {
-        s.get("id") for s, _ in _schema.iter_agent_steps(steps) if isinstance(s.get("id"), str)
-    }
-    # Container steps also own ids that may be referenced.
-    known_step_ids |= _collect_all_step_ids(steps)
+    known_step_ids = _collect_all_step_ids(steps)
 
     diags.extend(_lint_agent_steps(steps, declared_inputs, known_step_ids))
+    diags.extend(_lint_if_steps(steps, declared_inputs, known_step_ids))
     diags.extend(_lint_execution_order(steps))
     diags.extend(_lint_cycles(steps))
     return diags
@@ -152,6 +149,17 @@ def _lint_policy_block(definition: dict[str, Any]) -> list[Diagnostic]:
                 pointer="/policy/filesystem",
             )
         )
+    if "max_parallel" in policy:
+        max_parallel = policy.get("max_parallel")
+        if not isinstance(max_parallel, int) or isinstance(max_parallel, bool) or max_parallel < 1:
+            diags.append(
+                Diagnostic(
+                    severity="error",
+                    code=err.E_DISALLOWED_CAPABILITY,
+                    message="policy.max_parallel must be a positive integer",
+                    pointer="/policy/max_parallel",
+                )
+            )
     for key in policy:
         if key not in KNOWN_CAPABILITIES:
             diags.append(
@@ -228,6 +236,40 @@ def _lint_agent_steps(
     return diags
 
 
+def _lint_if_steps(
+    steps: list[Any],
+    declared_inputs: set[str],
+    known_step_ids: set[Any],
+) -> list[Diagnostic]:
+    """Lint conditional step refs that are not reached through effect inputs."""
+    diags: list[Diagnostic] = []
+
+    def walk(seq: list[Any], base: str) -> None:
+        for i, step in enumerate(seq):
+            if not isinstance(step, dict):
+                continue
+            ptr = f"{base}/{i}"
+            kind = step.get("kind")
+            if kind == "if":
+                condition = step.get("condition")
+                if isinstance(condition, dict):
+                    diags.extend(_lint_refs(condition.get("ref"), f"{ptr}/condition/ref", declared_inputs, known_step_ids))
+                then_steps = step.get("then")
+                if isinstance(then_steps, list):
+                    walk(then_steps, f"{ptr}/then")
+                else_steps = step.get("else")
+                if isinstance(else_steps, list):
+                    walk(else_steps, f"{ptr}/else")
+            elif kind in {"parallel", "pipeline", "phase"}:
+                child_key = "branches" if kind == "parallel" else "steps"
+                children = step.get(child_key)
+                if isinstance(children, list):
+                    walk(children, f"{ptr}/{child_key}")
+
+    walk(steps, "/steps")
+    return diags
+
+
 def _lint_refs(
     value: Any,
     ptr: str,
@@ -294,41 +336,53 @@ def _lint_execution_order(steps: list[Any]) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     available: set[str] = set()
 
-    def walk_step(step: Any, ptr: str) -> None:
+    def walk_step(step: Any, ptr: str, available_ids: set[str]) -> None:
         if not isinstance(step, dict):
             return
         kind = step.get("kind")
         step_id = step.get("id")
-        if kind in {"agent", "kanban_agent"}:
-            for j, dep in enumerate(step.get("depends_on", []) or []):
-                if isinstance(dep, str) and dep not in available:
-                    diags.append(
-                        Diagnostic(
-                            severity="error",
-                            code=err.E_UNRESOLVED_REF,
-                            message=(
-                                f"depends_on references step id {dep!r} before it is available "
-                                "in declaration order"
-                            ),
-                            pointer=f"{ptr}/depends_on/{j}",
-                        )
+        for j, dep in enumerate(step.get("depends_on", []) or []):
+            if isinstance(dep, str) and dep not in available_ids:
+                diags.append(
+                    Diagnostic(
+                        severity="error",
+                        code=err.E_UNRESOLVED_REF,
+                        message=(
+                            f"depends_on references step id {dep!r} before it is available "
+                            "in declaration order"
+                        ),
+                        pointer=f"{ptr}/depends_on/{j}",
                     )
-            _lint_step_refs_available(step.get("input"), f"{ptr}/input", available, diags)
+                )
+        if kind in {"agent", "kanban_agent"}:
+            _lint_step_refs_available(step.get("input"), f"{ptr}/input", available_ids, diags)
             if kind == "kanban_agent":
-                _lint_step_refs_available(step.get("task"), f"{ptr}/task", available, diags)
+                _lint_step_refs_available(step.get("task"), f"{ptr}/task", available_ids, diags)
             if isinstance(step_id, str):
-                available.add(step_id)
+                available_ids.add(step_id)
+        elif kind == "if":
+            condition = step.get("condition")
+            if isinstance(condition, dict):
+                _lint_step_refs_available(condition.get("ref"), f"{ptr}/condition/ref", available_ids, diags)
+            for branch_key in ("then", "else"):
+                branch_steps = step.get(branch_key)
+                if isinstance(branch_steps, list):
+                    branch_available = set(available_ids)
+                    for i, child in enumerate(branch_steps):
+                        walk_step(child, f"{ptr}/{branch_key}/{i}", branch_available)
+            if isinstance(step_id, str):
+                available_ids.add(step_id)
         elif kind in {"parallel", "pipeline", "phase"}:
             child_key = "branches" if kind == "parallel" else "steps"
             children = step.get(child_key)
             if isinstance(children, list):
                 for i, child in enumerate(children):
-                    walk_step(child, f"{ptr}/{child_key}/{i}")
+                    walk_step(child, f"{ptr}/{child_key}/{i}", available_ids)
             if isinstance(step_id, str):
-                available.add(step_id)
+                available_ids.add(step_id)
 
     for i, step in enumerate(steps):
-        walk_step(step, f"/steps/{i}")
+        walk_step(step, f"/steps/{i}", available)
     return diags
 
 
@@ -411,7 +465,7 @@ def _lint_cycles(steps: list[Any]) -> list[Diagnostic]:
 def _collect_all_step_ids(steps: list[Any]) -> set[Any]:
     """Collect ids of every step (any kind), recursively."""
     out: set[Any] = set()
-    child_keys = ("branches", "steps")
+    child_keys = ("branches", "steps", "then", "else")
     for step in steps:
         if not isinstance(step, dict):
             continue

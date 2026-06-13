@@ -28,7 +28,8 @@ __all__ = [
 ]
 
 SUPPORTED_VERSION = "1"
-STEP_KINDS = ("agent", "kanban_agent", "parallel", "pipeline", "phase")
+STEP_KINDS = ("agent", "kanban_agent", "parallel", "pipeline", "phase", "if")
+CONDITION_OPS = ("truthy", "exists", "eq", "ne")
 
 # Keys that hold nested step lists, by kind, used for recursive descent.
 _CHILD_KEYS = {"parallel": "branches", "pipeline": "steps", "phase": "steps"}
@@ -168,10 +169,14 @@ def _validate_steps(
                 diags.append(_e(err.E_DUP_STEP_ID, f"duplicate step id {step_id!r}", f"{ptr}/id"))
             seen_ids.add(step_id)
 
+        _validate_depends_on(step, ptr, diags)
+
         if kind == "agent":
             _validate_agent_step(step, ptr, diags)
         elif kind == "kanban_agent":
             _validate_kanban_agent_step(step, ptr, diags)
+        elif kind == "if":
+            _validate_if_step(step, ptr, diags, seen_ids)
         else:
             child_key = _CHILD_KEYS[kind]
             children = step.get(child_key)
@@ -217,6 +222,50 @@ def _validate_kanban_agent_step(step: dict[str, Any], ptr: str, diags: list[Diag
     _validate_effect_input_contract(step, ptr, diags)
 
 
+def _validate_if_step(
+    step: dict[str, Any],
+    ptr: str,
+    diags: list[Diagnostic],
+    seen_ids: set[str],
+) -> None:
+    """Validate the deterministic conditional step shape."""
+    condition = step.get("condition")
+    if not isinstance(condition, dict):
+        diags.append(_e(err.E_SCHEMA_STEP, "if step requires a 'condition' object", f"{ptr}/condition"))
+    else:
+        ref = condition.get("ref")
+        if not isinstance(ref, str) or not ref.startswith("$ref:"):
+            diags.append(_e(err.E_SCHEMA_STEP, "if condition requires a '$ref:' string in 'ref'", f"{ptr}/condition/ref"))
+        op = condition.get("op")
+        if op not in CONDITION_OPS:
+            diags.append(
+                _e(err.E_SCHEMA_STEP, f"if condition 'op' must be one of {CONDITION_OPS}, got {op!r}", f"{ptr}/condition/op")
+            )
+        if op in {"eq", "ne"} and "value" not in condition:
+            diags.append(_e(err.E_SCHEMA_STEP, f"if condition op {op!r} requires 'value'", f"{ptr}/condition/value"))
+
+    then_steps = step.get("then")
+    if not isinstance(then_steps, list) or not then_steps:
+        diags.append(_e(err.E_SCHEMA_STEP, "if step requires a non-empty 'then' list", f"{ptr}/then"))
+    else:
+        _validate_steps(then_steps, f"{ptr}/then", diags, seen_ids)
+
+    if "else" in step:
+        else_steps = step.get("else")
+        if not isinstance(else_steps, list):
+            diags.append(_e(err.E_SCHEMA_STEP, "if step 'else' must be a list", f"{ptr}/else"))
+        else:
+            _validate_steps(else_steps, f"{ptr}/else", diags, seen_ids)
+
+
+def _validate_depends_on(step: dict[str, Any], ptr: str, diags: list[Diagnostic]) -> None:
+    """Validate depends_on shape shared by every step kind."""
+    if "depends_on" in step:
+        dep = step["depends_on"]
+        if not isinstance(dep, list) or not all(isinstance(d, str) for d in dep):
+            diags.append(_e(err.E_SCHEMA_STEP, "'depends_on' must be a list of step ids", f"{ptr}/depends_on"))
+
+
 def _validate_effect_input_contract(step: dict[str, Any], ptr: str, diags: list[Diagnostic]) -> None:
     """Validate fields shared by effectful leaf steps."""
     if "input" in step and not isinstance(step["input"], (dict, str)):
@@ -224,11 +273,6 @@ def _validate_effect_input_contract(step: dict[str, Any], ptr: str, diags: list[
 
     if "output_schema" in step and not isinstance(step["output_schema"], dict):
         diags.append(_e(err.E_SCHEMA_STEP, "'output_schema' must be an object", f"{ptr}/output_schema"))
-
-    if "depends_on" in step:
-        dep = step["depends_on"]
-        if not isinstance(dep, list) or not all(isinstance(d, str) for d in dep):
-            diags.append(_e(err.E_SCHEMA_STEP, "'depends_on' must be a list of step ids", f"{ptr}/depends_on"))
 
 
 def iter_agent_steps(steps: list[Any]):
@@ -254,6 +298,13 @@ def _iter_agent_steps(steps: list[Any], base_pointer: str):
             children = step.get(child_key)
             if isinstance(children, list):
                 yield from _iter_agent_steps(children, f"{ptr}/{child_key}")
+        elif kind == "if":
+            then_steps = step.get("then")
+            if isinstance(then_steps, list):
+                yield from _iter_agent_steps(then_steps, f"{ptr}/then")
+            else_steps = step.get("else")
+            if isinstance(else_steps, list):
+                yield from _iter_agent_steps(else_steps, f"{ptr}/else")
 
 
 def _is_identifier_safe(value: str) -> bool:

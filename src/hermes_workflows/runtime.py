@@ -1,7 +1,7 @@
 """Deterministic, network-free workflow executor (SKELETON).
 
 The runtime interprets an already-validated workflow definition. It is a tiny
-tree-walking interpreter over the four step kinds — it never ``eval``s strings,
+tree-walking interpreter over workflow step kinds — it never ``eval``s strings,
 never imports user-named modules, and routes every external effect through the
 injected :class:`~hermes_workflows.agents.AgentRunner`. See
 :mod:`hermes_workflows.sandbox` for the security model this honours.
@@ -88,6 +88,8 @@ def _exec_step(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
         return _exec_pipeline(step, ctx)
     if kind == "phase":
         return _exec_phase(step, ctx)
+    if kind == "if":
+        return _exec_if(step, ctx)
     raise SandboxPolicyError(f"unsupported step kind at runtime: {kind!r}")
 
 
@@ -285,6 +287,64 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     ctx.outputs[step_id] = result
     ctx.last_output = result
     return result
+
+
+def _exec_if(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
+    """Execute a deterministic conditional step without leaking branch-local ids."""
+    step_id = step["id"]
+    status = StepStatus(step_id=step_id, kind="if", status="running", started_at=utc_now_iso())
+    ctx.store.update_step(ctx.run_id, status)
+
+    try:
+        branch_key = "then" if _eval_condition(step["condition"], ctx) else "else"
+        branch_steps = step.get(branch_key) or []
+        before_keys = set(ctx.outputs)
+        before_last = ctx.last_output
+        if branch_steps:
+            _exec_sequence(branch_steps, ctx)
+            branch_output = ctx.last_output or {}
+        else:
+            ctx.last_output = before_last
+            branch_output = {}
+        for key in set(ctx.outputs) - before_keys:
+            ctx.outputs.pop(key, None)
+        result = {"branch": branch_key, "output": branch_output}
+    except Exception as exc:
+        status.status = "failed"
+        status.ended_at = utc_now_iso()
+        status.error = {"type": type(exc).__name__, "message": str(exc)}
+        ctx.store.update_step(ctx.run_id, status)
+        raise
+
+    status.status = "succeeded"
+    status.ended_at = utc_now_iso()
+    status.output = result
+    ctx.store.update_step(ctx.run_id, status)
+
+    ctx.outputs[step_id] = result
+    ctx.last_output = result
+    return result
+
+
+def _eval_condition(condition: dict[str, Any], ctx: RunContext) -> bool:
+    """Evaluate the tiny declarative condition grammar."""
+    op = condition.get("op")
+    try:
+        value = _resolve(condition.get("ref"), ctx)
+        exists = value is not None
+    except SandboxPolicyError:
+        if op == "exists":
+            return False
+        raise
+    if op == "truthy":
+        return bool(value)
+    if op == "exists":
+        return exists
+    if op == "eq":
+        return value == condition.get("value")
+    if op == "ne":
+        return value != condition.get("value")
+    raise SandboxPolicyError(f"unsupported if condition op {op!r}")
 
 
 # ---------------------------------------------------------------------------

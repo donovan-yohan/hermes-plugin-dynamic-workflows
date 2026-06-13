@@ -32,7 +32,7 @@ __all__ = [
 
 Severity = Literal["error", "warning"]
 RunState = Literal["queued", "running", "succeeded", "failed", "cancelled", "unknown"]
-StepKind = Literal["agent", "kanban_agent", "parallel", "pipeline", "phase"]
+StepKind = Literal["agent", "kanban_agent", "parallel", "pipeline", "phase", "if"]
 
 
 @dataclass(frozen=True)

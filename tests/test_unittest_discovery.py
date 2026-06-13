@@ -13,7 +13,16 @@ import inspect
 import unittest
 
 
-MODULES = ("test_validate", "test_run", "test_status", "test_plugin_registration", "test_file_store_and_kanban")
+MODULES = (
+    "test_validate",
+    "test_run",
+    "test_status",
+    "test_plugin_registration",
+    "test_file_store_and_kanban",
+    "test_control_flow",
+    "test_catalog",
+    "test_relay_github_contract",
+)
 
 
 def _import_test_module(module_name: str):
