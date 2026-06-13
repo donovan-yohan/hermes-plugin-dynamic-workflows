@@ -488,12 +488,88 @@ id/profile, ok) — raw inputs/outputs and prompts are redacted.
 
 ### 5.4 What is intentionally deferred
 
-This is the **smallest coherent #2 slice**: it proves the subprocess VM, the
-parent-owned RPC broker, the static launch gate, and capability enforcement with
-tests. Deliberately out of scope here (tracked by #3/#4/#11): durable
-journal/snapshot persistence and the deterministic replay cache (#3), the full
-script-API surface with loop guards and richer helpers (#4), true concurrent
-fan-out, and launch-approval/session-policy governance (#11).
+The #2 slice proved the subprocess VM, the parent-owned RPC broker, the static
+launch gate, and capability enforcement with tests. The durable run store and
+deterministic replay cache (#3) are now implemented additively (see §5.6).
+Still out of scope here (tracked by #4/#11): the full script-API surface with
+loop guards and richer helpers (#4), true concurrent fan-out, resume from a
+*partial* run (this slice replays a *completed* run; it does not yet resume an
+interrupted one), no-duplicate-Kanban side-effect dedup, and
+launch-approval/session-policy governance (#11).
+
+### 5.6 Durable script run store and deterministic replay cache (issue #3)
+
+The broker journals each capability request with a **stable, ascending call id**
+(1, 2, 3, ...) minted by the guest's RPC client. Because a workflow script is
+deterministic — given the same `args` and the same sequence of RPC return
+values it makes the same calls in the same order — those ids are a stable
+address space across runs of the same script. `script_store.py` turns that into
+durability without re-running deterministic work.
+
+**Store layout.** `ScriptRunStore` persists each run under
+`<root>/<run_id>/` (the parent owns the path; the script's subprocess still has
+no filesystem authority):
+
+| File | Contents |
+|------|----------|
+| `run.json` | Bounded metadata snapshot, atomically replaced: `schema_version`, `run_id`, `script_sha256`, `args_hash`, `status` (`running`/`succeeded`/`failed`), the public `meta` literal, a small `limits` view, the final `value`/`error`, `deterministic_runner`, `replay_of`, timestamps. **No raw script source, inputs, or prompts.** |
+| `journal.jsonl` | Metadata-only events. Vocabulary: **`boot`** (script/args hashes, limits, determinism, replay provenance), **`call`** (call id, method, agent id/profile, label, `ok`, `error`, `replayed`), **`done`** (terminal status). In this synchronous broker the return outcome is folded into the `call` event, so a separate `return` line carries no extra information. Raw `params` are never written. |
+| `cache.jsonl` | The **deterministic replay cache**: one line per replayable call, `{call_id, method, args_hash, value}`. |
+
+**Run ids.** `wfs_<digest8>_<uuid12>` where `digest8` is the sha256 of the
+canonicalized script+args (content-addressed, sortable-by-source) and the
+`uuid4` suffix keeps it collision-resistant. Callers may pass an explicit
+`run_id` for idempotency/tests; it must be a single safe path segment.
+
+**What is replayable (conservative, opt-in to determinism).** `log` / `phase`
+always (their result is a constant `None`). `agent` / `kanban_agent` **only**
+when the caller declares the injected runner deterministic — auto-detected for
+the default `StubAgentRunner` (a pure function of its inputs) or set explicitly
+via `deterministic_runner=`. A live, non-deterministic Hermes runner caches **no**
+agent output, so on replay those calls re-run rather than returning a stale
+value. We do not fake safety: caching agent results is opt-in to a determinism
+guarantee the operator makes.
+
+**Replay.** `run_script(..., store=store, replay_from=<prior_run_id>)` loads the
+prior run's cache **up front** (a corrupt/missing cache fails closed and typed
+*before* any subprocess spawns) and re-runs the script. For each call the broker
+consults the cache by call id:
+
+- **hit** (cached entry whose `method` + canonical `args_hash` match the live
+  call) → return the recorded value **without invoking the runner**; re-apply the
+  recorded `_tokens` so the script's budget view stays consistent.
+- **miss** (no cached entry for this id — the call was non-replayable in the
+  source run) → fall through to a **live dispatch** (rerun).
+- **mismatch** (a cached entry exists but `method`/`args_hash` drifted) →
+  **fail closed**: a `replay_mismatch` denial aborts the subprocess and marks the
+  run failed, rather than serving a value intended for a different logical call.
+
+The `args_hash` (canonical JSON of the call's semantic params, excluding the
+cosmetic `label`) is a per-call **integrity tag**: it detects a script/args drift
+that would otherwise silently misalign the call stream. Combined with the fixed
+`PYTHONHASHSEED=0` in the scrubbed env and the validator's ban on
+clock/randomness/imports, this makes the cached call stream reproducible.
+
+**Failure model.** Every load failure is a typed
+`ScriptRunStoreError` subclass — `ScriptRunNotFound`, or `CorruptScriptRunError`
+with a stable `reason` (`corrupt_run` / `corrupt_cache` / `schema_version`) — so
+the parent declines to replay without corrupting state and may fall back to a
+fresh run. A subprocess crash/timeout still yields a failed `ScriptRunResult` and
+a `done` event with `status="failed"`.
+
+**Trust boundary / accepted limitations.** The cache lives under the
+parent-owned state dir; like `snapshot.json`, it trusts its own on-disk contents.
+The integrity tag protects against a *drifting script*, not against an attacker
+with write access to the state dir tampering with a cached `value` (out of scope
+for this slice — same threat model as the JSON-runtime `FileRunStore`).
+`cache.jsonl` can hold deterministic call *results* (e.g. stub agent outputs):
+`log` / `phase` entries (constant `None`) are always cached, but `agent` /
+`kanban_agent` *outputs* are cached **only** when the runner is declared
+deterministic — so a non-deterministic run never persists agent/kanban result
+data. The metadata `journal.jsonl` stays redacted by default (raw params and
+script-authored error messages are never written). Budget enforcement is
+best-effort on replay (recorded token spend is re-applied for determinism but the
+hard cap is not re-checked on a faithful replay).
 
 ### 5.5 Adversarial review and residual limitations
 
@@ -546,7 +622,11 @@ Near-term and future work, roughly in priority order:
 3. **Resume / journal engine.** Build on the existing append-style run records and
    `def_hash` correlation to support resuming an interrupted run from the last
    completed step — the resumable-journal idea borrowed from Dynamic Workflows,
-   realized as a first-class feature.
+   realized as a first-class feature. The script-VM side now ships the first
+   piece of this: a durable `ScriptRunStore` plus a deterministic replay cache
+   that re-runs a *completed* script without duplicating deterministic RPC work
+   (§5.6, issue #3). Remaining: resume from a *partial* run and dedup of durable
+   side effects (e.g. no-duplicate Kanban task creation) on rerun.
 
 4. **Durable & Kanban stores.** Provide at least one durable `RunStore`
    implementation and a concrete `KanbanRunStore` against a real board, validating
@@ -560,9 +640,10 @@ Near-term and future work, roughly in priority order:
    first slice of this: model-authored Python scripts run out-of-process under a
    scrubbed environment, a static launch gate, restricted builtins, and a
    parent-owned RPC capability broker — without a JS engine or any runtime
-   dependency. Remaining work: durable journal/replay for scripts (#3), the full
-   script API with loop guards (#4), and resource quotas beyond the wall-clock
-   timeout and call-count caps.
+   dependency. Durable journal + deterministic replay for scripts (#3) now ships
+   additively (§5.6). Remaining work: the full script API with loop guards (#4),
+   resume from a partial run, and resource quotas beyond the wall-clock timeout
+   and call-count caps.
 
 7. **Capability grants beyond default-deny.** Allow `policy` to *request* network
    or filesystem capabilities, mediated by an out-of-band grant mechanism, so the

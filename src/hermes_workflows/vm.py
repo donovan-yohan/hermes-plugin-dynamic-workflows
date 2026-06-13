@@ -33,6 +33,15 @@ from . import rpc
 from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_id, is_kanban_runner_id
 from .errors import CapabilityDenied, ScriptValidationError, WorkflowSubprocessError
 from .registry import utc_now_iso
+from .script_store import (
+    CallRecorder,
+    ReplayCache,
+    ScriptRunStore,
+    canonical_hash,
+    is_replayable,
+    replay_args_hash,
+    script_sha256,
+)
 from .script_validator import validate_script
 
 __all__ = [
@@ -48,6 +57,10 @@ JournalSink = Callable[[dict[str, Any]], None]
 # Capability methods the broker is willing to dispatch. Anything else is denied
 # regardless of what the (untrusted) subprocess sends.
 _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "log", "phase", "workflow"})
+
+# Sentinel: a replay consult that found no cache entry for a call id (a miss),
+# so the broker must fall through to a live dispatch.
+_MISS = object()
 
 # Output-schema type table (mirrors runtime._TYPE_MAP) for brokered agent calls.
 _TYPE_MAP: dict[str, tuple[type, ...]] = {
@@ -85,6 +98,12 @@ class ScriptRunResult:
     calls: list[dict[str, Any]] = field(default_factory=list)
     exit_code: Optional[int] = None
     stderr: str = ""
+    # Durable-store fields (issue #3); populated only when a ScriptRunStore is
+    # supplied to run_script. Left None/0 for in-memory runs so existing callers
+    # are unaffected.
+    run_id: Optional[str] = None
+    journal_path: Optional[str] = None
+    replayed_calls: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +114,9 @@ class ScriptRunResult:
             "calls": self.calls,
             "exit_code": self.exit_code,
             "stderr": self.stderr,
+            "run_id": self.run_id,
+            "journal_path": self.journal_path,
+            "replayed_calls": self.replayed_calls,
         }
 
 
@@ -116,16 +138,33 @@ class CapabilityBroker:
         *,
         journal: Optional[JournalSink] = None,
         redact: bool = True,
+        recorder: Optional[CallRecorder] = None,
+        replay: Optional[ReplayCache] = None,
+        deterministic_runner: bool = False,
     ) -> None:
         self._runner = agent_runner
         self._limits = limits
         self._journal = journal
         self._redact = redact
+        # Durable-store seams (issue #3): a recorder persists deterministic call
+        # results for future replay; a replay cache serves them instead of
+        # re-dispatching. Both default off, so the broker is unchanged for
+        # in-memory runs and the broker unit tests.
+        self._recorder = recorder
+        self._replay = replay
+        self._deterministic_runner = deterministic_runner
         self._rpc_calls = 0
         self._agent_calls = 0
         self._kanban_calls = 0
         self._tokens = 0
+        self._replayed_calls = 0
         self.should_abort = False
+        self.abort_reason: Optional[str] = None
+
+    @property
+    def replayed_calls(self) -> int:
+        """Number of calls served from the replay cache this run."""
+        return self._replayed_calls
 
     # -- budget view piggybacked on every ret frame ------------------------
     def _budget_info(self) -> dict[str, Any]:
@@ -147,15 +186,31 @@ class CapabilityBroker:
             self._rpc_calls += 1
             if self._rpc_calls > self._limits.max_rpc_calls:
                 self.should_abort = True
+                self.abort_reason = "aborted: capability hard-limit exceeded"
                 raise CapabilityDenied(
                     f"max_rpc_calls ({self._limits.max_rpc_calls}) exceeded", code="limit_rpc"
                 )
             if method not in _ALLOWED_METHODS:
                 raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
 
+            # Replay: serve a deterministic call from the cache instead of
+            # re-dispatching. A hit returns the recorded value without touching
+            # the runner; a method/args drift fails closed; a miss falls through
+            # to a live dispatch (the call was non-replayable in the source run).
+            if self._replay is not None:
+                replayed = self._maybe_replay(call_id, method, params)
+                if replayed is not _MISS:
+                    return replayed
+
             value = self._dispatch(method, params)
-            self._emit(self._call_event(call_id, method, params, ok=True))
-            return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": value, "budget": self._budget_info()}
+            # The effect has already happened. Persist (replay cache + journal)
+            # on a best-effort basis *after* building the success frame so a
+            # disk/IO failure here never masquerades as a runner failure for a
+            # call that actually succeeded (and may have produced an external
+            # side effect a live runner cannot take back).
+            ret = {"t": rpc.T_RET, "id": call_id, "ok": True, "value": value, "budget": self._budget_info()}
+            self._persist_success(call_id, method, params, value)
+            return ret
         except CapabilityDenied as denied:
             self._emit(self._call_event(call_id, method, params, ok=False, error=denied.code))
             return {
@@ -173,6 +228,65 @@ class CapabilityBroker:
                 "error": {"code": "runner_error", "message": f"{type(exc).__name__}: {exc}"},
                 "budget": self._budget_info(),
             }
+
+    def _persist_success(self, call_id: Any, method: str, params: dict[str, Any], value: Any) -> None:
+        """Best-effort persist a successful call (replay cache + journal event).
+
+        Both writes are guarded independently: a cache write failure still lets
+        the journal event through, and either failure is swallowed rather than
+        reported as a runner failure for a call that already succeeded. A lost
+        cache line is fail-safe — on replay the missing id is a miss and the call
+        simply re-runs.
+        """
+        if self._recorder is not None and is_replayable(
+            method, deterministic_runner=self._deterministic_runner
+        ):
+            try:
+                self._recorder.record(call_id, method, replay_args_hash(method, params), value)
+            except Exception:  # noqa: BLE001 — persistence is best-effort.
+                pass
+        try:
+            self._emit(self._call_event(call_id, method, params, ok=True))
+        except Exception:  # noqa: BLE001 — journaling is best-effort.
+            pass
+
+    def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
+        """Consult the replay cache for ``call_id``.
+
+        Returns the ``ret`` frame on a hit, raises :class:`CapabilityDenied`
+        (``replay_mismatch``, abort) on a method/args drift, or returns
+        :data:`_MISS` when there is no cached entry (the caller dispatches live).
+        """
+        entry = self._replay.get(call_id)  # type: ignore[union-attr]
+        if entry is None:
+            return _MISS
+        args_hash = replay_args_hash(method, params) if isinstance(params, dict) else ""
+        if entry.method != method or entry.args_hash != args_hash:
+            self.should_abort = True
+            self.abort_reason = (
+                f"replay drift at call {call_id}: recorded {entry.method!r} does not "
+                f"match {method!r} (or arguments changed)"
+            )
+            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+        # Hit. Mirror the live accounting so cap-/budget-gated control flow in the
+        # script reproduces the recorded run:
+        #  * advance the soft per-method counters, so a later *non-cached* call
+        #    still trips max_agent_calls / max_kanban_calls at the same point it
+        #    did on the recorded run;
+        #  * re-apply the recorded non-negative token spend (a negative/absent
+        #    value is ignored — the hard cap is not re-enforced on a faithful
+        #    replay, so a tampered _tokens must not skew the budget downward).
+        if method == "agent":
+            self._agent_calls += 1
+        elif method == "kanban_agent":
+            self._kanban_calls += 1
+        if method in ("agent", "kanban_agent") and isinstance(entry.value, dict):
+            usage = entry.value.get("_tokens")
+            if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+                self._tokens += usage
+        self._replayed_calls += 1
+        self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "log":
@@ -247,7 +361,14 @@ class CapabilityBroker:
         return output
 
     def _call_event(
-        self, call_id: Any, method: Any, params: dict[str, Any], *, ok: bool, error: Optional[str] = None
+        self,
+        call_id: Any,
+        method: Any,
+        params: dict[str, Any],
+        *,
+        ok: bool,
+        error: Optional[str] = None,
+        replayed: bool = False,
     ) -> dict[str, Any]:
         event: dict[str, Any] = {"type": "rpc_call", "call_id": call_id, "method": method, "ok": ok}
         if method in ("agent",):
@@ -258,6 +379,8 @@ class CapabilityBroker:
             event["label"] = params.get("label")
         if error:
             event["error"] = error
+        if replayed:
+            event["replayed"] = True
         if not self._redact:
             event["params"] = params
         return event
@@ -292,11 +415,18 @@ class WorkflowVM:
         limits: Optional[VMLimits] = None,
         journal: Optional[JournalSink] = None,
         python_executable: Optional[str] = None,
+        recorder: Optional[CallRecorder] = None,
+        replay: Optional[ReplayCache] = None,
+        deterministic_runner: bool = False,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._limits = limits if limits is not None else VMLimits()
         self._journal = journal
         self._python = python_executable or sys.executable
+        # Durable-store wiring (issue #3): forwarded to the per-run broker.
+        self._recorder = recorder
+        self._replay = replay
+        self._deterministic_runner = deterministic_runner
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -322,9 +452,18 @@ class WorkflowVM:
             if external_sink is not None:
                 external_sink(event)
 
-        broker = CapabilityBroker(self._runner, self._limits, journal=_collect)
+        broker = CapabilityBroker(
+            self._runner,
+            self._limits,
+            journal=_collect,
+            recorder=self._recorder,
+            replay=self._replay,
+            deterministic_runner=self._deterministic_runner,
+        )
         try:
-            return self._drive(script, args, broker, calls)
+            result = self._drive(script, args, broker, calls)
+            result.replayed_calls = broker.replayed_calls
+            return result
         except Exception as exc:  # noqa: BLE001 - keep unexpected VM bugs contained.
             return ScriptRunResult(
                 ok=False,
@@ -409,7 +548,7 @@ class WorkflowVM:
                         break
                     if broker.should_abort:
                         _kill(proc)
-                        protocol_error = "aborted: capability hard-limit exceeded"
+                        protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
                         break
                 elif kind == rpc.T_DONE:
                     done = frame
@@ -505,6 +644,36 @@ def _close(stream: Any) -> None:
         pass
 
 
+def _limits_view(limits: VMLimits) -> dict[str, Any]:
+    """A small, metadata-only snapshot of the limits for the durable run.json."""
+    return {
+        "max_rpc_calls": limits.max_rpc_calls,
+        "max_agent_calls": limits.max_agent_calls,
+        "max_kanban_calls": limits.max_kanban_calls,
+        "max_runtime_s": limits.max_runtime_s,
+        "allow_nested_workflows": limits.allow_nested_workflows,
+        "token_budget": limits.token_budget,
+    }
+
+
+def _limits_from_view(view: dict[str, Any]) -> VMLimits:
+    """Rebuild :class:`VMLimits` from a persisted ``_limits_view`` snapshot.
+
+    Used to pin a replay's caps/budget to the recorded run so budget-/cap-gated
+    control flow reproduces faithfully when the caller does not pass explicit
+    ``limits=``. Unknown/missing keys fall back to the :class:`VMLimits` default.
+    """
+    default = VMLimits()
+    return VMLimits(
+        max_rpc_calls=int(view.get("max_rpc_calls", default.max_rpc_calls)),
+        max_agent_calls=int(view.get("max_agent_calls", default.max_agent_calls)),
+        max_kanban_calls=int(view.get("max_kanban_calls", default.max_kanban_calls)),
+        max_runtime_s=float(view.get("max_runtime_s", default.max_runtime_s)),
+        allow_nested_workflows=bool(view.get("allow_nested_workflows", default.allow_nested_workflows)),
+        token_budget=view.get("token_budget"),
+    )
+
+
 def run_script(
     script: str,
     *,
@@ -513,7 +682,115 @@ def run_script(
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
+    store: Optional[ScriptRunStore] = None,
+    run_id: Optional[str] = None,
+    replay_from: Optional[str] = None,
+    deterministic_runner: Optional[bool] = None,
 ) -> ScriptRunResult:
-    """Convenience wrapper: construct a :class:`WorkflowVM` and run one script."""
-    vm = WorkflowVM(agent_runner=agent_runner, limits=limits, journal=journal)
-    return vm.run(script, args=args, validate=validate)
+    """Construct a :class:`WorkflowVM` and run one script, optionally durable.
+
+    Without ``store`` this is the original in-memory convenience wrapper. With a
+    ``store`` the run is persisted under a stable ``run_id`` (minted if omitted):
+    a ``run.json`` metadata snapshot, a metadata-only ``journal.jsonl``
+    (``boot`` / ``call`` / ``done``), and — for deterministic calls — a
+    ``cache.jsonl`` replay cache.
+
+    ``replay_from`` names a prior run whose deterministic calls are served from
+    the cache instead of being re-dispatched (``store`` is required, and the
+    cache is loaded up front so a corrupt/missing cache raises a typed
+    :class:`~hermes_workflows.errors.ScriptRunStoreError` *before* any subprocess
+    is spawned). ``deterministic_runner`` overrides the default detection
+    (``isinstance(runner, StubAgentRunner)``); set it ``True`` only when the
+    injected runner is a pure function of its inputs, or agent/kanban results
+    will not be cached.
+    """
+    runner = agent_runner if agent_runner is not None else StubAgentRunner()
+    deterministic = (
+        deterministic_runner
+        if deterministic_runner is not None
+        else isinstance(runner, StubAgentRunner)
+    )
+
+    # Resolve replay up front, before touching the subprocess, so every failure
+    # (no store, identity mismatch, corrupt/missing cache) fails closed and
+    # typed rather than mid-run.
+    replay_cache: Optional[ReplayCache] = None
+    source_limits: Optional[dict[str, Any]] = None
+    if replay_from is not None:
+        if store is None:
+            raise ValueError("replay_from requires a store")
+        # Bind the replay to the exact (script, args) that produced the cache.
+        # The per-call method+args_hash guard is local to each call; without this
+        # identity check a *different* script/args could be served another run's
+        # cached values at every coincidentally-matching call id, undetected.
+        source = store.load_run(replay_from)
+        if source.script_sha256 != script_sha256(script) or source.args_hash != canonical_hash(args):
+            raise ValueError(
+                f"replay_from {replay_from!r} does not match this script/args "
+                "(script_sha256 or args_hash differs); a replay must reproduce the recorded run"
+            )
+        replay_cache = store.load_cache(replay_from)
+        source_limits = source.limits
+
+    # Default a replay's caps/budget to the recorded run's so budget-/cap-gated
+    # control flow reproduces faithfully; an explicit limits= still overrides.
+    if limits is not None:
+        effective_limits = limits
+    elif source_limits is not None:
+        effective_limits = _limits_from_view(source_limits)
+    else:
+        effective_limits = VMLimits()
+
+    if store is None:
+        vm = WorkflowVM(
+            agent_runner=runner,
+            limits=effective_limits,
+            journal=journal,
+            replay=replay_cache,
+            deterministic_runner=deterministic,
+        )
+        return vm.run(script, args=args, validate=validate)
+
+    # Durable path: validate up front so a rejected script never leaves an
+    # orphan run directory, then begin -> drive -> finish.
+    if validate:
+        validation = validate_script(script)
+        if not validation.ok:
+            raise ScriptValidationError(validation.diagnostics)
+
+    persist_run_id = run_id if run_id is not None else store.next_run_id(script, args)
+    store.begin(
+        persist_run_id,
+        script=script,
+        args=args,
+        limits=_limits_view(effective_limits),
+        deterministic_runner=deterministic,
+        replay_of=replay_from,
+    )
+
+    def _store_journal(event: dict[str, Any]) -> None:
+        store.note_call(persist_run_id, event)
+        if journal is not None:
+            journal(event)
+
+    # Record cache entries only on a fresh run; a replay consumes the cache.
+    recorder = store.recorder(persist_run_id) if replay_cache is None else None
+    vm = WorkflowVM(
+        agent_runner=runner,
+        limits=effective_limits,
+        journal=_store_journal,
+        recorder=recorder,
+        replay=replay_cache,
+        deterministic_runner=deterministic,
+    )
+    result = vm.run(script, args=args, validate=False)
+    result.run_id = persist_run_id
+    result.journal_path = str(store.journal_path(persist_run_id))
+    store.finish(
+        persist_run_id,
+        status="succeeded" if result.ok else "failed",
+        meta=result.meta,
+        value=result.value,
+        error=result.error,
+    )
+    return result
