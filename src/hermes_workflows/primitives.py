@@ -18,8 +18,17 @@ from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
+from .script_validator import ScriptValidation, validate_script
+from .vm import JournalSink, ScriptRunResult, VMLimits, run_script
 
-__all__ = ["workflow", "workflow_validate", "workflow_run", "workflow_status"]
+__all__ = [
+    "workflow",
+    "workflow_validate",
+    "workflow_run",
+    "workflow_status",
+    "workflow_validate_script",
+    "run_workflow_script",
+]
 
 
 def workflow(
@@ -262,6 +271,45 @@ def workflow_run(
 
     store.set_status(rid, "succeeded", result=final)
     return RunHandle(run_id=rid, status="succeeded", created_at=record.created_at, def_hash=h)
+
+
+def workflow_validate_script(source: str) -> ScriptValidation:
+    """Statically validate a *Python workflow script* against the launch gate.
+
+    This is the side-effect-free, library/operator primitive behind the
+    subprocess VM (:mod:`hermes_workflows.vm`). It never executes the script; it
+    only reports whether the script is safe to launch and, if so, its parsed
+    ``meta``. See :mod:`hermes_workflows.script_validator` for the contract.
+    """
+    return validate_script(source)
+
+
+def run_workflow_script(
+    source: str,
+    *,
+    args: Any = None,
+    agent_runner: Optional[AgentRunner] = None,
+    limits: Optional[VMLimits] = None,
+    journal: Optional[JournalSink] = None,
+    validate: bool = True,
+) -> ScriptRunResult:
+    """Run a Python workflow script in the parent-owned subprocess VM.
+
+    The script is statically gated (unless ``validate=False``), then executed in
+    a sandboxed subprocess with a scrubbed environment and a narrow RPC surface;
+    every capability call is brokered and journaled by the parent. Returns a
+    :class:`~hermes_workflows.vm.ScriptRunResult`. This is a library/operator
+    primitive: it is intentionally **not** registered as a model-facing tool, so
+    the declarative ``workflow`` facade and JSON runtime are unchanged.
+    """
+    return run_script(
+        source,
+        args=args,
+        agent_runner=agent_runner,
+        limits=limits,
+        journal=journal,
+        validate=validate,
+    )
 
 
 def workflow_status(

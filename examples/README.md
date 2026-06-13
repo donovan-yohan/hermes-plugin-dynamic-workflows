@@ -61,6 +61,30 @@ recorded, and progress `2 / 2`.
 The `run_id` follows the scheme `wf_<def_hash8>_<uuid12>`, so it sorts by
 source definition and correlates back to the workflow via its `def_hash`.
 
+## `hello_script.workflow.py` — subprocess script VM (issue #2)
+
+A Python *script* counterpart to `hello.workflow.json`. Instead of a declarative
+AST, it is deterministic orchestration code that runs in a sandboxed subprocess
+behind a parent-owned RPC capability broker (see [DESIGN.md §5](../DESIGN.md)).
+It is **not** loaded by the JSON template catalog (which only globs
+`*.workflow.json`) and is **not** a model-facing tool.
+
+```bash
+python -c '
+from hermes_workflows import workflow_validate_script, run_workflow_script
+src = open("examples/hello_script.workflow.py").read()
+print("validate ok:", workflow_validate_script(src).ok)
+res = run_workflow_script(src, args={"name": "world"})
+print("run ok:", res.ok, "value:", res.value)
+print("calls:", [(c["method"], c["call_id"]) for c in res.calls])
+'
+```
+
+Expected: `validate ok: True`, `run ok: True value: {"greeting": "hello, world",
+"shout": "HELLO, WORLD"}`, and a journaled call list with stable, ascending call
+ids. Pass `agent_runner=` to `run_workflow_script` to swap in a real Hermes
+fan-out, or `limits=VMLimits(...)` to tighten budgets and caps.
+
 ## Notes
 
 - Swap in a real Hermes fan-out by passing `agent_runner=` to `workflow_run`.
