@@ -1,0 +1,84 @@
+{
+  "version": "1",
+  "name": "relay_github_exact_head",
+  "description": "Offline fixture proving Relay release evidence is threaded through one exact PR head SHA.",
+  "inputs": {
+    "repo": "string",
+    "pr_number": "int"
+  },
+  "policy": {
+    "network": false,
+    "filesystem": false,
+    "max_parallel": 2
+  },
+  "steps": [
+    {
+      "kind": "agent",
+      "id": "github_head",
+      "agent": "hermes.github.pr_head",
+      "input": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number"
+      },
+      "output_schema": {
+        "head_sha": "string",
+        "head_ref": "string"
+      }
+    },
+    {
+      "kind": "kanban_agent",
+      "id": "qa_gate",
+      "profile": "relayqa",
+      "task": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number",
+        "exact_head_sha": "$ref:github_head.output.head_sha"
+      },
+      "input": {
+        "exact_head_sha": "$ref:github_head.output.head_sha"
+      },
+      "output_schema": {
+        "task_id": "string",
+        "status": "string",
+        "result": "object"
+      },
+      "depends_on": ["github_head"]
+    },
+    {
+      "kind": "kanban_agent",
+      "id": "review_gate",
+      "profile": "relayreviewer",
+      "task": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number",
+        "exact_head_sha": "$ref:github_head.output.head_sha"
+      },
+      "input": {
+        "exact_head_sha": "$ref:github_head.output.head_sha"
+      },
+      "output_schema": {
+        "task_id": "string",
+        "status": "string",
+        "result": "object"
+      },
+      "depends_on": ["github_head"]
+    },
+    {
+      "kind": "agent",
+      "id": "release_decision",
+      "agent": "hermes.github.release_exact_head",
+      "input": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number",
+        "expected_head_sha": "$ref:github_head.output.head_sha",
+        "qa": "$ref:qa_gate.output.result",
+        "review": "$ref:review_gate.output.result"
+      },
+      "output_schema": {
+        "release": "bool",
+        "head_sha": "string"
+      },
+      "depends_on": ["qa_gate", "review_gate"]
+    }
+  ]
+}

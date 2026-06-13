@@ -2,7 +2,7 @@
 
 A prototype Hermes Agent plugin for **Claude Code–style dynamic workflows**: a lightweight,
 sandboxed orchestration runtime where an agent can validate, run, and inspect workflow definitions
-made of `agent`, `kanban_agent`, `parallel`, `pipeline`, and `phase` steps.
+made of `agent`, `kanban_agent`, `if`, `parallel`, `pipeline`, and `phase` steps.
 
 The product-shaped surface is now the single model-facing `workflow` tool: validate with `dry_run`,
 run with a workflow definition, or inspect an existing run with `run_id`. The lower-level
@@ -30,7 +30,8 @@ The current runtime supports:
 
 - declarative JSON workflow definitions
 - `$ref:inputs.<key>` and `$ref:<step>.output.<field>` data wiring
-- deterministic `agent` / `kanban_agent` / `parallel` / `pipeline` / `phase` composition
+- deterministic `agent` / `kanban_agent` / `if` / `parallel` / `pipeline` / `phase` composition
+- declarative saved workflow templates via catalog listing and `run_template`
 - flat structured-output schema checks
 - default-deny sandbox policy linting
 - in-memory run storage for library use
@@ -103,6 +104,11 @@ hermes plugins list
 The plugin registers this tool in the `dynamic_workflows` toolset:
 
 - `workflow` — the single model-facing entry point
+  - `action: "validate"` / `dry_run: true` validates a supplied definition.
+  - `action: "run"` runs a supplied definition.
+  - `action: "status"` reads a prior `run_id`.
+  - `action: "catalog"` lists saved templates from bundled examples and `$HERMES_WORKFLOWS_CATALOG_DIR` or `$HERMES_HOME/dynamic-workflows/templates`.
+  - `action: "run_template"` loads a safe `<name>.workflow.json` template and runs it; `template_name` alone also infers `run_template`.
 
 The lower-level `workflow_validate`, `workflow_run`, and `workflow_status` functions remain available
 for tests, library callers, and operator/debug integrations, but they are not registered as
@@ -145,6 +151,28 @@ If Hermes does not show `workflow` after restart, check:
 }
 ```
 
+### Conditional control flow
+
+`if` steps evaluate a deterministic condition and expose only the container output to later steps.
+Branch-local step ids do not leak outside the selected branch; downstream steps should reference
+`$ref:<if_step>.output.branch` or `$ref:<if_step>.output.output`.
+
+```json
+{
+  "kind": "if",
+  "id": "needs_fix",
+  "condition": { "ref": "$ref:qa_gate.output.passed", "op": "eq", "value": false },
+  "then": [
+    { "kind": "agent", "id": "fix", "agent": "hermes.echo", "input": { "mode": "fix" }, "output_schema": { "echo": "object" } }
+  ],
+  "else": [
+    { "kind": "agent", "id": "ship", "agent": "hermes.echo", "input": { "mode": "ship" }, "output_schema": { "echo": "object" } }
+  ]
+}
+```
+
+Supported condition operators are `truthy`, `exists`, `eq`, and `ne`.
+
 ### Kanban-backed awaitable step
 
 `kanban_agent` is the durable-backend contract. The skeleton does not call Kanban directly; it
@@ -165,6 +193,24 @@ id to a Hermes Kanban board/profile, persist the task id, and wake the workflow 
 This is the first replacement seam for timer watchdog orchestration: workflows await a durable task
 result instead of polling status just to decide the next step. The current stub runner returns a
 deterministic `kb_<hash>` task id for tests.
+
+## Saved workflow catalog
+
+Templates are JSON workflow files named `<template>.workflow.json`. The default catalog searches the
+bundled `examples/` directory plus `$HERMES_WORKFLOWS_CATALOG_DIR` when set, otherwise
+`$HERMES_HOME/dynamic-workflows/templates`. Template names are single safe path segments; path
+traversal and symlink escapes are rejected/skipped.
+
+```python
+from hermes_workflows.primitives import workflow
+
+print(workflow(action="catalog"))
+print(workflow(template_name="hello", inputs={"name": "world"}))
+```
+
+The bundled `relay_github_exact_head` template is an offline contract fixture for Relay-style PR
+gates: it captures the PR head once, passes that exact SHA through QA/review steps, and only allows
+the release decision to succeed when QA/review evidence matches the same head.
 
 ## Architecture at a glance
 

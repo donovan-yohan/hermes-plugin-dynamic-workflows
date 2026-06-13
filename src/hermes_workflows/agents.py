@@ -109,6 +109,26 @@ class StubAgentRunner:
         if agent_id == "hermes.noop":
             return {}
 
+        if agent_id == "hermes.github.pr_head":
+            return {
+                "head_sha": str(input.get("head_sha") or input.get("expected_head_sha") or "stub-head-sha"),
+                "head_ref": str(input.get("head_ref") or "stub-head"),
+            }
+
+        if agent_id == "hermes.github.release_exact_head":
+            expected = str(input.get("expected_head_sha") or "")
+            qa_value = input.get("qa")
+            review_value = input.get("review")
+            qa = qa_value if isinstance(qa_value, dict) else {}
+            review = review_value if isinstance(review_value, dict) else {}
+            release = (
+                bool(qa.get("approved", True))
+                and bool(review.get("approved", True))
+                and qa.get("head_sha", expected) == expected
+                and review.get("head_sha", expected) == expected
+            )
+            return {"release": release, "head_sha": expected}
+
         if agent_id.startswith("kanban."):
             profile = agent_id.split(".", 1)[1]
             return {

@@ -35,9 +35,11 @@ def workflow(
     definition: dict | str | None = None,
     inputs: dict | None = None,
     run_id: str | None = None,
+    template_name: str | None = None,
     action: str | None = None,
     dry_run: bool = False,
     registry: RunStore | None = None,
+    catalog: FileWorkflowCatalog | None = None,
     agent_runner: AgentRunner | None = None,
     validate: bool = True,
     max_parallel: int = 8,
@@ -71,8 +73,9 @@ def workflow_status(
 ```
 
 - **`workflow`** chooses the operation from supplied fields: `dry_run` or
-  `action='validate'` validates only, a `definition` runs, and `run_id` without a
-  definition reads status. It is the tool shape meant for model use.
+  `action='validate'` validates only, a `definition` runs, `template_name` runs a
+  saved catalog template, `action='catalog'` lists saved templates, and `run_id`
+  without a definition reads status. It is the tool shape meant for model use.
 
 - **`workflow_validate`** parses (`definition` may be a parsed `dict` or a JSON
   string), validates the schema, and runs the sandbox-policy lint. It has **no
@@ -125,9 +128,10 @@ def workflow_status(
 | File | Responsibility |
 |------|----------------|
 | `primitives.py` | Public entry points; `workflow` facade plus explicit validate/run/status primitives. |
+| `catalog.py` | File-backed saved template catalog for safe `<name>.workflow.json` listing/loading. |
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
-| `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
+| `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
 | `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `FileRunStore` snapshots/journals; `KanbanRunStore` documented/stubbed. |
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
@@ -151,6 +155,7 @@ Step kinds are discriminated by `"kind"`:
 
 - **`agent`** — `{ "kind":"agent", "id", "agent", "input", "output_schema"?, "depends_on"? }`
 - **`kanban_agent`** — `{ "kind":"kanban_agent", "id", "profile", "task", "input"?, "wait"?, "output_schema"?, "depends_on"? }` (durable Kanban-backed awaitable contract; skeleton routes through `kanban.<profile>` runner id)
+- **`if`** — `{ "kind":"if", "id", "condition": {"ref", "op", "value"?}, "then": [Step, ...], "else"?: [Step, ...] }` (deterministic conditional; branch-local step ids do not leak outside the container)
 - **`parallel`** — `{ "kind":"parallel", "id", "branches": [Step, ...] }` (fan-out, joins all branches)
 - **`pipeline`** — `{ "kind":"pipeline", "id", "steps": [Step, ...] }` (each step's output feeds the next; no-barrier by default)
 - **`phase`** — `{ "kind":"phase", "id", "label", "steps": [Step, ...] }` (explicit barrier: all inner steps complete before the next phase)

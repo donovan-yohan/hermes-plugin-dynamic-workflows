@@ -117,7 +117,7 @@ def test_run_records_both_steps():
     assert {"greet", "shout"} <= recorded
 
     for s in status.steps:
-        assert s.kind in ("agent", "kanban_agent", "parallel", "pipeline", "phase")
+        assert s.kind in ("agent", "kanban_agent", "parallel", "pipeline", "phase", "if")
         assert isinstance(s.status, str) and s.status
         # The two top-level steps are agent steps.
         if s.step_id in {"greet", "shout"}:

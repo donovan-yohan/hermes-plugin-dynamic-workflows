@@ -30,6 +30,7 @@ from hermes_workflows.primitives import (  # noqa: E402
     workflow_validate as _workflow_validate,
 )
 from hermes_workflows.registry import FileRunStore  # noqa: E402
+from hermes_workflows.catalog import FileWorkflowCatalog  # noqa: E402
 
 TOOLSET = "dynamic_workflows"
 
@@ -67,6 +68,10 @@ def _plugin_store() -> FileRunStore:
     return FileRunStore(root)
 
 
+def _plugin_catalog() -> FileWorkflowCatalog:
+    return FileWorkflowCatalog()
+
+
 WORKFLOW_SCHEMA = {
     "name": "workflow",
     "description": (
@@ -79,7 +84,7 @@ WORKFLOW_SCHEMA = {
         "properties": {
             "action": {
                 "type": ["string", "null"],
-                "enum": ["validate", "run", "status", None],
+                "enum": ["validate", "run", "status", "catalog", "run_template", None],
                 "description": "Optional explicit operation. Defaults from supplied fields.",
                 "default": None,
             },
@@ -96,6 +101,11 @@ WORKFLOW_SCHEMA = {
             "run_id": {
                 "type": ["string", "null"],
                 "description": "Existing run id for status, or caller-supplied id for run.",
+                "default": None,
+            },
+            "template_name": {
+                "type": ["string", "null"],
+                "description": "Safe template name for action=run_template.",
                 "default": None,
             },
             "dry_run": {
@@ -214,8 +224,10 @@ def _handle_workflow(params: dict[str, Any], **_: Any) -> str:
             definition=params.get("definition"),
             inputs=params.get("inputs"),
             run_id=params.get("run_id"),
+            template_name=params.get("template_name"),
             dry_run=params.get("dry_run", False),
             registry=store,
+            catalog=_plugin_catalog(),
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),
