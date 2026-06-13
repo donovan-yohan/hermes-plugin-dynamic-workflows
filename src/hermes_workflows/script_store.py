@@ -1,0 +1,569 @@
+"""Durable run store and deterministic replay cache for workflow scripts (issue #3).
+
+The subprocess VM (:mod:`hermes_workflows.vm`) runs a model-authored Python
+orchestration script out-of-process and produces a metadata-only ``calls``
+journal with **stable, ascending RPC call ids** (1, 2, 3, ...). Because the
+script is deterministic — given the same ``args`` and the same sequence of RPC
+return values it makes the exact same sequence of calls in the exact same order
+— those call ids are a stable address space across runs of the same script.
+
+This module turns that into durability:
+
+* :class:`ScriptRunStore` persists each run under ``<root>/<run_id>/`` as a
+  bounded ``run.json`` metadata snapshot, a metadata-only ``journal.jsonl``
+  (``boot`` / ``call`` / ``done`` events — no raw inputs/outputs/prompts), and a
+  separate ``cache.jsonl`` replay cache.
+* The **replay cache** records the *result* of every deterministic capability
+  call keyed by its stable call id, plus a ``method`` + canonical ``args_hash``
+  integrity tag. On a later replay the parent broker serves those calls from the
+  cache instead of re-dispatching to the :class:`AgentRunner`, so deterministic
+  work is not duplicated.
+
+What is *replayable* is deliberately conservative (see :func:`is_replayable`):
+``log`` / ``phase`` always (their result is a constant ``None``), and
+``agent`` / ``kanban_agent`` **only** when the caller declares the injected
+runner deterministic (the default :class:`StubAgentRunner` is — a pure function
+of its inputs). A live, non-deterministic Hermes runner caches no agent output,
+so on replay those calls re-run rather than returning a stale value. We do not
+fake safety: caching is opt-in to determinism.
+
+Failure is fail-closed and typed. A missing run, a corrupt ``run.json`` /
+``cache.jsonl`` line, or an incompatible ``schema_version`` raises a
+:class:`~hermes_workflows.errors.ScriptRunStoreError` subclass at load time —
+never a bare exception — so the parent can decline to replay without corrupting
+state. A mid-run *drift* (a replayed call whose method/args no longer match the
+recorded run) is surfaced inside the run as a ``replay_mismatch`` denial that
+aborts the subprocess (see :mod:`hermes_workflows.vm`).
+
+This module is pure Python 3.11 stdlib.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import threading
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from .errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
+from .registry import utc_now_iso
+
+__all__ = [
+    "SCRIPT_SCHEMA_VERSION",
+    "ScriptRunMeta",
+    "ReplayEntry",
+    "ReplayCache",
+    "CallRecorder",
+    "ScriptRunStore",
+    "canonical_hash",
+    "script_sha256",
+    "script_run_id",
+    "replay_args_hash",
+    "is_replayable",
+]
+
+# Bump when the on-disk layout changes incompatibly. A run.json written by a
+# different version is refused at load time as a typed CorruptScriptRunError so
+# we never silently misread a stale schema.
+SCRIPT_SCHEMA_VERSION = 1
+
+# A run id must be usable as exactly one filesystem path segment (mirrors the
+# JSON-runtime FileRunStore guard). Minted ids are ``wfs_<hash8>_<uuid12>``.
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+# Methods whose result is a deterministic constant regardless of any runner:
+# both ``log`` and ``phase`` are pure side-effect metadata and return ``None``.
+_ALWAYS_REPLAYABLE = frozenset({"log", "phase"})
+# Methods that cross the AgentRunner boundary: replayable only when the runner
+# is declared deterministic for the run.
+_RUNNER_METHODS = frozenset({"agent", "kanban_agent"})
+
+
+def canonical_hash(obj: Any) -> str:
+    """Return the sha256 hex of a value's canonical JSON form.
+
+    ``sort_keys`` + compact separators make the encoding order-independent;
+    ``default=str`` is a safety net for any non-JSON leaf (real RPC params are
+    already JSON, so it rarely fires). Used for both the per-run ``args_hash``
+    and the per-call replay integrity tag.
+    """
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def script_sha256(script: str) -> str:
+    """Return the sha256 hex of the script source (full digest, not truncated)."""
+    return hashlib.sha256(script.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def script_run_id(script: str, args: Any = None) -> str:
+    """Mint ``wfs_<digest8>_<uuid12>`` for a script + args pair.
+
+    The 8-hex prefix is content-addressed (sha256 of the canonicalized
+    script+args) so ids sort by source; the 12-hex ``uuid4`` suffix keeps them
+    collision-resistant per run. Callers may always pass an explicit ``run_id``
+    instead, for idempotency or deterministic tests.
+    """
+    digest = canonical_hash({"script": script, "args": args})
+    return f"wfs_{digest[:8]}_{uuid.uuid4().hex[:12]}"
+
+
+def replay_args_hash(method: str, params: dict[str, Any]) -> str:
+    """Canonical integrity hash of a capability call's *semantic* arguments.
+
+    The cosmetic ``label`` (display-only, does not affect a call's result) is
+    excluded so a relabelled-but-equivalent call still replays. Everything else
+    in ``params`` (``agent_id``/``profile``, ``input``, ``task``, ``schema``)
+    participates, so any change that could change the result is detected as a
+    replay mismatch.
+    """
+    keyed = {k: v for k, v in params.items() if k != "label"}
+    return canonical_hash({"method": method, "params": keyed})
+
+
+def is_replayable(method: str, *, deterministic_runner: bool) -> bool:
+    """Whether a call of ``method`` may be cached/served from the replay cache.
+
+    ``log`` / ``phase`` always (constant ``None`` result). ``agent`` /
+    ``kanban_agent`` only when ``deterministic_runner`` is true. ``workflow`` and
+    anything else are never replayable.
+    """
+    if method in _ALWAYS_REPLAYABLE:
+        return True
+    if method in _RUNNER_METHODS:
+        return deterministic_runner
+    return False
+
+
+def _require_safe_run_id(run_id: str) -> None:
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(f"unsafe run_id: {run_id!r}")
+
+
+def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Keep only metadata-safe error fields for the durable journal.
+
+    Drops the free-text ``message`` (which a workflow script controls and could
+    fill with input/output-derived data) and keeps the structural ``type`` /
+    ``code`` / ``line``, honoring the journal's metadata-only contract.
+    """
+    if not isinstance(error, dict):
+        return error
+    return {k: error[k] for k in ("type", "code", "line") if k in error}
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort directory fsync after an atomic snapshot replace."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@dataclass
+class ScriptRunMeta:
+    """Durable metadata snapshot for one script run.
+
+    Holds no raw script source, inputs, or outputs — only content hashes,
+    lifecycle status, the run's ``meta`` literal (already public, name +
+    description), and a small ``limits`` view. ``value``/``error`` carry the
+    final result of the run (the script's chosen return, which the model already
+    intends to surface).
+    """
+
+    run_id: str
+    script_sha256: str
+    args_hash: str
+    status: str = "running"  # running | succeeded | failed
+    meta: Optional[dict[str, Any]] = None
+    limits: Optional[dict[str, Any]] = None
+    value: Any = None
+    error: Optional[dict[str, Any]] = None
+    deterministic_runner: bool = False
+    replay_of: Optional[str] = None
+    schema_version: int = SCRIPT_SCHEMA_VERSION
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "script_sha256": self.script_sha256,
+            "args_hash": self.args_hash,
+            "status": self.status,
+            "meta": self.meta,
+            "limits": self.limits,
+            "value": self.value,
+            "error": self.error,
+            "deterministic_runner": self.deterministic_runner,
+            "replay_of": self.replay_of,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class ReplayEntry:
+    """One cached deterministic call result, addressed by its stable call id."""
+
+    call_id: int
+    method: str
+    args_hash: str
+    value: Any
+
+
+class ReplayCache:
+    """Immutable, in-memory view of a run's ``cache.jsonl`` for replay.
+
+    Maps a stable call id to its :class:`ReplayEntry`. The parent broker consults
+    it before dispatching: a hit (matching method + args hash) returns the cached
+    value without touching the runner; a method/args drift is a fail-closed
+    mismatch; an absent id is a miss (the original call was non-replayable, so it
+    re-runs live).
+    """
+
+    def __init__(self, entries: dict[int, ReplayEntry], *, source_run_id: str) -> None:
+        self._entries = entries
+        self.source_run_id = source_run_id
+
+    def get(self, call_id: Any) -> Optional[ReplayEntry]:
+        if not isinstance(call_id, int):
+            return None
+        return self._entries.get(call_id)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+class CallRecorder:
+    """Append-only writer for one run's deterministic replay cache.
+
+    Each :meth:`record` writes one ``cache.jsonl`` line ``{call_id, method,
+    args_hash, value}`` and fsyncs, so a parent crash mid-run still leaves a
+    consistent prefix of cached calls. Only deterministic calls are recorded
+    (the broker decides via :func:`is_replayable`); the metadata journal records
+    *all* calls separately.
+    """
+
+    def __init__(self, path: Path, lock: threading.Lock) -> None:
+        self._path = path
+        self._lock = lock
+
+    def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
+        line = json.dumps(
+            {"call_id": call_id, "method": method, "args_hash": args_hash, "value": value},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+
+class ScriptRunStore:
+    """Filesystem-backed durable store for subprocess workflow-script runs.
+
+    Layout, one directory per run::
+
+        <root>/<run_id>/run.json       # bounded metadata snapshot (atomic write)
+        <root>/<run_id>/journal.jsonl  # metadata-only boot/call/done events
+        <root>/<run_id>/cache.jsonl    # deterministic replay cache (opt-in)
+
+    The store is the parent-owned persistence boundary; the workflow script (in
+    its subprocess) still has no filesystem authority. Concurrent writers within
+    one process are serialised by a single lock. ``root`` defaults are chosen by
+    the caller (e.g. ``$HERMES_HOME/dynamic-workflows/script-runs``).
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    # -- id minting -------------------------------------------------------
+    def next_run_id(self, script: str, args: Any = None) -> str:
+        """Mint a fresh content-addressed run id (see :func:`script_run_id`)."""
+        return script_run_id(script, args)
+
+    # -- lifecycle: begin -> note_call/record -> finish -------------------
+    def begin(
+        self,
+        run_id: str,
+        *,
+        script: str,
+        args: Any,
+        limits: Optional[dict[str, Any]],
+        deterministic_runner: bool,
+        replay_of: Optional[str] = None,
+    ) -> ScriptRunMeta:
+        """Create the run directory, write ``run.json`` (status=running), and a
+        ``boot`` journal event. Raises ``ValueError`` on a duplicate run id."""
+        _require_safe_run_id(run_id)
+        meta = ScriptRunMeta(
+            run_id=run_id,
+            script_sha256=script_sha256(script),
+            args_hash=canonical_hash(args),
+            limits=limits,
+            deterministic_runner=deterministic_runner,
+            replay_of=replay_of,
+        )
+        with self._lock:
+            run_dir = self._run_dir(run_id)
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
+                raise ValueError(f"run_id already exists: {run_id!r}") from exc
+            try:
+                self._write_meta(meta)
+                self._append_journal(
+                    run_id,
+                    "boot",
+                    {
+                        "script_sha256": meta.script_sha256,
+                        "args_hash": meta.args_hash,
+                        "deterministic_runner": deterministic_runner,
+                        "replay_of": replay_of,
+                        "limits": limits,
+                    },
+                )
+            except BaseException:
+                # Leave no orphan 'running' dir on a partial begin, so the same
+                # explicit run_id can be cleanly retried.
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise
+        return meta
+
+    def note_call(self, run_id: str, event: dict[str, Any]) -> None:
+        """Write a metadata-only ``call`` journal event from a broker event.
+
+        The broker emits one event per completed RPC call (call id, method,
+        agent id/profile, ok, error, ``replayed``). In this synchronous broker
+        the return outcome is folded into the same event, so the journal
+        vocabulary is ``boot`` / ``call`` / ``done`` (a separate ``return`` line
+        would carry no extra information). Raw ``params`` are never written.
+        """
+        data = {
+            "call_id": event.get("call_id"),
+            "method": event.get("method"),
+            "ok": event.get("ok"),
+        }
+        for key in ("agent_id", "profile", "label", "error", "replayed"):
+            if event.get(key) is not None:
+                data[key] = event.get(key)
+        with self._lock:
+            self._append_journal(run_id, "call", data)
+
+    def recorder(self, run_id: str) -> CallRecorder:
+        """Return the append-only replay-cache writer for ``run_id``."""
+        _require_safe_run_id(run_id)
+        return CallRecorder(self._cache_path(run_id), self._lock)
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        meta: Optional[dict[str, Any]],
+        value: Any,
+        error: Optional[dict[str, Any]],
+    ) -> None:
+        """Write the terminal ``run.json`` (status + result) and a ``done`` event.
+
+        Tolerant of a half-written ``run.json``: it reloads best-effort and, if
+        the metadata is unreadable, rewrites a minimal terminal record so the run
+        is never left stuck in ``running``.
+        """
+        _require_safe_run_id(run_id)
+        with self._lock:
+            # Truly best-effort reload: a *corrupt* or schema-drifted run.json
+            # must not make finish() raise (which would leave the run stuck in
+            # 'running' and the exception escape the caller). Fall back to a
+            # minimal terminal record on any load failure, not just a missing one.
+            try:
+                record = self._load_meta_unlocked(run_id, missing_ok=True)
+            except ScriptRunStoreError:
+                record = None
+            if record is None:
+                record = ScriptRunMeta(run_id=run_id, script_sha256="", args_hash="")
+            record.status = status
+            record.meta = meta
+            record.value = value
+            record.error = error
+            record.updated_at = utc_now_iso()
+            self._write_meta(record)
+            # The 'done' journal event is metadata-only: a script-authored
+            # exception message can carry arbitrary (possibly sensitive) text, so
+            # only its type/code/line reach the journal. The full error is kept
+            # on the operator-facing run.json (which already records value/error).
+            self._append_journal(
+                run_id,
+                "done",
+                {"status": status, "has_value": value is not None, "error": _redact_error(error)},
+            )
+
+    # -- reads ------------------------------------------------------------
+    def load_run(self, run_id: str) -> ScriptRunMeta:
+        """Load a run's metadata. Raises :class:`ScriptRunNotFound` if absent and
+        :class:`CorruptScriptRunError` on a malformed or stale-schema record."""
+        _require_safe_run_id(run_id)
+        with self._lock:
+            record = self._load_meta_unlocked(run_id, missing_ok=False)
+        assert record is not None
+        return record
+
+    def load_cache(self, run_id: str) -> ReplayCache:
+        """Load a run's deterministic replay cache.
+
+        Raises :class:`ScriptRunNotFound` if the run dir is absent and
+        :class:`CorruptScriptRunError` (reason ``"corrupt_cache"``) on any
+        malformed line or duplicate call id. An absent ``cache.jsonl`` for an
+        existing run is an *empty* cache (the run recorded nothing replayable),
+        not an error.
+        """
+        _require_safe_run_id(run_id)
+        if not self._run_dir(run_id).exists():
+            raise ScriptRunNotFound(run_id)
+        path = self._cache_path(run_id)
+        entries: dict[int, ReplayEntry] = {}
+        if not path.exists():
+            return ReplayCache(entries, source_run_id=run_id)
+        with path.open("r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, start=1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"cache.jsonl line {lineno}: {exc.msg}"
+                    ) from exc
+                call_id_raw = obj.get("call_id") if isinstance(obj, dict) else None
+                # ``isinstance(True, int)`` is True, so exclude bools explicitly:
+                # a forged ``call_id: true`` must not be accepted as call id 1.
+                if not isinstance(obj, dict) or not isinstance(call_id_raw, int) or isinstance(call_id_raw, bool):
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"cache.jsonl line {lineno}: bad entry shape"
+                    )
+                call_id = obj["call_id"]
+                if call_id in entries:
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
+                    )
+                entries[call_id] = ReplayEntry(
+                    call_id=call_id,
+                    method=str(obj.get("method")),
+                    args_hash=str(obj.get("args_hash")),
+                    value=obj.get("value"),
+                )
+        return ReplayCache(entries, source_run_id=run_id)
+
+    def journal(self, run_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Return the most recent metadata-only journal events for ``run_id``."""
+        _require_safe_run_id(run_id)
+        path = self._journal_path(run_id)
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8") as f:
+            lines = deque(f, maxlen=max(1, limit))
+        events: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def journal_path(self, run_id: str) -> Path:
+        _require_safe_run_id(run_id)
+        return self._journal_path(run_id)
+
+    # -- internals --------------------------------------------------------
+    def _load_meta_unlocked(self, run_id: str, *, missing_ok: bool) -> Optional[ScriptRunMeta]:
+        path = self._meta_path(run_id)
+        if not path.exists():
+            if missing_ok:
+                return None
+            raise ScriptRunNotFound(run_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise CorruptScriptRunError(run_id, "corrupt_run", f"run.json: {exc.msg}") from exc
+        if not isinstance(data, dict):
+            raise CorruptScriptRunError(run_id, "corrupt_run", "run.json is not an object")
+        version = data.get("schema_version")
+        if version != SCRIPT_SCHEMA_VERSION:
+            raise CorruptScriptRunError(
+                run_id, "schema_version",
+                f"run.json schema_version {version!r} != {SCRIPT_SCHEMA_VERSION}",
+            )
+        return ScriptRunMeta(
+            run_id=data.get("run_id", run_id),
+            script_sha256=data.get("script_sha256", ""),
+            args_hash=data.get("args_hash", ""),
+            status=data.get("status", "running"),
+            meta=data.get("meta"),
+            limits=data.get("limits"),
+            value=data.get("value"),
+            error=data.get("error"),
+            deterministic_runner=bool(data.get("deterministic_runner", False)),
+            replay_of=data.get("replay_of"),
+            schema_version=version,
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+        )
+
+    def _write_meta(self, record: ScriptRunMeta) -> None:
+        run_dir = self._run_dir(record.run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(record.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        tmp = run_dir / "run.json.tmp"
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._meta_path(record.run_id))
+        _fsync_dir(run_dir)
+
+    def _append_journal(self, run_id: str, event_type: str, data: dict[str, Any]) -> None:
+        event = {"ts": utc_now_iso(), "type": event_type, "run_id": run_id, **data}
+        with self._journal_path(run_id).open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _run_dir(self, run_id: str) -> Path:
+        _require_safe_run_id(run_id)
+        return self.root / run_id
+
+    def _meta_path(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "run.json"
+
+    def _journal_path(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "journal.jsonl"
+
+    def _cache_path(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "cache.jsonl"
+
+
+# A journal sink the VM accepts is just ``Callable[[dict], None]``; the store's
+# ``note_call`` is adapted into one by :mod:`hermes_workflows.vm`.
+JournalSink = Callable[[dict[str, Any]], None]

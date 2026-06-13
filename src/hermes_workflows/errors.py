@@ -20,6 +20,9 @@ __all__ = [
     "ScriptValidationError",
     "WorkflowSubprocessError",
     "CapabilityDenied",
+    "ScriptRunStoreError",
+    "ScriptRunNotFound",
+    "CorruptScriptRunError",
     # Diagnostic codes.
     "E_PARSE",
     "E_SCHEMA_TOPLEVEL",
@@ -183,3 +186,37 @@ class CapabilityDenied(WorkflowScriptError):
     def __init__(self, message: str, *, code: str = "capability_denied") -> None:
         self.code = code
         super().__init__(message)
+
+
+class ScriptRunStoreError(WorkflowScriptError):
+    """Base class for durable script-run store failures (issue #3).
+
+    Loading a persisted run or its replay cache can fail in well-defined ways —
+    the run does not exist, its files are corrupt, or it was written by an
+    incompatible store schema. Every such failure is one of these typed errors
+    so a caller can catch them without crashing parent state; the parent simply
+    declines to replay and may fall back to a fresh run.
+    """
+
+
+class ScriptRunNotFound(ScriptRunStoreError):
+    """Raised when a durable script run id has no persisted record."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"script run not found: {run_id!r}")
+
+
+class CorruptScriptRunError(ScriptRunStoreError):
+    """Raised when a persisted run/journal/cache is unreadable or stale.
+
+    Covers a malformed ``run.json``/``cache.jsonl`` line and an incompatible
+    ``schema_version``. ``reason`` is a short stable token (``"corrupt_run"``,
+    ``"corrupt_cache"``, ``"schema_version"``) so callers/tests can branch on the
+    failure class without parsing the message.
+    """
+
+    def __init__(self, run_id: str, reason: str, message: Optional[str] = None) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(message or f"corrupt script run {run_id!r}: {reason}")

@@ -239,6 +239,49 @@ timeout marks the run failed without corrupting parent state. See
 This surface is intentionally a library/operator primitive: the single
 model-facing `workflow` tool and the JSON runtime are unchanged.
 
+### Durable runs and deterministic replay (issue #3)
+
+Because the broker journals every capability call with a **stable, ascending
+call id** and a deterministic script makes the same calls in the same order,
+runs can be persisted and replayed without redoing deterministic work. Pass a
+`ScriptRunStore` to persist a run; pass `replay_from` to serve a prior run's
+deterministic calls from cache instead of re-dispatching them.
+
+```python
+from hermes_workflows import run_workflow_script
+from hermes_workflows.script_store import ScriptRunStore
+
+store = ScriptRunStore("/tmp/hermes-script-runs")  # e.g. $HERMES_HOME/dynamic-workflows/script-runs
+
+script = '''
+meta = {"name": "demo", "description": "greet then shout"}
+g = await agent("hermes.greeter", {"subject": args["who"]}, schema={"greeting": "string"})
+s = await agent("hermes.uppercaser", {"text": g["greeting"]})
+return {"shout": s["result"]}
+'''
+
+rec = run_workflow_script(script, args={"who": "world"}, store=store, run_id="run-1")
+print(rec.run_id, rec.value, rec.journal_path)   # run-1 {'shout': 'HELLO, WORLD'} .../journal.jsonl
+
+# Replay: deterministic calls come from the cache; the runner is never invoked.
+rep = run_workflow_script(script, args={"who": "world"}, store=store,
+                          run_id="run-1-replay", replay_from="run-1")
+print(rep.value == rec.value, rep.replayed_calls)  # True 2
+```
+
+Each run is stored under `<root>/<run_id>/` as a bounded `run.json` metadata
+snapshot, a metadata-only `journal.jsonl` (`boot` / `call` / `done` events — no
+raw inputs/outputs), and a `cache.jsonl` replay cache. What is *replayable* is
+deliberately conservative: `log` / `phase` always (result is a constant `None`);
+`agent` / `kanban_agent` **only** when the runner is declared deterministic
+(auto-detected for the default `StubAgentRunner`, or set `deterministic_runner=`).
+A live, non-deterministic runner caches no agent output, so those calls re-run on
+replay rather than returning a stale value. On replay a call whose `method` /
+canonical `args_hash` drifts from the recorded run **fails closed** (a
+`replay_mismatch` abort) instead of serving the wrong value; a corrupt/missing
+run or cache raises a typed `ScriptRunStoreError` before any subprocess spawns.
+See [DESIGN.md §5.6](DESIGN.md) for the full contract and trust boundary.
+
 ## Saved workflow catalog
 
 Templates are JSON workflow files named `<template>.workflow.json`. The default catalog searches the
@@ -361,9 +404,9 @@ The repo intentionally avoids runtime dependencies. `pytest` is only a dev conve
 - The runtime is synchronous and deterministic; `parallel` is modeled, not truly concurrent (true in both the JSON runtime and the subprocess VM's guest combinators).
 - The JSON runtime's sandbox is a declarative policy checker, not a code VM. The subprocess VM (issue #2) does run code, but only out-of-process behind a static gate + restricted builtins + parent RPC broker.
 - The default `StubAgentRunner` only simulates known demo agents.
-- No durable resume/replay yet; the `RunStore` shape and the VM's stable RPC call ids are designed to grow into it (issue #3).
+- The script VM now has a durable run store + deterministic replay cache (issue #3): completed script runs persist a metadata-only journal and replay deterministic RPC calls from cache. Still missing: resume from a *partial* run, dedup of durable side effects (e.g. no-duplicate Kanban creation) on rerun, and replay for the declarative JSON `RunStore` path.
 - The Kanban backend is documented/stubbed, not implemented.
-- The subprocess VM is the smallest coherent issue #2 slice: durable script journals/replay (#3), the full script API with loop guards (#4), and launch-approval/session-policy governance (#11) are deferred.
+- The subprocess VM (#2) plus the durable run store + deterministic replay cache (#3) are now in place; the full script API with loop guards (#4) and launch-approval/session-policy governance (#11) are deferred.
 
 ## License
 
