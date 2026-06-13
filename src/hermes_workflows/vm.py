@@ -270,7 +270,7 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
     for field_name, hint in schema.items():
         if field_name not in output:
             raise CapabilityDenied(f"agent output missing declared field {field_name!r}", code="schema")
-        expected = _TYPE_MAP.get(str(hint).lower())
+        expected = (hint,) if isinstance(hint, type) else _TYPE_MAP.get(str(hint).lower())
         if expected is None:
             continue
         value = output[field_name]
@@ -323,7 +323,14 @@ class WorkflowVM:
                 external_sink(event)
 
         broker = CapabilityBroker(self._runner, self._limits, journal=_collect)
-        return self._drive(script, args, broker, calls)
+        try:
+            return self._drive(script, args, broker, calls)
+        except Exception as exc:  # noqa: BLE001 - keep unexpected VM bugs contained.
+            return ScriptRunResult(
+                ok=False,
+                calls=calls,
+                error={"type": "WorkflowSubprocessError", "message": f"Internal VM error: {exc}"},
+            )
 
     # -- subprocess lifecycle ---------------------------------------------
     def _drive(
@@ -461,7 +468,7 @@ def _scrubbed_env() -> dict[str, str]:
     pkg_parent = str(Path(__file__).resolve().parents[1])  # dir that contains hermes_workflows/
     env = {
         "PYTHONPATH": pkg_parent,
-        "PATH": "/usr/bin:/bin",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1",

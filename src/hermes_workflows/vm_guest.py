@@ -309,11 +309,13 @@ def _jsonable(value: Any) -> Any:
     output for functions/objects embeds a live heap address and would inject
     per-process non-determinism into the result the parent records.
     """
-    try:
-        _json.dumps(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool, type(None))):
         return value
-    except (TypeError, ValueError):
-        return {"_unserializable_type": type(value).__name__}
+    return {"_unserializable_type": type(value).__name__}
 
 
 def main() -> int:

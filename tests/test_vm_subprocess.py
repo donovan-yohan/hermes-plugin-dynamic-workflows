@@ -21,7 +21,7 @@ from pathlib import Path
 from hermes_workflows import run_workflow_script
 from hermes_workflows.agents import StubAgentRunner
 from hermes_workflows.errors import ScriptValidationError
-from hermes_workflows.vm import CapabilityBroker, VMLimits, WorkflowVM, run_script
+from hermes_workflows.vm import CapabilityBroker, VMLimits, WorkflowVM, _scrubbed_env, run_script
 from hermes_workflows import rpc
 
 META = 'meta = {"name": "demo", "description": "d"}\n'
@@ -283,6 +283,20 @@ def test_broker_validates_output_schema():
     assert ret["ok"] is False and ret["error"]["code"] == "schema"
 
 
+def test_broker_validates_python_type_schema_hints():
+    ok = _broker().handle(_call("agent", {
+        "agent_id": "hermes.classifier", "input": {},
+        "schema": {"label": str, "score": float},
+    }))
+    assert ok["ok"] is True
+
+    wrong = _broker().handle(_call("agent", {
+        "agent_id": "hermes.classifier", "input": {},
+        "schema": {"score": str},
+    }))
+    assert wrong["ok"] is False and wrong["error"]["code"] == "schema"
+
+
 def test_broker_denies_nested_workflow_by_default():
     ret = _broker().handle(_call("workflow", {"name": "child", "args": {}}))
     assert ret["ok"] is False and ret["error"]["code"] == "nested_denied"
@@ -358,6 +372,18 @@ def test_runner_baseexception_is_contained_not_propagated():
     assert res.ok is True and res.value == {"caught": "runner_error"}
 
 
+def test_unexpected_parent_vm_error_is_returned_not_raised():
+    class ExplodingVM(WorkflowVM):
+        def _drive(self, script, args, broker, calls):  # noqa: ANN001 - test override.
+            calls.append({"call_id": 99, "method": "test", "ok": False})
+            raise RuntimeError("driver exploded")
+
+    res = ExplodingVM().run(META + 'return {"x": 1}\n')
+    assert res.ok is False
+    assert res.calls == [{"call_id": 99, "method": "test", "ok": False}]
+    assert res.error == {"type": "WorkflowSubprocessError", "message": "Internal VM error: driver exploded"}
+
+
 def test_unserializable_return_is_deterministic_no_address_leak():
     # Regression: the _jsonable fallback used repr(value), leaking a heap address
     # (non-deterministic) for non-JSON returns. It now reports only the type.
@@ -366,3 +392,43 @@ def test_unserializable_return_is_deterministic_no_address_leak():
     b = run_workflow_script(script)
     assert a.ok and a.value == {"_unserializable_type": "function"}
     assert a.value == b.value  # deterministic across runs (no 0x... address).
+
+
+def test_unserializable_nested_return_preserves_json_safe_parts():
+    script = META + (
+        "def helper():\n    return 1\n"
+        "return {'ok': ['safe', helper], 'nested': {'n': 1, 'bad': helper}}\n"
+    )
+    res = run_workflow_script(script)
+    assert res.ok, res.error
+    assert res.value == {
+        "ok": ["safe", {"_unserializable_type": "function"}],
+        "nested": {"n": 1, "bad": {"_unserializable_type": "function"}},
+    }
+
+
+def test_scrubbed_env_preserves_parent_path_without_credentials():
+    old_path = os.environ.get("PATH")
+    old_github = os.environ.get("GITHUB_TOKEN")
+    old_hermes = os.environ.get("HERMES_API_KEY")
+    try:
+        os.environ["PATH"] = "/custom/python/bin:/usr/bin"
+        os.environ["GITHUB_TOKEN"] = "do-not-copy"
+        os.environ["HERMES_API_KEY"] = "do-not-copy"
+        env = _scrubbed_env()
+    finally:
+        if old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = old_path
+        if old_github is None:
+            os.environ.pop("GITHUB_TOKEN", None)
+        else:
+            os.environ["GITHUB_TOKEN"] = old_github
+        if old_hermes is None:
+            os.environ.pop("HERMES_API_KEY", None)
+        else:
+            os.environ["HERMES_API_KEY"] = old_hermes
+    assert env["PATH"] == "/custom/python/bin:/usr/bin"
+    assert "GITHUB_TOKEN" not in env
+    assert "HERMES_API_KEY" not in env
