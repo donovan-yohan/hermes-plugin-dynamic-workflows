@@ -471,7 +471,7 @@ class CapabilityBroker:
             result["reason"] = resolution.reason
         _validate_output(result, spec.schema)
         usage = (resolution.result or {}).get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
+        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
             self._tokens += usage
         return result
 

@@ -153,6 +153,19 @@ def test_broker_completed_returns_structured_result():
     assert value["profile"] == "planner"
 
 
+def test_broker_ignores_negative_token_usage_from_kanban_resolution():
+    # Match replay-cache accounting: a backend/result must not be able to skew the
+    # budget downward with a negative token value.
+    backend = InMemoryKanbanBackend(
+        auto=lambda spec: {"status": CARD_COMPLETED, "result": {"_tokens": -50}},
+        known_profiles={"planner"},
+    )
+    broker = _broker(backend, limits=VMLimits(token_budget=10))
+    ret = broker.handle(_kanban_frame(1, on_block="return"))
+    assert ret["ok"] is True, ret
+    assert ret["budget"] == {"total": 10, "spent": 0, "remaining": 10}
+
+
 def test_broker_blocked_return_surfaces_blocked_status():
     backend = InMemoryKanbanBackend(auto="blocked", known_profiles={"planner"})
     broker = _broker(backend)
