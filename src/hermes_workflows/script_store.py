@@ -168,6 +168,11 @@ def _fsync_dir(path: Path) -> None:
         return
     try:
         os.fsync(fd)
+    except OSError:
+        # Some filesystems reject fsync on a directory fd (e.g. certain network
+        # mounts); the os.replace above already landed the snapshot, so the
+        # missing dir-entry flush is a durability best-effort, not a failure.
+        pass
     finally:
         os.close(fd)
 
@@ -240,7 +245,9 @@ class ReplayCache:
         self.source_run_id = source_run_id
 
     def get(self, call_id: Any) -> Optional[ReplayEntry]:
-        if not isinstance(call_id, int):
+        # ``isinstance(True, int)`` is True, so reject bools explicitly: a call id
+        # of ``True``/``False`` must not alias to cached call ids 1/0.
+        if not isinstance(call_id, int) or isinstance(call_id, bool):
             return None
         return self._entries.get(call_id)
 
@@ -466,10 +473,21 @@ class ScriptRunStore:
                     raise CorruptScriptRunError(
                         run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
                     )
+                method = obj.get("method")
+                args_hash = obj.get("args_hash")
+                # Require real strings rather than coercing with str(): a missing
+                # method would become the literal "None" and silently match a
+                # forged replay entry against the per-call integrity guard.
+                if not isinstance(method, str) or not isinstance(args_hash, str):
+                    raise CorruptScriptRunError(
+                        run_id,
+                        "corrupt_cache",
+                        f"cache.jsonl line {lineno}: method/args_hash must be strings",
+                    )
                 entries[call_id] = ReplayEntry(
                     call_id=call_id,
-                    method=str(obj.get("method")),
-                    args_hash=str(obj.get("args_hash")),
+                    method=method,
+                    args_hash=args_hash,
                     value=obj.get("value"),
                 )
         return ReplayCache(entries, source_run_id=run_id)
@@ -499,12 +517,20 @@ class ScriptRunStore:
     # -- internals --------------------------------------------------------
     def _load_meta_unlocked(self, run_id: str, *, missing_ok: bool) -> Optional[ScriptRunMeta]:
         path = self._meta_path(run_id)
-        if not path.exists():
+        # Read directly instead of gating on path.exists(): a check-then-read
+        # races a concurrent finish()/rmtree, and a file that vanishes between the
+        # two would escape as a bare OSError. Map FileNotFoundError to the typed
+        # missing/not-found outcome and any other OSError to corrupt_run.
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             if missing_ok:
                 return None
-            raise ScriptRunNotFound(run_id)
+            raise ScriptRunNotFound(run_id) from None
+        except OSError as exc:
+            raise CorruptScriptRunError(run_id, "corrupt_run", f"run.json: {exc}") from exc
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise CorruptScriptRunError(run_id, "corrupt_run", f"run.json: {exc.msg}") from exc
         if not isinstance(data, dict):

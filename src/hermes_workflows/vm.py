@@ -21,6 +21,7 @@ and testable without a live Hermes. This module is pure stdlib.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -31,7 +32,12 @@ from typing import Any, Callable, Optional
 
 from . import rpc
 from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_id, is_kanban_runner_id
-from .errors import CapabilityDenied, ScriptValidationError, WorkflowSubprocessError
+from .errors import (
+    CapabilityDenied,
+    CorruptScriptRunError,
+    ScriptValidationError,
+    WorkflowSubprocessError,
+)
 from .registry import utc_now_iso
 from .script_store import (
     CallRecorder,
@@ -656,21 +662,108 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
     }
 
 
-def _limits_from_view(view: dict[str, Any]) -> VMLimits:
+class _CorruptLimitsView(ValueError):
+    """A persisted ``_limits_view`` carries a present-but-invalid value.
+
+    Raised by :func:`_limits_from_view` so the replay caller can fail closed
+    *before* launch instead of silently widening the recorded caps by falling
+    back to the permissive global default. A genuinely-absent key (forward/back-
+    compat) is not corruption and still defaults.
+    """
+
+
+_MISSING = object()
+
+
+def _req_int(view: dict[str, Any], key: str, default: int) -> int:
+    """A cap int from the view; a missing key (or null) defaults, else strict.
+
+    Only a real JSON number is accepted (``bool`` is excluded: ``True``/``False``
+    are ints but never a meaningful cap). A present string / wrong type / non-
+    finite value is corruption and raises, so the recorded cap can never be
+    silently widened to the global default on a replay.
+    """
+    value = view.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _CorruptLimitsView(f"{key}={value!r} is not a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise _CorruptLimitsView(f"{key}={value!r} is not finite")
+    return int(value)
+
+
+def _req_float(view: dict[str, Any], key: str, default: float) -> float:
+    """A finite cap float from the view; a missing key (or null) defaults.
+
+    Rejects non-finite ``inf``/``nan`` — Python's ``json`` decodes ``Infinity`` /
+    ``NaN`` by default, and a forged ``max_runtime_s`` of ``inf`` would otherwise
+    disable the wall-clock watchdog (its :class:`threading.Timer` never fires).
+    """
+    value = view.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _CorruptLimitsView(f"{key}={value!r} is not a number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise _CorruptLimitsView(f"{key}={value!r} is not finite")
+    return result
+
+
+def _req_bool(view: dict[str, Any], key: str, default: bool) -> bool:
+    """A bool from the view; a missing key (or null) defaults, any non-bool raises.
+
+    A persisted ``"false"`` string is truthy under ``bool()``; refusing to coerce
+    it avoids silently flipping ``allow_nested_workflows`` on.
+    """
+    value = view.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return default
+    if not isinstance(value, bool):
+        raise _CorruptLimitsView(f"{key}={value!r} is not a bool")
+    return value
+
+
+def _req_token_budget(view: dict[str, Any], default: Optional[int]) -> Optional[int]:
+    """Token budget from the view; a missing key or null means *no budget* (None).
+
+    A present non-int (bool / float / string) is corruption and raises, so a
+    partially-corrupt budget field cannot silently drop the budget to unlimited.
+    """
+    value = view.get("token_budget", _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _CorruptLimitsView(f"token_budget={value!r} is not an integer")
+    return value
+
+
+def _limits_from_view(view: Any) -> VMLimits:
     """Rebuild :class:`VMLimits` from a persisted ``_limits_view`` snapshot.
 
     Used to pin a replay's caps/budget to the recorded run so budget-/cap-gated
     control flow reproduces faithfully when the caller does not pass explicit
-    ``limits=``. Unknown/missing keys fall back to the :class:`VMLimits` default.
+    ``limits=``. A genuinely-absent key (forward/back-compat) falls back to the
+    :class:`VMLimits` default, but a non-dict view or any present-but-invalid
+    value raises :class:`_CorruptLimitsView` — the replay caller turns that into a
+    typed, fail-closed :class:`~hermes_workflows.errors.CorruptScriptRunError`
+    *before* any subprocess spawns, rather than silently widening the recorded
+    caps to the permissive global default (or admitting a non-finite runtime that
+    would disable the watchdog).
     """
+    if not isinstance(view, dict):
+        raise _CorruptLimitsView("limits view is not an object")
     default = VMLimits()
     return VMLimits(
-        max_rpc_calls=int(view.get("max_rpc_calls", default.max_rpc_calls)),
-        max_agent_calls=int(view.get("max_agent_calls", default.max_agent_calls)),
-        max_kanban_calls=int(view.get("max_kanban_calls", default.max_kanban_calls)),
-        max_runtime_s=float(view.get("max_runtime_s", default.max_runtime_s)),
-        allow_nested_workflows=bool(view.get("allow_nested_workflows", default.allow_nested_workflows)),
-        token_budget=view.get("token_budget"),
+        max_rpc_calls=_req_int(view, "max_rpc_calls", default.max_rpc_calls),
+        max_agent_calls=_req_int(view, "max_agent_calls", default.max_agent_calls),
+        max_kanban_calls=_req_int(view, "max_kanban_calls", default.max_kanban_calls),
+        max_runtime_s=_req_float(view, "max_runtime_s", default.max_runtime_s),
+        allow_nested_workflows=_req_bool(
+            view, "allow_nested_workflows", default.allow_nested_workflows
+        ),
+        token_budget=_req_token_budget(view, default.token_budget),
     )
 
 
@@ -699,7 +792,13 @@ def run_script(
     the cache instead of being re-dispatched (``store`` is required, and the
     cache is loaded up front so a corrupt/missing cache raises a typed
     :class:`~hermes_workflows.errors.ScriptRunStoreError` *before* any subprocess
-    is spawned). ``deterministic_runner`` overrides the default detection
+    is spawned). A replay *reproduces the recorded run*: the cache only ever holds
+    the source run's deterministic calls (``log``/``phase`` always, ``agent``/
+    ``kanban_agent`` only if the source's runner was deterministic), and those are
+    served by call id irrespective of the runner passed to this replay invocation
+    — the replay's own ``deterministic_runner`` does not re-gate them. Omit
+    ``replay_from`` to dispatch fresh against the live runner instead.
+    ``deterministic_runner`` overrides the default detection
     (``isinstance(runner, StubAgentRunner)``); set it ``True`` only when the
     injected runner is a pure function of its inputs, or agent/kanban results
     will not be cached.
@@ -737,7 +836,16 @@ def run_script(
     if limits is not None:
         effective_limits = limits
     elif source_limits is not None:
-        effective_limits = _limits_from_view(source_limits)
+        try:
+            effective_limits = _limits_from_view(source_limits)
+        except _CorruptLimitsView as exc:
+            # The recorded run's persisted caps are corrupt. Refuse to replay under
+            # silently-widened global defaults (which would loosen every cap and
+            # drop the token budget to unlimited) — fail closed, typed, and before
+            # any subprocess spawns.
+            raise CorruptScriptRunError(
+                replay_from, "corrupt_run", f"limits view: {exc}"
+            ) from exc
     else:
         effective_limits = VMLimits()
 

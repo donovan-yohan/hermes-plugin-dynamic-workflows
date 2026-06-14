@@ -25,6 +25,8 @@ from hermes_workflows import run_workflow_script
 from hermes_workflows.errors import CorruptScriptRunError, ScriptRunNotFound
 from hermes_workflows.script_store import (
     SCRIPT_SCHEMA_VERSION,
+    ReplayCache,
+    ReplayEntry,
     ScriptRunStore,
     canonical_hash,
     is_replayable,
@@ -449,3 +451,160 @@ def test_unsafe_run_id_is_rejected_without_writing():
 def test_canonical_hash_is_order_independent():
     assert canonical_hash({"a": 1, "b": 2}) == canonical_hash({"b": 2, "a": 1})
     assert canonical_hash({"a": 1}) != canonical_hash({"a": 2})
+
+
+# --------------------------------------------------------------------------- #
+# Review hardening (Gemini PR #18 comments)
+# --------------------------------------------------------------------------- #
+
+def test_replay_cache_get_rejects_bool_and_non_int_call_ids():
+    # Regression (review finding): isinstance(True, int) is True, so ReplayCache.get
+    # must reject bools explicitly — get(True) must not alias cached call id 1.
+    entry = ReplayEntry(call_id=1, method="log", args_hash="x", value=None)
+    cache = ReplayCache({1: entry, 0: ReplayEntry(0, "phase", "y", None)}, source_run_id="r")
+    assert cache.get(1) is entry
+    assert cache.get(True) is None   # would alias to 1 under a bare isinstance(int).
+    assert cache.get(False) is None  # would alias to 0.
+    assert cache.get("1") is None
+    assert cache.get(1.0) is None
+    assert cache.get(None) is None
+
+
+def test_load_cache_rejects_non_string_method_or_args_hash():
+    # Regression (review finding): method/args_hash must be real strings — coercing
+    # a missing field with str() would yield the literal "None" and let a forged
+    # entry slip past the per-call integrity tag instead of failing closed.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        run_workflow_script(META + 'return {}\n', store=store, run_id="srcstr")
+        (Path(tmp) / "runs" / "srcstr" / "cache.jsonl").write_text(
+            '{"call_id": 1, "method": null, "args_hash": "x", "value": null}\n',
+            encoding="utf-8",
+        )
+        try:
+            store.load_cache("srcstr")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_cache"
+            return
+        raise AssertionError("expected CorruptScriptRunError for non-string method")
+
+
+def test_load_run_translates_unreadable_run_json_to_typed_corrupt():
+    # Regression (review finding): _load_meta_unlocked reads directly rather than
+    # gating on path.exists() (a TOCTOU race with finish()/rmtree). A run.json that
+    # is unreadable for a reason other than absence (here: it is a directory, so
+    # read_text raises IsADirectoryError/OSError) surfaces as a typed corrupt_run,
+    # never a bare OSError.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        run_workflow_script(META + 'return {}\n', store=store, run_id="srcdir")
+        run_json = Path(tmp) / "runs" / "srcdir" / "run.json"
+        run_json.unlink()
+        run_json.mkdir()  # not a regular file -> OSError on read, not FileNotFound.
+        try:
+            store.load_run("srcdir")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_run"
+            return
+        raise AssertionError("expected CorruptScriptRunError for unreadable run.json")
+
+
+def test_fsync_dir_is_best_effort_when_fsync_unsupported():
+    # Regression (review finding): some filesystems reject fsync on a directory fd;
+    # _fsync_dir must swallow that OSError so the (already-landed) atomic snapshot
+    # write does not fail.
+    import hermes_workflows.script_store as ss
+
+    with TemporaryDirectory() as tmp:
+        real_fsync = ss.os.fsync
+
+        def _raise(_fd):  # simulate fsync(dir_fd) rejection.
+            raise OSError("fsync not supported on this fs")
+
+        ss.os.fsync = _raise
+        try:
+            ss._fsync_dir(Path(tmp))  # must not raise.
+        finally:
+            ss.os.fsync = real_fsync
+
+
+def test_limits_from_view_defaults_missing_and_passes_through_valid():
+    # A replay rebuilds VMLimits from the recorded view. A genuinely-absent key
+    # (forward/back-compat) or an explicit null defaults; valid values round-trip.
+    from hermes_workflows.vm import VMLimits, _limits_from_view
+
+    default = VMLimits()
+    assert _limits_from_view({}) == default
+    assert _limits_from_view({"max_rpc_calls": None}).max_rpc_calls == default.max_rpc_calls
+    # token_budget None means "no budget" and is preserved.
+    assert _limits_from_view({"token_budget": None}).token_budget is None
+
+    good = _limits_from_view(
+        {"max_rpc_calls": 5, "max_runtime_s": 2.5,
+         "allow_nested_workflows": True, "token_budget": 10}
+    )
+    assert good.max_rpc_calls == 5
+    assert good.max_runtime_s == 2.5
+    assert good.allow_nested_workflows is True
+    assert good.token_budget == 10
+
+
+def test_limits_from_view_fails_closed_on_corrupt_values():
+    # Post-fix review: a *present-but-corrupt* limits value (or a non-dict view)
+    # must NOT silently widen the recorded caps to the permissive global default;
+    # it raises so the replay caller can fail closed before launch. inf/nan are
+    # rejected so a forged max_runtime_s cannot disable the wall-clock watchdog.
+    from hermes_workflows.vm import _CorruptLimitsView, _limits_from_view
+
+    for bad_view in (None, [], "x", 5):
+        try:
+            _limits_from_view(bad_view)  # type: ignore[arg-type]
+        except _CorruptLimitsView:
+            pass
+        else:
+            raise AssertionError(f"expected _CorruptLimitsView for view {bad_view!r}")
+
+    corrupt_cases = [
+        {"max_rpc_calls": "not-a-number"},
+        {"max_rpc_calls": True},             # bool is not a cap.
+        {"max_agent_calls": "5"},            # string, not a JSON number.
+        {"max_runtime_s": "inf"},            # string.
+        {"max_runtime_s": float("inf")},     # non-finite would disable the watchdog.
+        {"max_runtime_s": float("nan")},
+        {"allow_nested_workflows": "false"},  # truthy string must not flip it on.
+        {"token_budget": "oops"},
+        {"token_budget": True},
+        {"token_budget": 1.5},               # float, not an int budget.
+    ]
+    for view in corrupt_cases:
+        try:
+            _limits_from_view(view)
+        except _CorruptLimitsView:
+            continue
+        raise AssertionError(f"expected _CorruptLimitsView for {view!r}")
+
+
+def test_replay_with_corrupt_limits_view_fails_closed_before_launch():
+    # Post-fix review: a corrupt persisted limits view must not let a replay run
+    # under silently-widened global-default caps. The replay fails closed with a
+    # typed CorruptScriptRunError *before* any subprocess spawns, leaving no run.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        run_workflow_script(FULL_SCRIPT, args={"who": "world"}, store=store, run_id="srclim")
+
+        # Tamper the recorded run's limits with a non-finite runtime cap.
+        run_json = Path(tmp) / "runs" / "srclim" / "run.json"
+        data = json.loads(run_json.read_text(encoding="utf-8"))
+        data["limits"]["max_runtime_s"] = float("inf")
+        run_json.write_text(json.dumps(data), encoding="utf-8")
+
+        try:
+            run_workflow_script(
+                FULL_SCRIPT, args={"who": "world"}, store=store, run_id="replaylim",
+                replay_from="srclim",
+            )
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_run"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for corrupt limits view")
+        assert not (Path(tmp) / "runs" / "replaylim").exists()  # no orphan run dir.
