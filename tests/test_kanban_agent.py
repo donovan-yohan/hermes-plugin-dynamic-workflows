@@ -212,6 +212,23 @@ def test_broker_await_timeout_is_bounded_by_runtime_limit():
     assert ret["error"]["code"] == "kanban_timeout"
 
 
+def test_broker_kanban_await_bounded_by_shared_run_deadline():
+    # Regression (review): the await is bounded by the broker's ABSOLUTE run
+    # deadline (armed at construction, shared with the _drive watchdog), not a
+    # fresh max_runtime_s window per call. Once the deadline has elapsed, a
+    # never-resolving card times out near-immediately instead of blocking for
+    # another full window — so a late call can't stretch wall-clock toward 2x.
+    backend = InMemoryKanbanBackend(known_profiles={"planner"})  # never resolves.
+    broker = _broker(backend, limits=VMLimits(max_runtime_s=0.2))
+    time.sleep(0.25)  # let the shared deadline elapse before the call arrives.
+    start = time.monotonic()
+    ret = broker.handle(_kanban_frame(1, on_block="return"))
+    elapsed = time.monotonic() - start
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "kanban_timeout"
+    assert elapsed < 0.1  # a fresh window would block ~0.2s; shared deadline -> ~0.
+
+
 def test_broker_invalid_on_block_is_bad_request():
     backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
     broker = _broker(backend)
@@ -289,6 +306,31 @@ def test_e2e_replay_reattaches_and_creates_no_duplicate_card():
         assert rep.value["reattached"] is True
         assert len(backend.created_cards) == 1  # no duplicate card.
         assert backend.reattachments == 1
+
+
+def test_e2e_chained_replay_reattaches_the_original_card():
+    # Regression (review): replaying a replay (A <- B <- C) must converge on the
+    # ONE original card via the transitive idempotency root, not open a fresh card
+    # at each generation.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+
+        a = run_workflow_script(_E2E_SCRIPT, args={"i": "#42"}, store=store, run_id="A",
+                                kanban_backend=backend)
+        b = run_workflow_script(_E2E_SCRIPT, args={"i": "#42"}, store=store, run_id="B",
+                                replay_from="A", kanban_backend=backend)
+        c = run_workflow_script(_E2E_SCRIPT, args={"i": "#42"}, store=store, run_id="C",
+                                replay_from="B", kanban_backend=backend)
+        assert a.ok and b.ok and c.ok, (a.error, b.error, c.error)
+
+        card = backend.created_cards[0]
+        assert a.value["card_id"] == card
+        assert b.value["card_id"] == card
+        assert c.value["card_id"] == card
+        assert len(backend.created_cards) == 1  # exactly one card across the chain.
+        assert backend.reattachments == 2       # B and C both reattached A's card.
+        assert b.value["reattached"] is True and c.value["reattached"] is True
 
 
 def test_e2e_unknown_profile_fails_the_run_without_opening_a_card():

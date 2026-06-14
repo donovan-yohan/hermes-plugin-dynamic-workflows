@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -35,6 +36,7 @@ from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_
 from .errors import (
     CapabilityDenied,
     CorruptScriptRunError,
+    ScriptRunStoreError,
     ScriptValidationError,
     WorkflowSubprocessError,
 )
@@ -179,6 +181,13 @@ class CapabilityBroker:
         # a replay reattaches the same card rather than opening a duplicate.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        # Absolute wall-clock deadline for this run, set at construction (a few ms
+        # before the subprocess spawns and the _drive watchdog arms). A durable
+        # Kanban await is bounded by *this* shared deadline rather than a fresh
+        # per-call window, so a late or repeated kanban_agent call cannot stretch
+        # total wall-clock past ~max_runtime_s (the watchdog cannot interrupt an
+        # in-progress parent-side await, so the two must share one deadline).
+        self._deadline = time.monotonic() + self._limits.max_runtime_s
         self._rpc_calls = 0
         self._agent_calls = 0
         self._kanban_calls = 0
@@ -395,6 +404,17 @@ class CapabilityBroker:
         }
         return self._invoke(agent_id, payload, params.get("schema"))
 
+    def _kanban_await_timeout(self) -> float:
+        """Remaining time until the shared run deadline (never negative).
+
+        Bounds a durable Kanban await by the same absolute deadline as the _drive
+        watchdog instead of a fresh ``max_runtime_s`` window per call. ``0.0`` (the
+        deadline already passed) makes :meth:`await_resolution` return a cached
+        resolution immediately or raise ``KanbanTimeout`` without blocking.
+        """
+        remaining = self._deadline - time.monotonic()
+        return remaining if remaining > 0.0 else 0.0
+
     def _kanban_idempotency_key(self, call_id: Any) -> str:
         """Stable key for one logical ``kanban_agent`` call.
 
@@ -427,7 +447,7 @@ class CapabilityBroker:
             resolution = self._kanban_backend.await_resolution(
                 card.card_id,
                 accept_blocked=(on_block != "pause"),
-                timeout=self._limits.max_runtime_s,
+                timeout=self._kanban_await_timeout(),
             )
         except KanbanUnknownProfile as exc:
             raise CapabilityDenied(str(exc), code="unknown_profile") from exc
@@ -926,6 +946,7 @@ def run_script(
     # typed rather than mid-run.
     replay_cache: Optional[ReplayCache] = None
     source_limits: Optional[dict[str, Any]] = None
+    replay_idempotency_root: Optional[str] = None
     if replay_from is not None:
         if store is None:
             raise ValueError("replay_from requires a store")
@@ -941,6 +962,19 @@ def run_script(
             )
         replay_cache = store.load_cache(replay_from)
         source_limits = source.limits
+        # Kanban idempotency must key on the *original* logical run, not the
+        # immediate source: replaying a replay (A <- B <- C) would otherwise open a
+        # fresh card at each generation. Walk replay_of to the first non-replay
+        # ancestor; degrade to the nearest resolvable run if the chain is broken.
+        root_meta = source
+        visited = {source.run_id}
+        while root_meta.replay_of is not None and root_meta.replay_of not in visited:
+            visited.add(root_meta.replay_of)
+            try:
+                root_meta = store.load_run(root_meta.replay_of)
+            except ScriptRunStoreError:
+                break
+        replay_idempotency_root = root_meta.run_id
 
     # Default a replay's caps/budget to the recorded run's so budget-/cap-gated
     # control flow reproduces faithfully; an explicit limits= still overrides.
@@ -1001,9 +1035,10 @@ def run_script(
     # Record cache entries only on a fresh run; a replay consumes the cache.
     recorder = store.recorder(persist_run_id) if replay_cache is None else None
     # Kanban idempotency root is the *logical* run id: a fresh run uses its own
-    # persisted run id; a replay inherits the source run's id (via replay_from) so
-    # create/reattach converges on the same card instead of opening a duplicate.
-    idempotency_root = replay_from if replay_from is not None else persist_run_id
+    # persisted run id; a replay (or replay-of-a-replay) inherits the original
+    # run's id so create/reattach converges on the same card instead of opening a
+    # duplicate at each generation.
+    idempotency_root = replay_idempotency_root if replay_idempotency_root is not None else persist_run_id
     vm = WorkflowVM(
         agent_runner=runner,
         limits=effective_limits,
