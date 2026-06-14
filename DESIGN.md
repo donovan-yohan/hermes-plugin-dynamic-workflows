@@ -631,12 +631,25 @@ consults the event log **before** the latest-state file on its first await, so a
 parent that was down when an event was produced **replays it from the log** on its
 next await, even though no live in-memory backend ever saw it. This closes the
 "event arrived while no parent was listening" gap for *recorded* events and gives a
-durable audit trail (the in-memory event source could not survive a restart). The
-remaining boundary: a parent *blocking* on a not-yet-produced event from another
-process still needs cross-process notification (LISTEN/NOTIFY / a broker topic) —
-the durable log replays events that already exist; it is not itself a live
-cross-process wakeup. A card that was only ever `waiting` (no recorded event) is
-still re-awaited live on resume.
+durable audit trail (the in-memory event source could not survive a restart).
+
+**Cross-process wakeup (the live notifier).** Replaying an already-recorded event
+is not enough when a parent *blocks* on a not-yet-produced event from another
+process. `kanban_notify.py` adds the live wakeup as a swappable seam:
+`KanbanEventNotifier` is `notify(card_id)` / `subscribe(card_id).wait(timeout)`;
+`ThreadEventNotifier` is the in-process default, and `FifoEventNotifier` is a
+**cross-process** transport over per-card POSIX FIFOs (`os.mkfifo` + `select`,
+Unix-only — the subscriber holds a write end too so the read end never EOF-spins).
+`EventLogKanbanBackend` is the production-shaped backend: it resolves a card purely
+from the durable event log (no in-memory event source — the producer may be a
+different process via `publish_kanban_event`), blocking on the notifier between log
+reads and bounded by the run deadline. The notifier is a wakeup *hint*; the durable
+log is the source of truth, so a missed/raced signal is never a lost event (at
+worst observed a little later) — and subscribing before the first read means a
+signal that races in is buffered, so the await is event-driven, not a poll loop.
+The remaining residual is a cross-*host* transport (`LISTEN/NOTIFY` / a broker
+topic): the shipped notifiers cover one host (in-process and single-machine FIFO).
+A card that was only ever `waiting` (no recorded event) is still re-awaited live.
 
 **Honest fake vs production.** `InMemoryKanbanBackend` is a real, event-driven
 (`threading.Condition`) fake for tests/local dev — it is **not** production. A

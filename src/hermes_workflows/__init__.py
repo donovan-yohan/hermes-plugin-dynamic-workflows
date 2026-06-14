@@ -90,6 +90,14 @@ from .kanban import (
     validate_workflow_result,
     result_contract_instruction,
 )
+from .kanban_notify import (
+    KanbanEventNotifier,
+    EventSubscription,
+    ThreadEventNotifier,
+    FifoEventNotifier,
+    EventLogKanbanBackend,
+    publish_kanban_event,
+)
 from .errors import (
     WorkflowError,
     WorkflowValidationError,
@@ -172,6 +180,13 @@ __all__ = [
     "WORKFLOW_RESULT_KEY",
     "validate_workflow_result",
     "result_contract_instruction",
+    # cross-process event notification (issue #5)
+    "KanbanEventNotifier",
+    "EventSubscription",
+    "ThreadEventNotifier",
+    "FifoEventNotifier",
+    "EventLogKanbanBackend",
+    "publish_kanban_event",
     # errors
     "WorkflowError",
     "WorkflowValidationError",
