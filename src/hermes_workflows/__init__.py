@@ -84,6 +84,9 @@ from .kanban import (
     KanbanTimeout,
     ON_BLOCK_POLICIES,
     kanban_card_id,
+    WORKFLOW_RESULT_KEY,
+    validate_workflow_result,
+    result_contract_instruction,
 )
 from .errors import (
     WorkflowError,
@@ -161,6 +164,10 @@ __all__ = [
     "KanbanTimeout",
     "ON_BLOCK_POLICIES",
     "kanban_card_id",
+    # structured result contracts (issue #6)
+    "WORKFLOW_RESULT_KEY",
+    "validate_workflow_result",
+    "result_contract_instruction",
     # errors
     "WorkflowError",
     "WorkflowValidationError",
