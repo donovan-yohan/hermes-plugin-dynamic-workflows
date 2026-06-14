@@ -726,13 +726,15 @@ def _req_bool(view: dict[str, Any], key: str, default: bool) -> bool:
 
 
 def _req_token_budget(view: dict[str, Any], default: Optional[int]) -> Optional[int]:
-    """Token budget from the view; a missing key or null means *no budget* (None).
+    """Token budget from the view; a missing key defaults, null means no budget.
 
     A present non-int (bool / float / string) is corruption and raises, so a
     partially-corrupt budget field cannot silently drop the budget to unlimited.
     """
     value = view.get("token_budget", _MISSING)
-    if value is _MISSING or value is None:
+    if value is _MISSING:
+        return default
+    if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise _CorruptLimitsView(f"token_budget={value!r} is not an integer")

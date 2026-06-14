@@ -549,6 +549,15 @@ def test_limits_from_view_defaults_missing_and_passes_through_valid():
     assert good.token_budget == 10
 
 
+def test_req_token_budget_distinguishes_missing_from_null():
+    # Gemini review regression: a missing token_budget must preserve the caller's
+    # default; explicit null is the only "no budget" signal.
+    from hermes_workflows.vm import _req_token_budget
+
+    assert _req_token_budget({}, 123) == 123
+    assert _req_token_budget({"token_budget": None}, 123) is None
+
+
 def test_limits_from_view_fails_closed_on_corrupt_values():
     # Post-fix review: a *present-but-corrupt* limits value (or a non-dict view)
     # must NOT silently widen the recorded caps to the permissive global default;
