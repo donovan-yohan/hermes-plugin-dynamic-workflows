@@ -75,6 +75,8 @@ from .script_store import (
 from .kanban import (
     KanbanBackend,
     InMemoryKanbanBackend,
+    DurableKanbanBackend,
+    KanbanWaitStore,
     KanbanCardSpec,
     KanbanCard,
     KanbanResolution,
@@ -155,6 +157,8 @@ __all__ = [
     # durable kanban awaitable (issue #5)
     "KanbanBackend",
     "InMemoryKanbanBackend",
+    "DurableKanbanBackend",
+    "KanbanWaitStore",
     "KanbanCardSpec",
     "KanbanCard",
     "KanbanResolution",

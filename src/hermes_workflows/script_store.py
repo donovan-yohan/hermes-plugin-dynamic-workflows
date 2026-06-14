@@ -148,6 +148,13 @@ def _require_safe_run_id(run_id: str) -> None:
         raise ValueError(f"unsafe run_id: {run_id!r}")
 
 
+def _require_safe_card_id(card_id: str) -> None:
+    # A card id is also used as exactly one filesystem path segment (it keys the
+    # durable kanban state file), so it gets the same single-segment guard.
+    if not isinstance(card_id, str) or not _RUN_ID_RE.fullmatch(card_id):
+        raise ValueError(f"unsafe card_id: {card_id!r}")
+
+
 def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Keep only metadata-safe error fields for the durable journal.
 
@@ -513,6 +520,86 @@ class ScriptRunStore:
     def journal_path(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
         return self._journal_path(run_id)
+
+    # -- durable kanban card state (issue #5: resume across restart) -------
+    # A Kanban await is non-deterministic, so it is excluded from the #3 replay
+    # cache; instead the latest known state of each card is persisted under
+    # ``<root>/_kanban/<card_id>.json`` (keyed by the content-addressed card id, so
+    # it is stable across replays). This lets a restarted/replaying parent resume
+    # from a recorded terminal resolution instead of re-awaiting — or losing — the
+    # worker's result, and gives operators a durable view of in-flight waits.
+    def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None:
+        """Persist the latest state of a Kanban card (atomic, version-monotonic).
+
+        A write is ignored when ``state['version']`` is older than the persisted
+        version, so an out-of-order or stale event (e.g. a ``waiting`` marker
+        racing a resolution) can never regress a card past a newer one.
+        """
+        _require_safe_card_id(card_id)
+        if not isinstance(state, dict):
+            raise ValueError("kanban card state must be a dict")
+        record = {**state, "card_id": card_id}
+        new_version = record.get("version", 0)
+        new_version = new_version if isinstance(new_version, int) and not isinstance(new_version, bool) else 0
+        record["version"] = new_version
+        with self._lock:
+            existing = self._load_kanban_card_state_unlocked(card_id)
+            if existing is not None:
+                old_version = existing.get("version", 0)
+                if isinstance(old_version, int) and not isinstance(old_version, bool) and new_version < old_version:
+                    return  # monotonic: never overwrite a newer state with an older one.
+            self._kanban_dir().mkdir(parents=True, exist_ok=True)
+            path = self._kanban_path(card_id)
+            tmp = path.with_suffix(".json.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            _fsync_dir(self._kanban_dir())
+
+    def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]:
+        """Return the latest persisted state of ``card_id``, or ``None`` if absent."""
+        _require_safe_card_id(card_id)
+        with self._lock:
+            return self._load_kanban_card_state_unlocked(card_id)
+
+    def kanban_waits(self) -> list[dict[str, Any]]:
+        """Return persisted card states that are not yet terminal (in-flight waits).
+
+        Operator-facing durable view of what runs are blocked on, recovered from
+        disk so it survives a parent restart. Terminal (``completed``/``failed``)
+        cards are excluded; a ``blocked`` card is still an in-flight wait.
+        """
+        kdir = self._kanban_dir()
+        if not kdir.exists():
+            return []
+        waits: list[dict[str, Any]] = []
+        with self._lock:
+            for path in sorted(kdir.glob("*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(data, dict) and data.get("status") not in ("completed", "failed"):
+                    waits.append(data)
+        return waits
+
+    def _load_kanban_card_state_unlocked(self, card_id: str) -> Optional[dict[str, Any]]:
+        path = self._kanban_path(card_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None  # a corrupt card-state file is treated as absent (fail-safe re-await).
+        return data if isinstance(data, dict) else None
+
+    def _kanban_dir(self) -> Path:
+        return self.root / "_kanban"
+
+    def _kanban_path(self, card_id: str) -> Path:
+        return self._kanban_dir() / f"{card_id}.json"
 
     # -- internals --------------------------------------------------------
     def _load_meta_unlocked(self, run_id: str, *, missing_ok: bool) -> Optional[ScriptRunMeta]:
