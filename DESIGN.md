@@ -602,15 +602,40 @@ catchable denial into the script), or `pause` (keep awaiting until a terminal
 completed/failed event). Unknown assignee profiles are rejected with a structured
 `unknown_profile` diagnostic before any card opens.
 
+**Durable card state and resume across restart.** A Kanban await is
+non-deterministic, so it is excluded from the #3 replay cache. Instead the latest
+state of each card is persisted under the run store at
+`<root>/_kanban/<card_id>.json` (keyed by the content-addressed card id, so it is
+stable across replays) via `ScriptRunStore.record_kanban_card_state` /
+`load_kanban_card_state`. Writes are atomic (unique temp file + `os.replace`) and
+status-precedence, not numeric: a `waiting` marker never overwrites a card that
+already reached an outcome, but among outcomes the latest real write wins —
+because a card's events can originate in *incomparable* version spaces (a prior
+process's backend vs. a fresh one on resume), so a numeric compare would wrongly
+drop a live superseding outcome. `DurableKanbanBackend` wraps **any** inner
+backend with this persistence and re-stamps every resolution into its own
+monotonic version space (the inner's and the recorded outcome's versions are not
+comparable), feeding the inner from the inner's own counter on a retry: `create_or_reattach` records a `waiting` marker (and reports
+`reattached=True` when a record already exists), and `await_resolution` serves a
+recorded outcome on the first await **without touching the inner backend** — so a
+restarted or replaying parent resumes from the recorded worker result even if the
+inner backend has no memory of the card. `kanban_waits()` exposes the in-flight
+cards as a durable, operator-facing view. The honest boundary: a card that was
+only ever `waiting` when the parent stopped is *re-awaited* on resume (it has no
+recorded outcome), which still needs the inner backend to deliver the event — for
+the in-memory fake the event must still be present; a production backend
+re-subscribes/replays. Recorded *outcomes* are what survive a restart here.
+
 **Honest fake vs production.** `InMemoryKanbanBackend` is a real, event-driven
 (`threading.Condition`) fake for tests/local dev — it is **not** production. A
 production backend implementing the same interface must: create/reattach through
 the real Kanban DB/API using the idempotency key as the unique key (so concurrent
 parents and replays converge), subscribe to **durable** card events that survive a
-parent restart, defer dispatch to the gateway (the workflow only creates/waits —
-no duplicate dispatcher), and, for a true `pause`, persist the suspended run and
-resume it in a fresh process from a replayed event rather than holding a thread.
-Those four items are the residual production work for this slice.
+parent restart (composing with `DurableKanbanBackend` for the recorded-outcome
+half), defer dispatch to the gateway (the workflow only creates/waits — no
+duplicate dispatcher), and, for a true `pause` of an *unresolved* card, persist
+the suspended run and resume it in a fresh process from a replayed event rather
+than holding a thread. Those are the residual production work for this slice.
 
 ### 5.8 Structured result contracts for Kanban tasks (issue #6)
 

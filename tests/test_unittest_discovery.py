@@ -28,6 +28,7 @@ MODULES = (
     "test_script_store",
     "test_kanban_agent",
     "test_kanban_result_contract",
+    "test_kanban_durable_resume",
 )
 
 

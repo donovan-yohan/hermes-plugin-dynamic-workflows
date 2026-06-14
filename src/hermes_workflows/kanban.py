@@ -78,6 +78,9 @@ __all__ = [
     "KanbanResolution",
     "KanbanBackend",
     "InMemoryKanbanBackend",
+    "DurableKanbanBackend",
+    "KanbanWaitStore",
+    "is_accepted_resolution",
     "KanbanError",
     "KanbanBlocked",
     "KanbanUnknownProfile",
@@ -476,11 +479,7 @@ class InMemoryKanbanBackend:
 
     @staticmethod
     def _is_accepted(resolution: KanbanResolution, accept_blocked: bool) -> bool:
-        if resolution.status in TERMINAL_STATES:
-            return True
-        if resolution.status == CARD_BLOCKED:
-            return accept_blocked
-        return False
+        return is_accepted_resolution(resolution, accept_blocked)
 
     # -- inspection / test driver surface --------------------------------
     def spec_for(self, card_id: str) -> Optional[KanbanCardSpec]:
@@ -523,3 +522,209 @@ class InMemoryKanbanBackend:
                     reason=reason,
                 )
             )
+
+
+def is_accepted_resolution(resolution: KanbanResolution, accept_blocked: bool) -> bool:
+    """Whether an await may resolve on ``resolution`` given the ``accept_blocked`` policy.
+
+    Terminal (completed/failed) always; a ``blocked`` card only when blocked is
+    accepted (i.e. ``on_block`` is not ``"pause"``).
+    """
+    if resolution.status in TERMINAL_STATES:
+        return True
+    if resolution.status == CARD_BLOCKED:
+        return accept_blocked
+    return False
+
+
+# Card states that are an *outcome* (resolution), as opposed to a "waiting" marker.
+_RESOLUTION_STATES = frozenset({CARD_COMPLETED, CARD_BLOCKED, CARD_FAILED})
+
+
+@runtime_checkable
+class KanbanWaitStore(Protocol):
+    """Durable persistence seam for Kanban card state (issue #5).
+
+    A small interface — satisfied structurally by
+    :class:`hermes_workflows.script_store.ScriptRunStore` — that records the latest
+    state of a card (keyed by the content-addressed card id) so a restarted or
+    replaying parent can resume from a recorded outcome. ``state`` carries at least
+    ``status`` and a monotonic ``version``; an older version never overwrites a
+    newer one.
+    """
+
+    def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None:
+        ...
+
+    def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]:
+        ...
+
+
+def _resolution_to_state(resolution: KanbanResolution) -> dict[str, Any]:
+    """Serialise a resolution to a durable card-state record."""
+    return {
+        "card_id": resolution.card_id,
+        "profile": resolution.profile,
+        "status": resolution.status,
+        # The worker's structured payload, persisted so a resume need not re-await
+        # (or lose) it — the non-deterministic analogue of the #3 replay cache.
+        WORKFLOW_RESULT_KEY: resolution.result,
+        "reason": resolution.reason,
+        "version": resolution.version,
+    }
+
+
+def _state_to_resolution(state: Optional[dict[str, Any]]) -> Optional[KanbanResolution]:
+    """Rebuild a resolution from durable state, or ``None`` if not a resolution.
+
+    A ``waiting`` marker (or any non-resolution / malformed state) yields ``None``
+    so the caller falls through to a live await.
+    """
+    if not isinstance(state, dict):
+        return None
+    status = state.get("status")
+    if status not in _RESOLUTION_STATES:
+        return None
+    result = state.get(WORKFLOW_RESULT_KEY)
+    version = state.get("version", 0)
+    return KanbanResolution(
+        card_id=str(state.get("card_id", "")),
+        profile=str(state.get("profile", "")),
+        status=status,
+        result=result if isinstance(result, dict) else {},
+        reason=state.get("reason"),
+        version=version if isinstance(version, int) and not isinstance(version, bool) else 0,
+    )
+
+
+class DurableKanbanBackend:
+    """A :class:`KanbanBackend` wrapper that persists card state to a
+    :class:`KanbanWaitStore`, so a restarted/replaying parent **resumes from a
+    recorded outcome** instead of re-awaiting (or losing) the worker's result.
+
+    This is the concrete durability the in-memory fake cannot provide on its own
+    (DESIGN §5.7): a resolution recorded by one process is served to a later
+    process awaiting the same content-addressed card id, even if the inner backend
+    has no memory of it. It composes with any inner backend (the in-memory fake
+    today, a real Kanban backend in production):
+
+    * ``create_or_reattach`` records a durable ``waiting`` marker for a new card,
+      and reports ``reattached=True`` when a durable record already exists.
+    * ``await_resolution`` first consults the durable store: a recorded outcome
+      newer than ``after_version`` and accepted by the ``on_block`` policy is
+      returned **without touching the inner backend** (resume); otherwise it awaits
+      the inner backend live and persists whatever outcome it produces.
+
+    Honest boundary: a card that was only ever ``waiting`` when the parent stopped
+    is re-awaited on resume (it has no recorded outcome), which still needs the
+    inner backend to deliver the event — for the in-memory fake that means the
+    event must still be present; a production backend re-subscribes/replays. The
+    *recorded outcomes* are what survive a restart here.
+    """
+
+    def __init__(self, inner: KanbanBackend, store: KanbanWaitStore) -> None:
+        self._inner = inner
+        self._store = store
+        self._lock = threading.Lock()
+        # Per-card crossing-the-seam state. The wrapper joins two incomparable
+        # version spaces — a recorded outcome's foreign version and the inner
+        # backend's own counter — so it presents the broker a *third*, coherent
+        # monotonic space (``_next``): every returned resolution is re-stamped from
+        # it, so the broker's strictly-increasing after_version contract holds. We
+        # serve a card from the durable record at most once (``_served``) and feed
+        # the inner from the highest inner version we have consumed
+        # (``_inner_after``), never the broker's after_version.
+        self._served: set[str] = set()
+        self._inner_after: dict[str, int] = {}
+        self._next: dict[str, int] = {}
+
+    def _stamp(self, card_id: str, resolution: KanbanResolution) -> KanbanResolution:
+        """Re-stamp a resolution into the wrapper's own monotonic version space."""
+        with self._lock:
+            self._next[card_id] = self._next.get(card_id, 0) + 1
+            return replace(resolution, version=self._next[card_id])
+
+    def create_or_reattach(self, idempotency_key: str, spec: KanbanCardSpec) -> KanbanCard:
+        card = self._inner.create_or_reattach(idempotency_key, spec)
+        try:
+            existing = self._store.load_kanban_card_state(card.card_id)
+        except OSError:  # durable read is best-effort; fall back to live on an IO error.
+            existing = None
+        if existing is not None:
+            # A durable record already exists: this is a resume/reattach even if a
+            # fresh inner backend believed it was opening a new card.
+            return replace(card, reattached=True)
+        self._record_card_state(
+            card.card_id,
+            {"card_id": card.card_id, "status": "waiting", "profile": card.profile, "version": 0},
+        )
+        return card
+
+    def await_resolution(
+        self,
+        card_id: str,
+        *,
+        accept_blocked: bool,
+        timeout: Optional[float],
+        after_version: int = 0,
+    ) -> KanbanResolution:
+        # Serve the durable record only on the *first* await (after_version == 0)
+        # and at most once per card. A retry (after_version > 0 — the broker already
+        # rejected an outcome this run) always goes live to the inner.
+        if after_version == 0:
+            with self._lock:
+                already_served = card_id in self._served
+            if not already_served:
+                try:
+                    recorded = _state_to_resolution(self._store.load_kanban_card_state(card_id))
+                except OSError:  # durable read is best-effort.
+                    recorded = None
+                if recorded is not None and is_accepted_resolution(recorded, accept_blocked):
+                    with self._lock:
+                        if card_id in self._served:
+                            should_serve = False
+                        else:
+                            self._served.add(card_id)
+                            should_serve = True
+                    if should_serve:
+                        return self._stamp(card_id, recorded)  # resume from the durable record.
+        # Go live. Feed the inner from *its own* version space (the highest inner
+        # version we have consumed), never the broker's after_version, which may
+        # carry a recorded outcome's foreign version after a first-await resume.
+        with self._lock:
+            inner_after = self._inner_after.get(card_id, 0)
+        resolution = self._inner.await_resolution(
+            card_id,
+            accept_blocked=accept_blocked,
+            timeout=timeout,
+            after_version=inner_after,
+        )
+        if inner_after and resolution.version <= inner_after:
+            # The inner ignored after_version (it must return a strictly newer
+            # event); fail closed here rather than let a retry hot-spin.
+            raise KanbanError("inner backend returned a stale event (after_version ignored)")
+        with self._lock:
+            self._inner_after[card_id] = max(self._inner_after.get(card_id, 0), resolution.version)
+        self._record_card_state(card_id, _resolution_to_state(resolution))
+        return self._stamp(card_id, resolution)
+
+    def _record_card_state(self, card_id: str, state: dict[str, Any]) -> None:
+        """Persist card state best-effort: the outcome already happened, so an IO
+        failure must not fail an otherwise-successful await.
+
+        Only ``OSError`` is swallowed (a genuine disk/IO failure) — a programming
+        error such as an unsafe card id or a bad payload still surfaces. The cost
+        of a swallowed write is a *degraded* future resume (the card has no
+        recorded outcome, so a resume re-awaits it live), not a wrong result for
+        this run.
+        """
+        try:
+            self._store.record_kanban_card_state(card_id, state)
+        except OSError:  # durable persistence is best-effort; a resume re-awaits.
+            pass
+
+    def record_event(self, card_id: str, kind: str, detail: dict[str, Any]) -> None:
+        """Pass a card comment/event through to the inner backend if it supports it."""
+        inner_record = getattr(self._inner, "record_event", None)
+        if callable(inner_record):
+            inner_record(card_id, kind, detail)
