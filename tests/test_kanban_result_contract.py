@@ -109,6 +109,10 @@ def test_result_contract_instruction():
     assert "workflow_result" in text
     assert "plan: string" in text
     assert "block" in text.lower()  # instructs to block rather than emit prose.
+    typed_text = result_contract_instruction({"plan": str, "count": int})
+    assert "plan: str" in typed_text
+    assert "count: int" in typed_text
+    assert "<class" not in typed_text
 
 
 # --------------------------------------------------------------------------- #
@@ -227,7 +231,7 @@ class _StaleBackend:
         # Always a completed-but-invalid result at a fixed version, regardless of
         # after_version — exactly the contract violation the broker must not spin on.
         return KanbanResolution(
-            card_id=card_id, profile="planner", status=CARD_COMPLETED, result={}, version=1
+            card_id=card_id, profile="planner", status=CARD_COMPLETED, result={}, version=0
         )
 
 

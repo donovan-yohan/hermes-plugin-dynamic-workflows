@@ -496,6 +496,7 @@ class CapabilityBroker:
         """
         accept_blocked = on_block != "pause"
         after_version = 0
+        has_received = False
         last_recorded: Optional[tuple[str, ...]] = None
         records = 0
         while True:
@@ -515,12 +516,13 @@ class CapabilityBroker:
             # after_version. A backend that ignores after_version would hand back
             # the same rejected completion and the pause retry would hot-spin to the
             # deadline; fail closed instead of spinning.
-            if after_version and resolution.version <= after_version:
+            if has_received and resolution.version <= after_version:
                 raise CapabilityDenied(
                     "kanban backend returned a stale event (after_version ignored)",
                     code="kanban_error",
                 )
             after_version = resolution.version
+            has_received = True
             if resolution.status != CARD_COMPLETED or not schema:
                 return resolution, []  # blocked/failed, or no contract to enforce.
 

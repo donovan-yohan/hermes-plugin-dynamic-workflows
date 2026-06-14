@@ -225,7 +225,10 @@ def result_contract_instruction(schema: Optional[dict[str, Any]]) -> str:
     """
     if not schema:
         return ""
-    fields = ", ".join(f"{name}: {hint}" for name, hint in schema.items())
+    fields = ", ".join(
+        f"{name}: {hint.__name__ if isinstance(hint, type) else hint}"
+        for name, hint in schema.items()
+    )
     return (
         f"Complete this card by setting metadata.{WORKFLOW_RESULT_KEY} to a JSON "
         f"object matching this schema: {{{fields}}}. Do not complete with prose. "
