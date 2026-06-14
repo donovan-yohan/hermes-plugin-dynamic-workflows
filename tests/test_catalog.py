@@ -156,3 +156,34 @@ def test_template_name_rejects_path_traversal():
             pass
         else:
             raise AssertionError(f"expected unsafe template name to fail: {bad!r}")
+
+
+def test_bundled_github_issue_lifecycle_hygiene_template_validates_and_runs():
+    catalog = FileWorkflowCatalog()
+
+    templates = {entry["name"]: entry for entry in catalog.list_templates()}
+    assert templates["github_issue_lifecycle_hygiene"]["ok"] is True
+    assert "issue_number" in templates["github_issue_lifecycle_hygiene"]["required_inputs"]
+
+    result = workflow(
+        template_name="github_issue_lifecycle_hygiene",
+        inputs={
+            "repo": "donovan-yohan/hermes-plugin-dynamic-workflows",
+            "issue_number": 8,
+            "base_branch": "main",
+            "workspace": "/repo",
+            "profile_bindings": {"planner": "relayplanner", "ops": "relayops"},
+        },
+        catalog=catalog,
+        registry=InMemoryRunStore(),
+    )
+
+    assert result["operation"] == "run_template"
+    assert result["status"]["status"] == "succeeded"
+    outputs = result["status"]["result"]["outputs"]
+    assert "inventory" in outputs
+    assert "closeout_hygiene" in outputs
+    closeout = outputs["closeout_hygiene"]
+    assert closeout["profile"] == "ops"
+    assert "issue hygiene" in str(closeout["result"]["echo"]).lower()
+    assert "docs" in str(outputs["docs_gate"]["result"]["echo"]).lower()

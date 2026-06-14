@@ -195,6 +195,38 @@ This is the first replacement seam for timer watchdog orchestration: workflows a
 result instead of polling status just to decide the next step. The current stub runner returns a
 deterministic `kb_<hash>` task id for tests.
 
+### GitHub issue lifecycle hygiene template
+
+`examples/github_issue_lifecycle_hygiene.workflow.json` is the saved template for the
+"inventory → one implementation slice → verify → closeout" shipping loop. It is deliberately not a
+cron watchdog: the first step inventories the issue/PR/docs state, then Kanban-backed stages plan and
+implement exactly one non-duplicate slice, run exact-head review/docs gates, and finish with a
+`closeout_hygiene` task.
+
+The closeout task makes issue and docs hygiene part of shipping, not a forgotten afterthought:
+
+- comment on the GitHub issue with shipped PRs, merge commits, tests, docs changed, and residual work;
+- close only issues whose acceptance criteria are fully satisfied;
+- update parent roadmap checkboxes/comments after child issues land;
+- open follow-up issues for residual docs/product gaps instead of burying them in PR prose.
+
+Run it in stub/dry-run mode through the catalog while wiring real profiles/boards in a deployment. The current declarative runtime still uses static profile ids on `kanban_agent` steps, so the template also passes `profile_bindings` through every task payload as the deployment/config map the live Kanban adapter should honor:
+
+```python
+from hermes_workflows.primitives import workflow
+
+result = workflow(
+    template_name="github_issue_lifecycle_hygiene",
+    inputs={
+        "repo": "donovan-yohan/hermes-plugin-dynamic-workflows",
+        "issue_number": 8,
+        "base_branch": "main",
+        "workspace": "/repo",
+        "profile_bindings": {"planner": "relayplanner", "ops": "relayops"},
+    },
+)
+```
+
 ## Script-led subprocess VM (issue #2)
 
 Alongside the declarative JSON runtime, the plugin can run a **Python workflow

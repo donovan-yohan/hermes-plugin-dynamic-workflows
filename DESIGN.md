@@ -783,7 +783,36 @@ Known, accepted limitations (not security escapes):
   is the current backstop. A `resource.setrlimit` guard in the guest is future
   hardening.
 
-## 6. Roadmap
+## 6. GitHub issue lifecycle hygiene template
+
+`examples/github_issue_lifecycle_hygiene.workflow.json` is the first saved template
+for the end-to-end "ship this issue" loop (#8). It intentionally starts with a
+GitHub inventory step before planning work, because the overnight dogfood showed
+that stale local/session context can otherwise make agents re-open or re-plan
+work already merged. The template's durable shape is:
+
+1. `inventory` — collect current issue state, linked/merged PRs, docs touched, and
+   known blockers before choosing work.
+2. `plan_slice` — pick exactly one non-duplicate implementation slice from that
+   inventory.
+3. `implementation` — produce the PR and include tests/docs evidence.
+4. `verification_gates` — run exact-head review and docs gates in parallel.
+5. `closeout_hygiene` — comment/update/close GitHub issues only when acceptance is
+   satisfied, update parent roadmap state, and file follow-ups for residual docs or
+   product gaps.
+
+The template is a catalog fixture and a contract example, not a production GitHub
+adapter by itself: the bundled `StubAgentRunner` returns deterministic echo output
+for tests, while a live deployment wires those profiles to real Kanban/Hermes
+workers and GitHub tools. Until declarative `kanban_agent.profile` supports dynamic
+refs, the template passes a `profile_bindings` config object through each task
+payload so the live adapter can map the default lanes (`planner`, `implementer`,
+`reviewer`, `docs`, `ops`) to local profile names.
+
+The closeout stage is nevertheless part of the contract: shipping is incomplete
+until issue hygiene and docs hygiene have explicit evidence.
+
+## 7. Roadmap
 
 Near-term and future work, roughly in priority order:
 
