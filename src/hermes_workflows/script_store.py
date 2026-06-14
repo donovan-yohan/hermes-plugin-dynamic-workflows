@@ -204,7 +204,7 @@ class ScriptRunMeta:
     run_id: str
     script_sha256: str
     args_hash: str
-    status: str = "running"  # running | succeeded | failed
+    status: str = "running"  # running | succeeded | failed | suspended
     meta: Optional[dict[str, Any]] = None
     limits: Optional[dict[str, Any]] = None
     value: Any = None
@@ -527,6 +527,31 @@ class ScriptRunStore:
         _require_safe_run_id(run_id)
         return self._journal_path(run_id)
 
+    def suspended_runs(self) -> list[ScriptRunMeta]:
+        """Return runs durably suspended on an unresolved paused Kanban await (issue #5).
+
+        Operator/resumer-facing discovery: a fresh process scans for suspended
+        runs, checks each awaited card's durable event log (the ``error`` field
+        carries the metadata-safe ``card_id``/``profile``), and resumes the ready
+        ones via ``run_workflow_script(..., replay_from=<run_id>)``. A corrupt or
+        unreadable run record is skipped (a resume can still be driven by run id
+        directly); non-run entries (e.g. the ``_kanban`` dir, which fails the
+        run-id guard) are ignored.
+        """
+        if not self.root.exists():
+            return []
+        out: list[ScriptRunMeta] = []
+        for child in sorted(self.root.iterdir()):
+            if not child.is_dir() or not _RUN_ID_RE.fullmatch(child.name):
+                continue
+            try:
+                meta = self.load_run(child.name)
+            except (ScriptRunStoreError, ValueError):
+                continue
+            if meta.status == "suspended":
+                out.append(meta)
+        return out
+
     # -- durable kanban card state (issue #5: resume across restart) -------
     # A Kanban await is non-deterministic, so it is excluded from the #3 replay
     # cache; instead the latest known state of each card is persisted under
@@ -766,7 +791,11 @@ class ScriptRunStore:
             if missing_ok:
                 return None
             raise ScriptRunNotFound(run_id) from None
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError is a ValueError, not an OSError, so a run.json with
+            # invalid UTF-8 bytes would otherwise escape load_run as a bare
+            # exception (and crash a bulk scan like suspended_runs); map it to the
+            # same typed corrupt_run as any other unreadable record.
             raise CorruptScriptRunError(run_id, "corrupt_run", f"run.json: {exc}") from exc
         try:
             data = json.loads(raw)

@@ -39,6 +39,10 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Package managers (this project is pure-stdlib / zero-dependency; uv.lock is an
+# accidental `uv run` artifact and must never be committed).
+uv.lock
+
 # Environments
 .env
 .venv
