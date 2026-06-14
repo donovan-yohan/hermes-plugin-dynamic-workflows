@@ -620,11 +620,23 @@ comparable), feeding the inner from the inner's own counter on a retry: `create_
 recorded outcome on the first await **without touching the inner backend** — so a
 restarted or replaying parent resumes from the recorded worker result even if the
 inner backend has no memory of the card. `kanban_waits()` exposes the in-flight
-cards as a durable, operator-facing view. The honest boundary: a card that was
-only ever `waiting` when the parent stopped is *re-awaited* on resume (it has no
-recorded outcome), which still needs the inner backend to deliver the event — for
-the in-memory fake the event must still be present; a production backend
-re-subscribes/replays. Recorded *outcomes* are what survive a restart here.
+cards as a durable, operator-facing view.
+
+**Durable event log (the producer seam).** The latest-state file above is written
+by the parent's *own* await. The producer-facing half is an append-only
+`<root>/_kanban/<card_id>.events.jsonl` via `ScriptRunStore.append_kanban_event` /
+`read_kanban_events` / `latest_kanban_resolution`: a worker/gateway — possibly a
+*different process* — durably records a card event there. `DurableKanbanBackend`
+consults the event log **before** the latest-state file on its first await, so a
+parent that was down when an event was produced **replays it from the log** on its
+next await, even though no live in-memory backend ever saw it. This closes the
+"event arrived while no parent was listening" gap for *recorded* events and gives a
+durable audit trail (the in-memory event source could not survive a restart). The
+remaining boundary: a parent *blocking* on a not-yet-produced event from another
+process still needs cross-process notification (LISTEN/NOTIFY / a broker topic) —
+the durable log replays events that already exist; it is not itself a live
+cross-process wakeup. A card that was only ever `waiting` (no recorded event) is
+still re-awaited live on resume.
 
 **Honest fake vs production.** `InMemoryKanbanBackend` is a real, event-driven
 (`threading.Condition`) fake for tests/local dev — it is **not** production. A

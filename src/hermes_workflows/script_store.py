@@ -614,11 +614,111 @@ class ScriptRunStore:
             return None  # a corrupt card-state file is treated as absent (fail-safe re-await).
         return data if isinstance(data, dict) else None
 
+    # -- durable kanban event log (issue #5: external-producer event seam) --
+    # The latest-state file above is written by the *parent's own* await. The
+    # event log below is the producer-facing seam: a worker/gateway (possibly a
+    # different process) appends card events to an append-only
+    # ``<root>/_kanban/<card_id>.events.jsonl``. A parent that was down when the
+    # event was produced replays it from the log on its next await — the durable
+    # cross-restart event delivery the in-memory backend cannot provide. The log is
+    # also a durable audit trail of every card event.
+    def append_kanban_event(
+        self,
+        card_id: str,
+        *,
+        status: str,
+        result: Optional[dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        profile: str = "",
+    ) -> dict[str, Any]:
+        """Append one durable card event and return the persisted record.
+
+        ``seq`` is a per-card monotonic sequence (the append's 1-based position),
+        so a consumer can read events ``after_seq`` it has already processed. The
+        worker's structured payload is stored under ``workflow_result`` — the same
+        key the resolution serialiser uses — so a logged event reads back as a
+        resolution without translation.
+        """
+        _require_safe_card_id(card_id)
+        record = {
+            "card_id": card_id,
+            "status": status,
+            "workflow_result": result if isinstance(result, dict) else {},
+            "reason": reason,
+            "profile": profile,
+        }
+        with self._lock:
+            self._kanban_dir().mkdir(parents=True, exist_ok=True)
+            path = self._kanban_events_path(card_id)
+            seq = self._count_lines(path) + 1
+            record = {"seq": seq, "ts": utc_now_iso(), **record}
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        return record
+
+    def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
+        """Return durable card events with ``seq > after_seq`` (corrupt lines skipped)."""
+        _require_safe_card_id(card_id)
+        path = self._kanban_events_path(card_id)
+        events: list[dict[str, Any]] = []
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and isinstance(event.get("seq"), int) and event["seq"] > after_seq:
+                events.append(event)
+        return events
+
+    def latest_kanban_resolution(self, card_id: str) -> Optional[dict[str, Any]]:
+        """Return the most recent *outcome* event from the log, or ``None``.
+
+        Shaped like a card-state record (``status`` / ``workflow_result`` /
+        ``reason`` / ``version``), so a backend can resume from it directly. A
+        non-resolution event (or no events) yields ``None``.
+        """
+        latest: Optional[dict[str, Any]] = None
+        for event in self.read_kanban_events(card_id):
+            if event.get("status") in ("completed", "blocked", "failed"):
+                latest = event
+        if latest is None:
+            return None
+        return {
+            "card_id": card_id,
+            "status": latest.get("status"),
+            "workflow_result": latest.get("workflow_result") if isinstance(latest.get("workflow_result"), dict) else {},
+            "reason": latest.get("reason"),
+            "profile": latest.get("profile", ""),
+            "version": latest.get("seq", 0),
+        }
+
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return sum(1 for _ in f)
+        except FileNotFoundError:
+            return 0
+
     def _kanban_dir(self) -> Path:
         return self.root / "_kanban"
 
     def _kanban_path(self, card_id: str) -> Path:
         return self._kanban_dir() / f"{card_id}.json"
+
+    def _kanban_events_path(self, card_id: str) -> Path:
+        return self._kanban_dir() / f"{card_id}.events.jsonl"
 
     # -- internals --------------------------------------------------------
     def _load_meta_unlocked(self, run_id: str, *, missing_ok: bool) -> Optional[ScriptRunMeta]:

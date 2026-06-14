@@ -675,10 +675,7 @@ class DurableKanbanBackend:
             with self._lock:
                 already_served = card_id in self._served
             if not already_served:
-                try:
-                    recorded = _state_to_resolution(self._store.load_kanban_card_state(card_id))
-                except OSError:  # durable read is best-effort.
-                    recorded = None
+                recorded = self._durable_resolution(card_id)
                 if recorded is not None and is_accepted_resolution(recorded, accept_blocked):
                     with self._lock:
                         if card_id in self._served:
@@ -687,6 +684,10 @@ class DurableKanbanBackend:
                             self._served.add(card_id)
                             should_serve = True
                     if should_serve:
+                        # Mirror to the latest-state file so kanban_waits and the
+                        # fast-path read reflect a log-sourced (external-producer)
+                        # outcome too.
+                        self._record_card_state(card_id, _resolution_to_state(recorded))
                         return self._stamp(card_id, recorded)  # resume from the durable record.
         # Go live. Feed the inner from *its own* version space (the highest inner
         # version we have consumed), never the broker's after_version, which may
@@ -707,6 +708,27 @@ class DurableKanbanBackend:
             self._inner_after[card_id] = max(self._inner_after.get(card_id, 0), resolution.version)
         self._record_card_state(card_id, _resolution_to_state(resolution))
         return self._stamp(card_id, resolution)
+
+    def _durable_resolution(self, card_id: str) -> Optional[KanbanResolution]:
+        """The durable outcome for a card, preferring the event log over latest-state.
+
+        The event log is the producer-facing seam: a worker/gateway (possibly a
+        different process) appends a card event there, so a parent that was down
+        when the event was produced resumes from it. The latest-state file is the
+        parent's own record (and the fallback when the store has no event log).
+        """
+        latest = getattr(self._store, "latest_kanban_resolution", None)
+        if callable(latest):
+            try:
+                from_log = _state_to_resolution(latest(card_id))
+            except OSError:  # durable read is best-effort.
+                from_log = None
+            if from_log is not None:
+                return from_log
+        try:
+            return _state_to_resolution(self._store.load_kanban_card_state(card_id))
+        except OSError:  # durable read is best-effort.
+            return None
 
     def _record_card_state(self, card_id: str, state: dict[str, Any]) -> None:
         """Persist card state best-effort: the outcome already happened, so an IO
