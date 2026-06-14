@@ -1,0 +1,175 @@
+{
+  "version": "1",
+  "name": "github_issue_lifecycle_hygiene",
+  "description": "Issue-to-PR lifecycle template with explicit GitHub issue hygiene and docs hygiene gates before closeout.",
+  "inputs": {
+    "repo": "string",
+    "issue_number": "int",
+    "base_branch": "string",
+    "workspace": "string",
+    "profile_bindings": "object"
+  },
+  "policy": {
+    "network": false,
+    "filesystem": false,
+    "max_parallel": 2
+  },
+  "steps": [
+    {
+      "kind": "agent",
+      "id": "inventory",
+      "agent": "hermes.github.issue_inventory",
+      "input": {
+        "repo": "$ref:inputs.repo",
+        "issue_number": "$ref:inputs.issue_number",
+        "base_branch": "$ref:inputs.base_branch",
+        "required_outputs": [
+          "current issue state and acceptance checklist",
+          "linked PRs and merge commits",
+          "docs touched or stale",
+          "open blockers before implementation"
+        ]
+      },
+      "output_schema": {
+        "echo": "object",
+        "digest": "string"
+      }
+    },
+    {
+      "kind": "kanban_agent",
+      "id": "plan_slice",
+      "profile": "planner",
+      "task": {
+        "repo": "$ref:inputs.repo",
+        "issue_number": "$ref:inputs.issue_number",
+        "inventory": "$ref:inventory.output.echo",
+        "goal": "Select one non-duplicate implementation slice. Include GitHub issue hygiene and docs hygiene in acceptance criteria. Do not plan work already merged.",
+        "profile_bindings": "$ref:inputs.profile_bindings"
+      },
+      "input": {
+        "workspace": "$ref:inputs.workspace",
+        "base_branch": "$ref:inputs.base_branch"
+      },
+      "output_schema": {
+        "task_id": "string",
+        "status": "string",
+        "result": "object"
+      },
+      "depends_on": [
+        "inventory"
+      ]
+    },
+    {
+      "kind": "kanban_agent",
+      "id": "implementation",
+      "profile": "implementer",
+      "task": {
+        "repo": "$ref:inputs.repo",
+        "issue_number": "$ref:inputs.issue_number",
+        "plan": "$ref:plan_slice.output.result",
+        "requirements": [
+          "open or update exactly one PR against the configured base branch",
+          "link the PR to the issue without prematurely closing broader parent issues",
+          "update README/DESIGN/examples when behavior or workflow contract changes",
+          "include exact commands run in the PR body"
+        ],
+        "profile_bindings": "$ref:inputs.profile_bindings"
+      },
+      "input": {
+        "workspace": "$ref:inputs.workspace",
+        "base_branch": "$ref:inputs.base_branch"
+      },
+      "output_schema": {
+        "task_id": "string",
+        "status": "string",
+        "result": "object"
+      },
+      "depends_on": [
+        "plan_slice"
+      ]
+    },
+    {
+      "kind": "parallel",
+      "id": "verification_gates",
+      "branches": [
+        {
+          "kind": "kanban_agent",
+          "id": "review_gate",
+          "profile": "reviewer",
+          "task": {
+            "repo": "$ref:inputs.repo",
+            "issue_number": "$ref:inputs.issue_number",
+            "implementation": "$ref:implementation.output.result",
+            "check": "Review the exact PR head for code correctness, duplicate-work risk, and issue-closing scope.",
+            "profile_bindings": "$ref:inputs.profile_bindings"
+          },
+          "input": {
+            "base_branch": "$ref:inputs.base_branch"
+          },
+          "output_schema": {
+            "task_id": "string",
+            "status": "string",
+            "result": "object"
+          },
+          "depends_on": [
+            "implementation"
+          ]
+        },
+        {
+          "kind": "kanban_agent",
+          "id": "docs_gate",
+          "profile": "docs",
+          "task": {
+            "repo": "$ref:inputs.repo",
+            "issue_number": "$ref:inputs.issue_number",
+            "implementation": "$ref:implementation.output.result",
+            "check": "Verify docs hygiene: README/DESIGN/examples and comments match the shipped behavior, no stale roadmap claims remain, and docs-only gaps are filed or fixed.",
+            "profile_bindings": "$ref:inputs.profile_bindings"
+          },
+          "input": {
+            "base_branch": "$ref:inputs.base_branch"
+          },
+          "output_schema": {
+            "task_id": "string",
+            "status": "string",
+            "result": "object"
+          },
+          "depends_on": [
+            "implementation"
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "kanban_agent",
+      "id": "closeout_hygiene",
+      "profile": "ops",
+      "task": {
+        "repo": "$ref:inputs.repo",
+        "issue_number": "$ref:inputs.issue_number",
+        "implementation": "$ref:implementation.output.result",
+        "review": "$ref:review_gate.output.result",
+        "docs": "$ref:docs_gate.output.result",
+        "requirements": [
+          "comment on the GitHub issue with shipped PRs, merge commits, tests, docs changed, and residual work",
+          "close only issues whose acceptance criteria are fully satisfied",
+          "update parent roadmap checkboxes/comments after child issues land",
+          "open follow-up issues for residual docs/product gaps instead of burying them in a PR body"
+        ],
+        "profile_bindings": "$ref:inputs.profile_bindings"
+      },
+      "input": {
+        "base_branch": "$ref:inputs.base_branch"
+      },
+      "output_schema": {
+        "task_id": "string",
+        "status": "string",
+        "result": "object"
+      },
+      "depends_on": [
+        "review_gate",
+        "docs_gate"
+      ]
+    }
+  ]
+}
