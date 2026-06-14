@@ -26,6 +26,7 @@ MODULES = (
     "test_rpc",
     "test_vm_subprocess",
     "test_script_store",
+    "test_kanban_agent",
 )
 
 

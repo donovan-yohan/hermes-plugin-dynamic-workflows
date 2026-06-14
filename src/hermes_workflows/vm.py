@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -35,8 +36,20 @@ from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_
 from .errors import (
     CapabilityDenied,
     CorruptScriptRunError,
+    ScriptRunStoreError,
     ScriptValidationError,
     WorkflowSubprocessError,
+)
+from .kanban import (
+    CARD_BLOCKED,
+    DEFAULT_ON_BLOCK,
+    KanbanBackend,
+    KanbanBlocked,
+    KanbanCardSpec,
+    KanbanError,
+    KanbanTimeout,
+    KanbanUnknownProfile,
+    normalize_on_block,
 )
 from .registry import utc_now_iso
 from .script_store import (
@@ -147,6 +160,8 @@ class CapabilityBroker:
         recorder: Optional[CallRecorder] = None,
         replay: Optional[ReplayCache] = None,
         deterministic_runner: bool = False,
+        kanban_backend: Optional[KanbanBackend] = None,
+        idempotency_root: str = "",
     ) -> None:
         self._runner = agent_runner
         self._limits = limits
@@ -159,6 +174,20 @@ class CapabilityBroker:
         self._recorder = recorder
         self._replay = replay
         self._deterministic_runner = deterministic_runner
+        # Durable Kanban awaitable seam (issue #5): when present, kanban_agent
+        # calls are turned into durable, idempotent cards instead of synchronous
+        # AgentRunner stub calls. ``idempotency_root`` is the workflow's logical
+        # run id; combined with the stable call id it keys card create/reattach so
+        # a replay reattaches the same card rather than opening a duplicate.
+        self._kanban_backend = kanban_backend
+        self._idempotency_root = idempotency_root
+        # Absolute wall-clock deadline for this run, set at construction (a few ms
+        # before the subprocess spawns and the _drive watchdog arms). A durable
+        # Kanban await is bounded by *this* shared deadline rather than a fresh
+        # per-call window, so a late or repeated kanban_agent call cannot stretch
+        # total wall-clock past ~max_runtime_s (the watchdog cannot interrupt an
+        # in-progress parent-side await, so the two must share one deadline).
+        self._deadline = time.monotonic() + self._limits.max_runtime_s
         self._rpc_calls = 0
         self._agent_calls = 0
         self._kanban_calls = 0
@@ -208,7 +237,7 @@ class CapabilityBroker:
                 if replayed is not _MISS:
                     return replayed
 
-            value = self._dispatch(method, params)
+            value = self._dispatch(call_id, method, params)
             # The effect has already happened. Persist (replay cache + journal)
             # on a best-effort basis *after* building the success frame so a
             # disk/IO failure here never masquerades as a runner failure for a
@@ -244,9 +273,7 @@ class CapabilityBroker:
         cache line is fail-safe — on replay the missing id is a miss and the call
         simply re-runs.
         """
-        if self._recorder is not None and is_replayable(
-            method, deterministic_runner=self._deterministic_runner
-        ):
+        if self._recorder is not None and self._is_cacheable(method):
             try:
                 self._recorder.record(call_id, method, replay_args_hash(method, params), value)
             except Exception:  # noqa: BLE001 — persistence is best-effort.
@@ -255,6 +282,18 @@ class CapabilityBroker:
             self._emit(self._call_event(call_id, method, params, ok=True))
         except Exception:  # noqa: BLE001 — journaling is best-effort.
             pass
+
+    def _is_cacheable(self, method: str) -> bool:
+        """Whether a call's result may be written to the #3 replay cache.
+
+        Mirrors :func:`is_replayable`, with one subtraction: a ``kanban_agent``
+        served by a live :class:`KanbanBackend` is a durable external effect, not
+        a pure function, so it is never cached. On replay it re-runs and the
+        idempotency key reattaches the same card — no duplicate, no stale value.
+        """
+        if method == "kanban_agent" and self._kanban_backend is not None:
+            return False
+        return is_replayable(method, deterministic_runner=self._deterministic_runner)
 
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
@@ -294,7 +333,7 @@ class CapabilityBroker:
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
         return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
 
-    def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
+    def _dispatch(self, call_id: Any, method: str, params: dict[str, Any]) -> Any:
         if method == "log":
             return None  # journaling is handled by _emit; nothing to return.
         if method == "phase":
@@ -302,7 +341,7 @@ class CapabilityBroker:
         if method == "agent":
             return self._handle_agent(params)
         if method == "kanban_agent":
-            return self._handle_kanban(params)
+            return self._handle_kanban(call_id, params)
         if method == "workflow":
             if not self._limits.allow_nested_workflows:
                 raise CapabilityDenied("nested workflows are not permitted", code="nested_denied")
@@ -335,15 +374,26 @@ class CapabilityBroker:
         payload = params.get("input") if isinstance(params.get("input"), dict) else {}
         return self._invoke(agent_id, payload, params.get("schema"))
 
-    def _handle_kanban(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         profile = params.get("profile")
         if not isinstance(profile, str) or not profile:
             raise CapabilityDenied("kanban_agent call requires a non-empty 'profile'", code="bad_request")
+        try:
+            on_block = normalize_on_block(params.get("on_block"))
+        except ValueError as exc:
+            raise CapabilityDenied(str(exc), code="bad_request") from exc
         self._check_token_budget()
         self._kanban_calls += 1
         if self._kanban_calls > self._limits.max_kanban_calls:
             # Soft denial (see _handle_agent): catchable; max_rpc_calls aborts.
             raise CapabilityDenied(f"max_kanban_calls ({self._limits.max_kanban_calls}) exceeded", code="limit_kanban")
+
+        if self._kanban_backend is not None:
+            return self._handle_kanban_durable(call_id, profile, on_block, params)
+
+        # Legacy synchronous path (no durable backend injected): route through the
+        # AgentRunner exactly as before, so existing in-memory runs/tests are
+        # unchanged. on_block is inert here — there is no real card to block on.
         agent_id = kanban_runner_id(profile)
         payload = {
             "profile": profile,
@@ -353,6 +403,77 @@ class CapabilityBroker:
             "durable": True,
         }
         return self._invoke(agent_id, payload, params.get("schema"))
+
+    def _kanban_await_timeout(self) -> float:
+        """Remaining time until the shared run deadline (never negative).
+
+        Bounds a durable Kanban await by the same absolute deadline as the _drive
+        watchdog instead of a fresh ``max_runtime_s`` window per call. ``0.0`` (the
+        deadline already passed) makes :meth:`await_resolution` return a cached
+        resolution immediately or raise ``KanbanTimeout`` without blocking.
+        """
+        remaining = self._deadline - time.monotonic()
+        return remaining if remaining > 0.0 else 0.0
+
+    def _kanban_idempotency_key(self, call_id: Any) -> str:
+        """Stable key for one logical ``kanban_agent`` call.
+
+        ``<logical_run_id>:<stable_call_id>``. The call id is reproducible across a
+        replay of the same script+args, and a replay inherits the source run's id
+        as the root, so create/reattach converges on one card per logical step.
+        """
+        return f"{self._idempotency_root}:{call_id}"
+
+    def _handle_kanban_durable(
+        self, call_id: Any, profile: str, on_block: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        spec = KanbanCardSpec(
+            profile=profile,
+            title=params.get("title"),
+            prompt=params.get("prompt"),
+            context=params.get("context") if isinstance(params.get("context"), dict) else {},
+            task=params.get("task") if isinstance(params.get("task"), dict) else {},
+            input=params.get("input") if isinstance(params.get("input"), dict) else {},
+            board=params.get("board"),
+            tenant=params.get("tenant"),
+            parents=tuple(params["parents"]) if isinstance(params.get("parents"), (list, tuple)) else (),
+            labels=tuple(params["labels"]) if isinstance(params.get("labels"), (list, tuple)) else (),
+            workspace=params.get("workspace") if isinstance(params.get("workspace"), dict) else None,
+            schema=params.get("schema") if isinstance(params.get("schema"), dict) else None,
+        )
+        idempotency_key = self._kanban_idempotency_key(call_id)
+        try:
+            card = self._kanban_backend.create_or_reattach(idempotency_key, spec)
+            resolution = self._kanban_backend.await_resolution(
+                card.card_id,
+                accept_blocked=(on_block != "pause"),
+                timeout=self._kanban_await_timeout(),
+            )
+        except KanbanUnknownProfile as exc:
+            raise CapabilityDenied(str(exc), code="unknown_profile") from exc
+        except KanbanTimeout as exc:
+            raise CapabilityDenied(str(exc), code="kanban_timeout") from exc
+        except KanbanError as exc:  # any other backend failure -> structured denial.
+            raise CapabilityDenied(str(exc), code="kanban_error") from exc
+
+        if resolution.status == CARD_BLOCKED and on_block == "raise":
+            raise CapabilityDenied(str(KanbanBlocked(resolution)), code="kanban_blocked")
+
+        result: dict[str, Any] = {
+            "card_id": resolution.card_id,
+            "task_id": resolution.card_id,  # parity with the legacy stub shape.
+            "profile": resolution.profile or profile,
+            "status": resolution.status,
+            "result": resolution.result or {},
+            "reattached": card.reattached,
+        }
+        if resolution.reason is not None:
+            result["reason"] = resolution.reason
+        _validate_output(result, spec.schema)
+        usage = (resolution.result or {}).get("_tokens")
+        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+            self._tokens += usage
+        return result
 
     def _invoke(self, agent_id: str, payload: dict[str, Any], schema: Any) -> dict[str, Any]:
         output = self._runner(agent_id, payload)
@@ -424,6 +545,8 @@ class WorkflowVM:
         recorder: Optional[CallRecorder] = None,
         replay: Optional[ReplayCache] = None,
         deterministic_runner: bool = False,
+        kanban_backend: Optional[KanbanBackend] = None,
+        idempotency_root: str = "",
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._limits = limits if limits is not None else VMLimits()
@@ -433,6 +556,9 @@ class WorkflowVM:
         self._recorder = recorder
         self._replay = replay
         self._deterministic_runner = deterministic_runner
+        # Durable Kanban awaitable wiring (issue #5): forwarded to the broker.
+        self._kanban_backend = kanban_backend
+        self._idempotency_root = idempotency_root
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -465,6 +591,8 @@ class WorkflowVM:
             recorder=self._recorder,
             replay=self._replay,
             deterministic_runner=self._deterministic_runner,
+            kanban_backend=self._kanban_backend,
+            idempotency_root=self._idempotency_root,
         )
         try:
             result = self._drive(script, args, broker, calls)
@@ -781,6 +909,7 @@ def run_script(
     run_id: Optional[str] = None,
     replay_from: Optional[str] = None,
     deterministic_runner: Optional[bool] = None,
+    kanban_backend: Optional[KanbanBackend] = None,
 ) -> ScriptRunResult:
     """Construct a :class:`WorkflowVM` and run one script, optionally durable.
 
@@ -817,6 +946,7 @@ def run_script(
     # typed rather than mid-run.
     replay_cache: Optional[ReplayCache] = None
     source_limits: Optional[dict[str, Any]] = None
+    replay_idempotency_root: Optional[str] = None
     if replay_from is not None:
         if store is None:
             raise ValueError("replay_from requires a store")
@@ -832,6 +962,19 @@ def run_script(
             )
         replay_cache = store.load_cache(replay_from)
         source_limits = source.limits
+        # Kanban idempotency must key on the *original* logical run, not the
+        # immediate source: replaying a replay (A <- B <- C) would otherwise open a
+        # fresh card at each generation. Walk replay_of to the first non-replay
+        # ancestor; degrade to the nearest resolvable run if the chain is broken.
+        root_meta = source
+        visited = {source.run_id}
+        while root_meta.replay_of is not None and root_meta.replay_of not in visited:
+            visited.add(root_meta.replay_of)
+            try:
+                root_meta = store.load_run(root_meta.replay_of)
+            except ScriptRunStoreError:
+                break
+        replay_idempotency_root = root_meta.run_id
 
     # Default a replay's caps/budget to the recorded run's so budget-/cap-gated
     # control flow reproduces faithfully; an explicit limits= still overrides.
@@ -852,12 +995,18 @@ def run_script(
         effective_limits = VMLimits()
 
     if store is None:
+        # No durable store: there is no logical run id to share across replays, so
+        # key Kanban idempotency by the program identity (script+args). Two runs of
+        # the same program then reattach the same cards — replay-safe by design.
+        idempotency_root = f"mem_{script_sha256(script)[:12]}_{canonical_hash(args)[:8]}"
         vm = WorkflowVM(
             agent_runner=runner,
             limits=effective_limits,
             journal=journal,
             replay=replay_cache,
             deterministic_runner=deterministic,
+            kanban_backend=kanban_backend,
+            idempotency_root=idempotency_root,
         )
         return vm.run(script, args=args, validate=validate)
 
@@ -885,6 +1034,11 @@ def run_script(
 
     # Record cache entries only on a fresh run; a replay consumes the cache.
     recorder = store.recorder(persist_run_id) if replay_cache is None else None
+    # Kanban idempotency root is the *logical* run id: a fresh run uses its own
+    # persisted run id; a replay (or replay-of-a-replay) inherits the original
+    # run's id so create/reattach converges on the same card instead of opening a
+    # duplicate at each generation.
+    idempotency_root = replay_idempotency_root if replay_idempotency_root is not None else persist_run_id
     vm = WorkflowVM(
         agent_runner=runner,
         limits=effective_limits,
@@ -892,6 +1046,8 @@ def run_script(
         recorder=recorder,
         replay=replay_cache,
         deterministic_runner=deterministic,
+        kanban_backend=kanban_backend,
+        idempotency_root=idempotency_root,
     )
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id

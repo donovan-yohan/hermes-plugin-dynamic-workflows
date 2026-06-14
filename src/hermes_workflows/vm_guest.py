@@ -175,11 +175,26 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
         return conn.call("agent", {"agent_id": agent_id, "input": input or {}, "label": label, "schema": schema})
 
     async def kanban_agent(profile: str, task: Any = None, input: Optional[dict[str, Any]] = None, *,
+                           title: Optional[str] = None, prompt: Optional[str] = None,
+                           context: Optional[dict[str, Any]] = None, board: Optional[str] = None,
+                           tenant: Optional[str] = None, parents: Any = None, labels: Any = None,
+                           workspace: Optional[dict[str, Any]] = None, on_block: Optional[str] = None,
                            label: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
-        return conn.call(
-            "kanban_agent",
-            {"profile": profile, "task": task or {}, "input": input or {}, "label": label, "schema": schema},
-        )
+        # The parent broker (never this subprocess) turns these into a durable,
+        # idempotent Kanban card and blocks until it resolves; ``on_block`` selects
+        # pause/raise/return semantics for a blocked card. Only non-None extras are
+        # forwarded so the call's replay args-hash stays stable for the common case.
+        params: dict[str, Any] = {
+            "profile": profile, "task": task or {}, "input": input or {},
+            "label": label, "schema": schema,
+        }
+        extras = {
+            "title": title, "prompt": prompt, "context": context, "board": board,
+            "tenant": tenant, "parents": parents, "labels": labels,
+            "workspace": workspace, "on_block": on_block,
+        }
+        params.update({key: value for key, value in extras.items() if value is not None})
+        return conn.call("kanban_agent", params)
 
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
         return conn.call("workflow", {"name": name, "args": args})

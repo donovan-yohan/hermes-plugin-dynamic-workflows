@@ -72,6 +72,19 @@ from .script_store import (
     canonical_hash,
     is_replayable,
 )
+from .kanban import (
+    KanbanBackend,
+    InMemoryKanbanBackend,
+    KanbanCardSpec,
+    KanbanCard,
+    KanbanResolution,
+    KanbanError,
+    KanbanBlocked,
+    KanbanUnknownProfile,
+    KanbanTimeout,
+    ON_BLOCK_POLICIES,
+    kanban_card_id,
+)
 from .errors import (
     WorkflowError,
     WorkflowValidationError,
@@ -136,6 +149,18 @@ __all__ = [
     "script_run_id",
     "canonical_hash",
     "is_replayable",
+    # durable kanban awaitable (issue #5)
+    "KanbanBackend",
+    "InMemoryKanbanBackend",
+    "KanbanCardSpec",
+    "KanbanCard",
+    "KanbanResolution",
+    "KanbanError",
+    "KanbanBlocked",
+    "KanbanUnknownProfile",
+    "KanbanTimeout",
+    "ON_BLOCK_POLICIES",
+    "kanban_card_id",
     # errors
     "WorkflowError",
     "WorkflowValidationError",
