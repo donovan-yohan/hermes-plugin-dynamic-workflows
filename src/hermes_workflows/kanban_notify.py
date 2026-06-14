@@ -161,10 +161,12 @@ class _FifoSubscription:
         # The write end is held only so the read end never sees EOF (which select
         # reports as readable) when no producer happens to be attached — otherwise
         # the consumer would busy-spin. We never write to it ourselves.
-        self._rfd = rfd
+        self._rfd: Optional[int] = rfd
         self._wfd = wfd
 
     def wait(self, timeout: Optional[float]) -> bool:
+        if self._rfd is None:
+            return False
         try:
             readable, _, _ = select.select([self._rfd], [], [], timeout)
         except (OSError, ValueError):
@@ -182,12 +184,23 @@ class _FifoSubscription:
         return True
 
     def close(self) -> None:
-        for fd in (self._rfd, self._wfd):
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+        if self._rfd is not None:
+            fd = self._rfd
+            self._rfd = None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if self._wfd is not None:
+            fd = self._wfd
+            self._wfd = None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class FifoEventNotifier:

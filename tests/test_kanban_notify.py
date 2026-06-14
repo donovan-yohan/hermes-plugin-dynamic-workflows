@@ -104,6 +104,18 @@ def test_fifo_subscription_does_not_spin_after_a_notify_and_leave():
             sub.close()
 
 
+def test_fifo_subscription_close_is_idempotent_and_marks_fds_closed():
+    # Regression (Gemini): close() must poison fd fields before a second close
+    # (explicit, destructor, or cleanup) can accidentally close a reused fd number.
+    with TemporaryDirectory() as tmp:
+        consumer = FifoEventNotifier(Path(tmp) / "_kanban")
+        sub = consumer.subscribe("kbc_x")
+        sub.close()
+        assert getattr(sub, "_rfd") is None
+        assert getattr(sub, "_wfd") is None
+        sub.close()  # must be harmless.
+
+
 def test_fifo_notify_with_no_subscriber_is_harmless():
     with TemporaryDirectory() as tmp:
         n = FifoEventNotifier(Path(tmp) / "_kanban")
