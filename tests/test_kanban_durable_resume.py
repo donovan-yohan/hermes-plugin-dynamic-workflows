@@ -85,6 +85,24 @@ def test_store_card_state_round_trips_and_waiting_never_clobbers_a_resolution():
         assert store.load_kanban_card_state("kbc_abc")["status"] == "completed"
 
 
+def test_store_terminal_outcome_is_not_regressed_by_a_stale_non_terminal_write():
+    # Regression (review): a terminal completed/failed is final — a stale 'blocked'
+    # or 'waiting' write (e.g. a slow cross-process writer) must not regress it. A
+    # legitimate blocked -> completed unblock still lands (incoming is terminal).
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        store.record_kanban_card_state("kbc_t", {"status": "completed", "workflow_result": {"plan": "FINAL"}})
+        store.record_kanban_card_state("kbc_t", {"status": "blocked", "reason": "stale"})
+        assert store.load_kanban_card_state("kbc_t")["status"] == "completed"
+        store.record_kanban_card_state("kbc_t", {"status": "waiting"})
+        assert store.load_kanban_card_state("kbc_t")["status"] == "completed"
+
+        # A non-terminal 'blocked' can still advance to a terminal 'completed'.
+        store.record_kanban_card_state("kbc_u", {"status": "blocked", "reason": "needs input"})
+        store.record_kanban_card_state("kbc_u", {"status": "completed", "workflow_result": {"plan": "done"}})
+        assert store.load_kanban_card_state("kbc_u")["status"] == "completed"
+
+
 def test_store_resolution_is_last_write_wins_regardless_of_version():
     # Outcomes from different processes live in incomparable version spaces, so a
     # later real outcome must win even if its version number is lower — a numeric

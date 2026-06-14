@@ -79,9 +79,10 @@ SCRIPT_SCHEMA_VERSION = 1
 # JSON-runtime FileRunStore guard). Minted ids are ``wfs_<hash8>_<uuid12>``.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
-# Durable kanban card *outcome* states (issue #5). A "waiting" marker must never
-# overwrite one of these (see ``record_kanban_card_state``).
-_KANBAN_RESOLUTION_STATUSES = frozenset({"completed", "blocked", "failed"})
+# Durable kanban card *terminal* states (issue #5). Once a card reaches one of
+# these it is final: a non-terminal write (``waiting`` or ``blocked``) must never
+# regress it (see ``record_kanban_card_state``).
+_KANBAN_TERMINAL_STATUSES = frozenset({"completed", "failed"})
 
 # Methods whose result is a deterministic constant regardless of any runner:
 # both ``log`` and ``phase`` are pure side-effect metadata and return ``None``.
@@ -536,13 +537,15 @@ class ScriptRunStore:
     def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None:
         """Persist the latest state of a Kanban card (atomic; status-precedence).
 
-        Last-write-wins among *outcome* states (completed/blocked/failed), which are
-        written in temporal order by a single run. The one guard is a precedence
-        rule: a ``waiting`` marker never overwrites a card that already reached an
-        outcome (so re-opening/reattaching a card cannot regress its recorded
-        result). A numeric version is deliberately *not* used to gate writes — a
-        card's events can originate in different, incomparable version spaces (a
-        prior process's backend vs. a fresh one on resume), so comparing them would
+        Last-write-wins among writes, with one precedence guard: once a card has
+        reached a **terminal** outcome (completed/failed) a *non-terminal* write
+        (``waiting`` or ``blocked``) never overwrites it. So re-opening/reattaching
+        a card, or a slow stale writer landing an old ``blocked``/``waiting``, can
+        never regress a recorded terminal result (a legitimate ``blocked`` ->
+        ``completed`` unblock still lands, since the incoming status is terminal).
+        A numeric version is deliberately *not* used to gate writes — a card's
+        events can originate in different, incomparable version spaces (a prior
+        process's backend vs. a fresh one on resume), so comparing them would
         wrongly drop a live superseding outcome.
         """
         _require_safe_card_id(card_id)
@@ -553,10 +556,10 @@ class ScriptRunStore:
             existing = self._load_kanban_card_state_unlocked(card_id)
             if (
                 existing is not None
-                and record.get("status") == "waiting"
-                and existing.get("status") in _KANBAN_RESOLUTION_STATUSES
+                and existing.get("status") in _KANBAN_TERMINAL_STATUSES
+                and record.get("status") not in _KANBAN_TERMINAL_STATUSES
             ):
-                return  # never regress a resolved card back to a 'waiting' marker.
+                return  # a terminal outcome is final; a non-terminal write never regresses it.
             self._kanban_dir().mkdir(parents=True, exist_ok=True)
             path = self._kanban_path(card_id)
             payload = json.dumps(record, ensure_ascii=False, indent=2) + "\n"

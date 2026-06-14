@@ -648,7 +648,7 @@ class DurableKanbanBackend:
         card = self._inner.create_or_reattach(idempotency_key, spec)
         try:
             existing = self._store.load_kanban_card_state(card.card_id)
-        except Exception:  # noqa: BLE001 — durable read is best-effort; fall back to live.
+        except OSError:  # durable read is best-effort; fall back to live on an IO error.
             existing = None
         if existing is not None:
             # A durable record already exists: this is a resume/reattach even if a
@@ -677,7 +677,7 @@ class DurableKanbanBackend:
             if not already_served:
                 try:
                     recorded = _state_to_resolution(self._store.load_kanban_card_state(card_id))
-                except Exception:  # noqa: BLE001 — durable read is best-effort.
+                except OSError:  # durable read is best-effort.
                     recorded = None
                 if recorded is not None and is_accepted_resolution(recorded, accept_blocked):
                     with self._lock:
@@ -704,11 +704,18 @@ class DurableKanbanBackend:
         return self._stamp(card_id, resolution)
 
     def _record_card_state(self, card_id: str, state: dict[str, Any]) -> None:
-        """Persist card state best-effort: the outcome already happened, so a disk
-        failure must not fail an otherwise-successful await."""
+        """Persist card state best-effort: the outcome already happened, so an IO
+        failure must not fail an otherwise-successful await.
+
+        Only ``OSError`` is swallowed (a genuine disk/IO failure) — a programming
+        error such as an unsafe card id or a bad payload still surfaces. The cost
+        of a swallowed write is a *degraded* future resume (the card has no
+        recorded outcome, so a resume re-awaits it live), not a wrong result for
+        this run.
+        """
         try:
             self._store.record_kanban_card_state(card_id, state)
-        except Exception:  # noqa: BLE001 — durable persistence is best-effort.
+        except OSError:  # durable persistence is best-effort; a resume re-awaits.
             pass
 
     def record_event(self, card_id: str, kind: str, detail: dict[str, Any]) -> None:
