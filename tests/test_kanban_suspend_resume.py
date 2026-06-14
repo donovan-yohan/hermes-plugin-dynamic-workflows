@@ -182,6 +182,29 @@ def test_suspended_runs_lists_only_suspended():
         assert ids == ["susp"]
 
 
+def test_suspended_runs_skips_a_corrupt_utf8_run_json():
+    # Regression (review): a run.json with invalid UTF-8 makes read_text raise
+    # UnicodeDecodeError (a ValueError, not OSError); load_run maps it to a typed
+    # CorruptScriptRunError so a bulk scan skips it instead of crashing.
+    from hermes_workflows.errors import CorruptScriptRunError
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        store.begin("susp", script="x", args=None, limits=None, deterministic_runner=False)
+        store.finish("susp", status="suspended", meta=None, value=None, error=None)
+        store.begin("rot", script="x", args=None, limits=None, deterministic_runner=False)
+        (Path(tmp) / "runs" / "rot" / "run.json").write_bytes(b"\xff\xfe not utf-8")
+
+        try:
+            store.load_run("rot")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_run"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for invalid UTF-8")
+
+        assert [m.run_id for m in store.suspended_runs()] == ["susp"]  # corrupt one skipped.
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end: suspend -> external event -> resume
 # --------------------------------------------------------------------------- #

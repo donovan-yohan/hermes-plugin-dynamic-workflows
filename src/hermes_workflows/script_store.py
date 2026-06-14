@@ -791,7 +791,11 @@ class ScriptRunStore:
             if missing_ok:
                 return None
             raise ScriptRunNotFound(run_id) from None
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError is a ValueError, not an OSError, so a run.json with
+            # invalid UTF-8 bytes would otherwise escape load_run as a bare
+            # exception (and crash a bulk scan like suspended_runs); map it to the
+            # same typed corrupt_run as any other unreadable record.
             raise CorruptScriptRunError(run_id, "corrupt_run", f"run.json: {exc}") from exc
         try:
             data = json.loads(raw)
