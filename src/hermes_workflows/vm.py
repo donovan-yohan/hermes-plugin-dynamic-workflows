@@ -84,6 +84,12 @@ _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "log", "phase", "workflow
 # so the broker must fall through to a live dispatch.
 _MISS = object()
 
+# Cap on how many distinct result-contract violations one kanban_agent call records
+# (journal marker + card comment). Under on_block="pause" a misbehaving worker can
+# re-complete with bad output rapidly; the await is deadline-bounded, but this keeps
+# a buggy worker from amplifying into unbounded journal writes / board comments.
+_MAX_RESULT_INVALID_RECORDS = 8
+
 # Output-schema type table (mirrors runtime._TYPE_MAP) for brokered agent calls.
 _TYPE_MAP: dict[str, tuple[type, ...]] = {
     "string": (str,), "str": (str,), "number": (int, float), "int": (int,),
@@ -490,6 +496,8 @@ class CapabilityBroker:
         """
         accept_blocked = on_block != "pause"
         after_version = 0
+        last_recorded: Optional[tuple[str, ...]] = None
+        records = 0
         while True:
             try:
                 resolution = self._kanban_backend.await_resolution(
@@ -503,6 +511,15 @@ class CapabilityBroker:
             except KanbanError as exc:  # any other backend failure -> structured denial.
                 raise CapabilityDenied(str(exc), code="kanban_error") from exc
 
+            # Defense: await_resolution must return an event strictly newer than
+            # after_version. A backend that ignores after_version would hand back
+            # the same rejected completion and the pause retry would hot-spin to the
+            # deadline; fail closed instead of spinning.
+            if after_version and resolution.version <= after_version:
+                raise CapabilityDenied(
+                    "kanban backend returned a stale event (after_version ignored)",
+                    code="kanban_error",
+                )
             after_version = resolution.version
             if resolution.status != CARD_COMPLETED or not schema:
                 return resolution, []  # blocked/failed, or no contract to enforce.
@@ -512,8 +529,15 @@ class CapabilityBroker:
                 return resolution, []  # valid structured result.
 
             # Contract violation: a completed card with a bad/missing workflow_result
-            # must not be returned as success.
-            self._record_kanban_result_invalid(call_id, card_id, profile, diagnostics)
+            # must not be returned as success. Record the rejection, but de-dup
+            # consecutive identical diagnostics and cap total records so a worker
+            # stuck re-completing with bad output can't amplify into unbounded
+            # journal writes / board comments.
+            diag_key = tuple(diagnostics)
+            if diag_key != last_recorded and records < _MAX_RESULT_INVALID_RECORDS:
+                self._record_kanban_result_invalid(call_id, card_id, profile, diagnostics)
+                last_recorded = diag_key
+                records += 1
             if on_block == "pause":
                 continue  # wait for the worker to re-complete with a valid result.
             reason = "workflow_result failed schema: " + "; ".join(diagnostics)

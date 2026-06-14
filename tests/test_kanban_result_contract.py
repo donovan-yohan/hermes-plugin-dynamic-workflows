@@ -23,6 +23,8 @@ from hermes_workflows.kanban import (
     CARD_BLOCKED,
     CARD_COMPLETED,
     InMemoryKanbanBackend,
+    KanbanCard,
+    KanbanResolution,
     kanban_card_id,
     result_contract_instruction,
     validate_workflow_result,
@@ -84,6 +86,20 @@ def test_validate_rejects_non_dict_and_bool_for_number():
 def test_validate_preserves_extra_fields():
     # Extra fields beyond the schema are allowed (templates may add shape).
     assert validate_workflow_result({"plan": "x", "extra": 1}, {"plan": "string"}) == []
+
+
+def test_validate_permissive_hints_accept_bool():
+    # Regression (review): a permissive field (the `any` hint -> object, or the
+    # Python `object` type) must accept a bool — the int-subclass bool guard only
+    # applies to numeric/text fields.
+    assert validate_workflow_result({"flag": True}, {"flag": "any"}) == []
+    assert validate_workflow_result({"flag": True}, {"flag": object}) == []
+    # bool is still explicitly accepted where bool/boolean is declared.
+    assert validate_workflow_result({"flag": True}, {"flag": "bool"}) == []
+    # ...and still rejected for a numeric field (bool is an int subclass).
+    assert validate_workflow_result({"n": True}, {"n": "int"})
+    # `"object"` means a dict (not Python object), so it correctly rejects a bool.
+    assert validate_workflow_result({"d": True}, {"d": "object"})
 
 
 def test_result_contract_instruction():
@@ -199,6 +215,30 @@ def test_pause_retries_until_a_valid_result():
     assert ret["value"]["status"] == CARD_COMPLETED
     assert ret["value"]["workflow_result"] == {"plan": "ok now"}
     assert sum(e["kind"] == "result_invalid" for e in backend.events) == 1
+
+
+class _StaleBackend:
+    """A broken backend that ignores after_version (always returns the same event)."""
+
+    def create_or_reattach(self, idempotency_key, spec):
+        return KanbanCard(card_id="kbc_stale", profile=spec.profile)
+
+    def await_resolution(self, card_id, *, accept_blocked, timeout, after_version=0):
+        # Always a completed-but-invalid result at a fixed version, regardless of
+        # after_version — exactly the contract violation the broker must not spin on.
+        return KanbanResolution(
+            card_id=card_id, profile="planner", status=CARD_COMPLETED, result={}, version=1
+        )
+
+
+def test_pause_fails_closed_if_backend_ignores_after_version():
+    # Regression (review): the pause retry's only guard against re-consuming the
+    # same rejected completion is after_version. A backend that ignores it would
+    # hot-spin to the deadline; the broker fails closed with kanban_error instead.
+    broker = _broker(_StaleBackend(), limits=VMLimits(max_runtime_s=2.0))
+    ret = broker.handle(_kanban_frame(1, schema={"plan": "string"}, on_block="pause"))
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "kanban_error"
 
 
 # --------------------------------------------------------------------------- #

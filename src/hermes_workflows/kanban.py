@@ -204,7 +204,11 @@ def validate_workflow_result(payload: Any, schema: Optional[dict[str, Any]]) -> 
         if expected is None:
             continue  # unknown type hint: leniently accept (matches brokered-output policy).
         value = payload[field_name]
-        if expected != (bool,) and isinstance(value, bool):
+        # bool is an int subclass, so reject it for a numeric/text field — but
+        # allow it where bool is explicitly expected or the field is permissive
+        # (``any``/``object``, i.e. ``object in expected``), so a valid bool result
+        # is not wrongly rejected and turned into a contract violation.
+        if isinstance(value, bool) and bool not in expected and object not in expected:
             diagnostics.append(f"field {field_name!r} expected {hint}, got bool")
         elif not isinstance(value, expected):
             diagnostics.append(f"field {field_name!r} expected {hint}, got {type(value).__name__}")
