@@ -571,6 +571,47 @@ script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
 
+### 5.7 `kanban_agent` as a durable awaitable (issue #5)
+
+`kanban.py` upgrades `kanban_agent` from a synchronous stub call into a
+**durable, idempotent awaitable**, owned entirely by the parent broker — the
+sandboxed subprocess still issues one RPC and blocks; it never touches a board.
+
+**Backend seam.** A `KanbanBackend` (injected via
+`run_workflow_script(..., kanban_backend=)`) exposes two operations the broker
+drives: `create_or_reattach(idempotency_key, spec)` and
+`await_resolution(card_id, *, accept_blocked, timeout)`. When no backend is
+injected, `kanban_agent` keeps its prior AgentRunner behaviour, so existing runs
+and tests are unchanged.
+
+**Idempotency / no duplicate on replay.** The broker keys each card by
+`<logical_run_id>:<stable_call_id>`. The call id is reproducible across a replay
+(§5.6), and a replay inherits the source run's id as the root (via
+`replay_from`), so create/reattach converges on **one** card per logical step.
+Critically, a live Kanban call is a durable external effect, **not** a pure
+function, so it is *excluded from the #3 replay cache* — on replay it re-runs and
+the idempotency key reattaches the same card rather than serving a stale value or
+opening a duplicate.
+
+**Event-driven resolution.** The await is woken by a card *event*
+(completed/blocked/failed), never by polling, and is bounded by the run's
+`max_runtime_s` so a never-resolving card surfaces a typed `kanban_timeout`
+denial instead of hanging the parent. `on_block` governs a *blocked* card:
+`return` (default; surface a structured `status="blocked"` result), `raise` (a
+catchable denial into the script), or `pause` (keep awaiting until a terminal
+completed/failed event). Unknown assignee profiles are rejected with a structured
+`unknown_profile` diagnostic before any card opens.
+
+**Honest fake vs production.** `InMemoryKanbanBackend` is a real, event-driven
+(`threading.Condition`) fake for tests/local dev — it is **not** production. A
+production backend implementing the same interface must: create/reattach through
+the real Kanban DB/API using the idempotency key as the unique key (so concurrent
+parents and replays converge), subscribe to **durable** card events that survive a
+parent restart, defer dispatch to the gateway (the workflow only creates/waits —
+no duplicate dispatcher), and, for a true `pause`, persist the suspended run and
+resume it in a fresh process from a replayed event rather than holding a thread.
+Those four items are the residual production work for this slice.
+
 ### 5.5 Adversarial review and residual limitations
 
 The validator/guest/broker boundary was red-teamed with an independent

@@ -8,7 +8,7 @@ and free of network/filesystem effects.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from . import schema as _schema
 from . import sandbox as _sandbox
@@ -21,6 +21,9 @@ from .registry import RunStore, get_default_store
 from .script_store import ScriptRunStore
 from .script_validator import ScriptValidation, validate_script
 from .vm import JournalSink, ScriptRunResult, VMLimits, run_script
+
+if TYPE_CHECKING:  # avoid importing the backend at runtime; annotation-only.
+    from .kanban import KanbanBackend
 
 __all__ = [
     "workflow",
@@ -297,6 +300,7 @@ def run_workflow_script(
     run_id: Optional[str] = None,
     replay_from: Optional[str] = None,
     deterministic_runner: Optional[bool] = None,
+    kanban_backend: Optional["KanbanBackend"] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -313,6 +317,14 @@ def run_workflow_script(
     prior run whose deterministic calls are served from the cache instead of
     being re-dispatched. See :func:`hermes_workflows.vm.run_script` for the full
     durable/replay contract.
+
+    ``kanban_backend`` (issue #5) makes ``kanban_agent`` a durable awaitable:
+    each call becomes a parent-owned, idempotent Kanban card that the broker
+    blocks on until it resolves (completed/blocked/failed), with ``on_block``
+    selecting pause/raise/return. The idempotency key is derived from the logical
+    run id and the stable call id, so a replay reattaches the same card instead of
+    creating a duplicate. Without a backend, ``kanban_agent`` keeps its prior
+    synchronous AgentRunner behaviour.
     """
     return run_script(
         source,
@@ -325,6 +337,7 @@ def run_workflow_script(
         run_id=run_id,
         replay_from=replay_from,
         deterministic_runner=deterministic_runner,
+        kanban_backend=kanban_backend,
     )
 
 
