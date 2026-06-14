@@ -633,33 +633,46 @@ class ScriptRunStore:
     ) -> dict[str, Any]:
         """Append one durable card event and return the persisted record.
 
-        ``seq`` is a per-card monotonic sequence (the append's 1-based position),
-        so a consumer can read events ``after_seq`` it has already processed. The
-        worker's structured payload is stored under ``workflow_result`` — the same
-        key the resolution serialiser uses — so a logged event reads back as a
-        resolution without translation.
+        ``seq`` is the event's **line position** in the log — assigned at read
+        time (not written into the line), so it is inherently unique and monotonic
+        even across concurrent producers in different processes (each ``O_APPEND``
+        write lands one whole line; the line order is the append order). The
+        returned ``seq`` is exact in a single process. The worker's structured
+        payload is stored under ``workflow_result`` — the same key the resolution
+        serialiser uses — so a logged event reads back as a resolution without
+        translation.
         """
         _require_safe_card_id(card_id)
         record = {
             "card_id": card_id,
+            "ts": utc_now_iso(),
             "status": status,
             "workflow_result": result if isinstance(result, dict) else {},
             "reason": reason,
             "profile": profile,
         }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
             self._kanban_dir().mkdir(parents=True, exist_ok=True)
             path = self._kanban_events_path(card_id)
-            seq = self._count_lines(path) + 1
-            record = {"seq": seq, "ts": utc_now_iso(), **record}
+            # If a prior crash left a torn (newline-less) final line, start this
+            # event on its own line so it can never concatenate onto — and be lost
+            # with — the partial one.
+            prefix = self._torn_line_prefix(path)
             with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                f.write(prefix + line + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-        return record
+            seq = self._count_lines(path)  # the new line's 1-based position.
+        return {"seq": seq, **record}
 
     def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
-        """Return durable card events with ``seq > after_seq`` (corrupt lines skipped)."""
+        """Return durable card events with line position ``> after_seq``.
+
+        ``seq`` is the event's physical line number (1-based), so it is a stable,
+        unique cursor regardless of concurrent producers; a corrupt line is skipped
+        but still consumes its position so the cursor never shifts.
+        """
         _require_safe_card_id(card_id)
         path = self._kanban_events_path(card_id)
         events: list[dict[str, Any]] = []
@@ -669,16 +682,18 @@ class ScriptRunStore:
             return []
         except OSError:
             return []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            if lineno <= after_seq:
+                continue
+            raw = raw.strip()
+            if not raw:
                 continue
             try:
-                event = json.loads(line)
+                event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if isinstance(event, dict) and isinstance(event.get("seq"), int) and event["seq"] > after_seq:
-                events.append(event)
+            if isinstance(event, dict):
+                events.append({**event, "seq": lineno})
         return events
 
     def latest_kanban_resolution(self, card_id: str) -> Optional[dict[str, Any]]:
@@ -710,6 +725,23 @@ class ScriptRunStore:
                 return sum(1 for _ in f)
         except FileNotFoundError:
             return 0
+
+    @staticmethod
+    def _torn_line_prefix(path: Path) -> str:
+        """Return ``"\\n"`` if the log's final line lacks a trailing newline.
+
+        A crash mid-append can leave a torn final line; prefixing the next event
+        with a newline isolates the damage to that one (corrupt, skipped) line
+        instead of letting the next event concatenate onto it.
+        """
+        try:
+            if path.stat().st_size == 0:
+                return ""
+            with path.open("rb") as f:
+                f.seek(-1, os.SEEK_END)
+                return "" if f.read(1) == b"\n" else "\n"
+        except OSError:
+            return ""
 
     def _kanban_dir(self) -> Path:
         return self.root / "_kanban"

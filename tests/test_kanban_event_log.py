@@ -84,6 +84,37 @@ def test_event_log_skips_corrupt_lines():
         assert store.latest_kanban_resolution("kbc_c")["workflow_result"] == {"plan": "ok"}
 
 
+def test_event_log_seq_is_a_stable_positional_cursor_across_instances():
+    # Regression (review): seq is the physical line position assigned at read time,
+    # so it is unique/monotonic even across two store instances (the cross-process
+    # producer seam) — a write-time counter under a per-instance lock would have
+    # handed out duplicate seqs and an after_seq consumer would silently drop events.
+    with TemporaryDirectory() as tmp:
+        a = ScriptRunStore(Path(tmp) / "runs")
+        b = ScriptRunStore(Path(tmp) / "runs")
+        a.append_kanban_event("kbc_x", status="blocked", reason="r1")
+        b.append_kanban_event("kbc_x", status="completed", result={"plan": "p2"})
+        a.append_kanban_event("kbc_x", status="completed", result={"plan": "p3"})
+        events = a.read_kanban_events("kbc_x")
+        assert [e["seq"] for e in events] == [1, 2, 3]
+        assert a.read_kanban_events("kbc_x", after_seq=2) == [events[2]]
+        assert a.latest_kanban_resolution("kbc_x")["workflow_result"] == {"plan": "p3"}
+
+
+def test_event_log_recovers_from_a_torn_trailing_line():
+    # Regression (review): a crash can leave a newline-less partial final line; the
+    # next append must not concatenate onto it and be lost.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        store.append_kanban_event("kbc_y", status="blocked", reason="r1")
+        path = Path(tmp) / "runs" / "_kanban" / "kbc_y.events.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"status":"completed","workflow_result":{"partial":1}')  # torn: no newline.
+        store.append_kanban_event("kbc_y", status="completed", result={"plan": "saved"})
+        latest = store.latest_kanban_resolution("kbc_y")
+        assert latest is not None and latest["workflow_result"] == {"plan": "saved"}
+
+
 def test_event_log_rejects_unsafe_card_id():
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")

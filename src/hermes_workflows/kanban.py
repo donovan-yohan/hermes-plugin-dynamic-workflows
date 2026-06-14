@@ -716,6 +716,14 @@ class DurableKanbanBackend:
         different process) appends a card event there, so a parent that was down
         when the event was produced resumes from it. The latest-state file is the
         parent's own record (and the fallback when the store has no event log).
+
+        By contract the log is authoritative for a card's outcome: both sources
+        describe the *same* content-addressed logical call, so a logged event and a
+        parent-recorded state agree, and the log is preferred when both exist. The
+        two carry incomparable version spaces (a log line position vs. the parent's
+        recorded version), so there is no safe numeric tie-break — a stale producer
+        event lingering in the log alongside a different parent-recorded outcome is
+        a producer-contract violation, out of scope for this seam.
         """
         latest = getattr(self._store, "latest_kanban_resolution", None)
         if callable(latest):
