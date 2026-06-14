@@ -28,8 +28,23 @@ from hermes_workflows.kanban import (
 )
 from hermes_workflows.kanban import _resolution_to_state, _state_to_resolution
 from hermes_workflows.script_store import ScriptRunStore
+from hermes_workflows.vm import CapabilityBroker, VMLimits
 
 META = 'meta = {"name": "k5d", "description": "d"}\n'
+
+
+def _broker(backend, *, root="root", limits=None):
+    return CapabilityBroker(
+        agent_runner=lambda agent_id, input: {},
+        limits=limits or VMLimits(max_runtime_s=2.0),
+        kanban_backend=backend,
+        idempotency_root=root,
+    )
+
+
+def _kanban_frame(call_id, **params):
+    params.setdefault("profile", "planner")
+    return {"t": "call", "id": call_id, "method": "kanban_agent", "params": params}
 
 _SCRIPT = META + (
     'r = await kanban_agent("planner", prompt="plan", schema={"plan": "string"})\n'
@@ -54,7 +69,7 @@ def _completed(card_id, result, *, version=1, profile="planner"):
 # ScriptRunStore: durable card state
 # --------------------------------------------------------------------------- #
 
-def test_store_card_state_round_trips_and_is_version_monotonic():
+def test_store_card_state_round_trips_and_waiting_never_clobbers_a_resolution():
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")
         assert store.load_kanban_card_state("kbc_abc") is None
@@ -64,9 +79,25 @@ def test_store_card_state_round_trips_and_is_version_monotonic():
             "kbc_abc", {"status": "completed", "version": 2, "workflow_result": {"plan": "x"}}
         )
         assert store.load_kanban_card_state("kbc_abc")["status"] == "completed"
-        # An older version never overwrites a newer one.
-        store.record_kanban_card_state("kbc_abc", {"status": "waiting", "version": 1})
+        # A 'waiting' marker never regresses a card that already reached an outcome
+        # (status precedence — NOT a numeric version compare).
+        store.record_kanban_card_state("kbc_abc", {"status": "waiting", "version": 9})
         assert store.load_kanban_card_state("kbc_abc")["status"] == "completed"
+
+
+def test_store_resolution_is_last_write_wins_regardless_of_version():
+    # Outcomes from different processes live in incomparable version spaces, so a
+    # later real outcome must win even if its version number is lower — a numeric
+    # monotonic guard would have wrongly dropped it (review finding).
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        store.record_kanban_card_state(
+            "kbc_v", {"status": "completed", "version": 7, "workflow_result": {"plan": "OLD"}}
+        )
+        store.record_kanban_card_state(
+            "kbc_v", {"status": "completed", "version": 1, "workflow_result": {"plan": "NEW"}}
+        )
+        assert store.load_kanban_card_state("kbc_v")["workflow_result"] == {"plan": "NEW"}
 
 
 def test_store_rejects_unsafe_card_id_without_writing():
@@ -188,6 +219,53 @@ def test_wrapper_waiting_only_record_re_awaits_inner():
         # A waiting-only record is not a resolution -> re-await the (live) inner.
         res = dur.await_resolution(card_id, accept_blocked=True, timeout=1.0)
         assert res.result == {"plan": "live"}
+
+
+# --------------------------------------------------------------------------- #
+# Version-space seam: pause + resume must not poison the inner (review findings)
+# --------------------------------------------------------------------------- #
+
+def test_pause_resume_rejected_record_reawaits_inner_in_its_own_version_space():
+    # Regression (review, major): a recorded completed-but-invalid result served on
+    # the first await, then rejected under on_block="pause", must re-await the fresh
+    # inner in the INNER's version space — not carry the recorded foreign version,
+    # which would make the fresh inner's valid completion unreachable and hang to
+    # timeout. The live valid outcome must also supersede the stale durable record.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        card_id = kanban_card_id("root:1")
+        store.record_kanban_card_state(
+            card_id, _resolution_to_state(_completed(card_id, {"bad": "x"}, version=1))
+        )
+        inner = InMemoryKanbanBackend(known_profiles={"planner"})
+        inner.resolve(card_id, CARD_COMPLETED, result={"plan": "GOOD"})  # fresh inner version 1
+        broker = _broker(DurableKanbanBackend(inner, store), root="root")
+        ret = broker.handle(_kanban_frame(1, schema={"plan": "string"}, on_block="pause"))
+        assert ret["ok"] is True, ret
+        assert ret["value"]["status"] == CARD_COMPLETED
+        assert ret["value"]["workflow_result"] == {"plan": "GOOD"}
+        # The live valid outcome superseded the stale recorded one.
+        assert store.load_kanban_card_state(card_id)["workflow_result"] == {"plan": "GOOD"}
+
+
+def test_wrapper_fails_closed_if_inner_ignores_after_version():
+    # The wrapper keeps the #6 hot-spin defense at the wrapper<->inner boundary.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        card_id = kanban_card_id("k:1")
+
+        class _StaleInner(InMemoryKanbanBackend):
+            def await_resolution(self, cid, *, accept_blocked, timeout, after_version=0):
+                return _completed(cid, {"plan": "x"}, version=1)  # always v1, ignores after_version
+
+        dur = DurableKanbanBackend(_StaleInner(known_profiles={"planner"}), store)
+        try:
+            dur.await_resolution(card_id, accept_blocked=True, timeout=1.0, after_version=0)  # primes inner_after=1
+            dur.await_resolution(card_id, accept_blocked=True, timeout=1.0, after_version=2)  # inner_after=1, v1<=1
+        except Exception as exc:  # KanbanError
+            assert "stale event" in str(exc)
+            return
+        raise AssertionError("expected the wrapper to fail closed on a stale inner event")
 
 
 # --------------------------------------------------------------------------- #

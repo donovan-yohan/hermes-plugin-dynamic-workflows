@@ -607,9 +607,15 @@ non-deterministic, so it is excluded from the #3 replay cache. Instead the lates
 state of each card is persisted under the run store at
 `<root>/_kanban/<card_id>.json` (keyed by the content-addressed card id, so it is
 stable across replays) via `ScriptRunStore.record_kanban_card_state` /
-`load_kanban_card_state`, with a monotonic `version` guard so a stale event can
-never regress a card. `DurableKanbanBackend` wraps **any** inner backend with this
-persistence: `create_or_reattach` records a `waiting` marker (and reports
+`load_kanban_card_state`. Writes are atomic (unique temp file + `os.replace`) and
+status-precedence, not numeric: a `waiting` marker never overwrites a card that
+already reached an outcome, but among outcomes the latest real write wins —
+because a card's events can originate in *incomparable* version spaces (a prior
+process's backend vs. a fresh one on resume), so a numeric compare would wrongly
+drop a live superseding outcome. `DurableKanbanBackend` wraps **any** inner
+backend with this persistence and re-stamps every resolution into its own
+monotonic version space (the inner's and the recorded outcome's versions are not
+comparable), feeding the inner from the inner's own counter on a retry: `create_or_reattach` records a `waiting` marker (and reports
 `reattached=True` when a record already exists), and `await_resolution` serves a
 recorded outcome on the first await **without touching the inner backend** — so a
 restarted or replaying parent resumes from the recorded worker result even if the

@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import uuid
 from collections import deque
@@ -77,6 +78,10 @@ SCRIPT_SCHEMA_VERSION = 1
 # A run id must be usable as exactly one filesystem path segment (mirrors the
 # JSON-runtime FileRunStore guard). Minted ids are ``wfs_<hash8>_<uuid12>``.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+# Durable kanban card *outcome* states (issue #5). A "waiting" marker must never
+# overwrite one of these (see ``record_kanban_card_state``).
+_KANBAN_RESOLUTION_STATUSES = frozenset({"completed", "blocked", "failed"})
 
 # Methods whose result is a deterministic constant regardless of any runner:
 # both ``log`` and ``phase`` are pure side-effect metadata and return ``None``.
@@ -529,33 +534,45 @@ class ScriptRunStore:
     # from a recorded terminal resolution instead of re-awaiting — or losing — the
     # worker's result, and gives operators a durable view of in-flight waits.
     def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None:
-        """Persist the latest state of a Kanban card (atomic, version-monotonic).
+        """Persist the latest state of a Kanban card (atomic; status-precedence).
 
-        A write is ignored when ``state['version']`` is older than the persisted
-        version, so an out-of-order or stale event (e.g. a ``waiting`` marker
-        racing a resolution) can never regress a card past a newer one.
+        Last-write-wins among *outcome* states (completed/blocked/failed), which are
+        written in temporal order by a single run. The one guard is a precedence
+        rule: a ``waiting`` marker never overwrites a card that already reached an
+        outcome (so re-opening/reattaching a card cannot regress its recorded
+        result). A numeric version is deliberately *not* used to gate writes — a
+        card's events can originate in different, incomparable version spaces (a
+        prior process's backend vs. a fresh one on resume), so comparing them would
+        wrongly drop a live superseding outcome.
         """
         _require_safe_card_id(card_id)
         if not isinstance(state, dict):
             raise ValueError("kanban card state must be a dict")
         record = {**state, "card_id": card_id}
-        new_version = record.get("version", 0)
-        new_version = new_version if isinstance(new_version, int) and not isinstance(new_version, bool) else 0
-        record["version"] = new_version
         with self._lock:
             existing = self._load_kanban_card_state_unlocked(card_id)
-            if existing is not None:
-                old_version = existing.get("version", 0)
-                if isinstance(old_version, int) and not isinstance(old_version, bool) and new_version < old_version:
-                    return  # monotonic: never overwrite a newer state with an older one.
+            if (
+                existing is not None
+                and record.get("status") == "waiting"
+                and existing.get("status") in _KANBAN_RESOLUTION_STATUSES
+            ):
+                return  # never regress a resolved card back to a 'waiting' marker.
             self._kanban_dir().mkdir(parents=True, exist_ok=True)
             path = self._kanban_path(card_id)
-            tmp = path.with_suffix(".json.tmp")
-            with tmp.open("w", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
+            payload = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
+            # A unique temp name (not a fixed '<card_id>.json.tmp') so two processes
+            # writing the same card never share a temp file and race os.replace.
+            fd, tmp_name = tempfile.mkstemp(dir=str(self._kanban_dir()), prefix=f"{card_id}.", suffix=".tmp")
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             _fsync_dir(self._kanban_dir())
 
     def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]:
