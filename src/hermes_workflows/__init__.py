@@ -61,6 +61,17 @@ from .registry import (
     RunRecord,
     get_default_store,
 )
+from .script_store import (
+    ScriptRunStore,
+    ScriptRunMeta,
+    ReplayCache,
+    ReplayEntry,
+    CallRecorder,
+    SCRIPT_SCHEMA_VERSION,
+    script_run_id,
+    canonical_hash,
+    is_replayable,
+)
 from .errors import (
     WorkflowError,
     WorkflowValidationError,
@@ -70,6 +81,9 @@ from .errors import (
     ScriptValidationError,
     WorkflowSubprocessError,
     CapabilityDenied,
+    ScriptRunStoreError,
+    ScriptRunNotFound,
+    CorruptScriptRunError,
 )
 
 __version__ = "0.1.0"
@@ -112,6 +126,16 @@ __all__ = [
     "KanbanRunStore",
     "RunRecord",
     "get_default_store",
+    # durable script run store + replay cache (issue #3)
+    "ScriptRunStore",
+    "ScriptRunMeta",
+    "ReplayCache",
+    "ReplayEntry",
+    "CallRecorder",
+    "SCRIPT_SCHEMA_VERSION",
+    "script_run_id",
+    "canonical_hash",
+    "is_replayable",
     # errors
     "WorkflowError",
     "WorkflowValidationError",
@@ -121,4 +145,7 @@ __all__ = [
     "ScriptValidationError",
     "WorkflowSubprocessError",
     "CapabilityDenied",
+    "ScriptRunStoreError",
+    "ScriptRunNotFound",
+    "CorruptScriptRunError",
 ]

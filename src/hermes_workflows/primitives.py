@@ -18,6 +18,7 @@ from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
+from .script_store import ScriptRunStore
 from .script_validator import ScriptValidation, validate_script
 from .vm import JournalSink, ScriptRunResult, VMLimits, run_script
 
@@ -292,6 +293,10 @@ def run_workflow_script(
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
+    store: Optional[ScriptRunStore] = None,
+    run_id: Optional[str] = None,
+    replay_from: Optional[str] = None,
+    deterministic_runner: Optional[bool] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -301,6 +306,13 @@ def run_workflow_script(
     :class:`~hermes_workflows.vm.ScriptRunResult`. This is a library/operator
     primitive: it is intentionally **not** registered as a model-facing tool, so
     the declarative ``workflow`` facade and JSON runtime are unchanged.
+
+    When a :class:`~hermes_workflows.script_store.ScriptRunStore` is supplied the
+    run is persisted durably (metadata snapshot + metadata-only journal +
+    deterministic replay cache) under a stable ``run_id``. ``replay_from`` names a
+    prior run whose deterministic calls are served from the cache instead of
+    being re-dispatched. See :func:`hermes_workflows.vm.run_script` for the full
+    durable/replay contract.
     """
     return run_script(
         source,
@@ -309,6 +321,10 @@ def run_workflow_script(
         limits=limits,
         journal=journal,
         validate=validate,
+        store=store,
+        run_id=run_id,
+        replay_from=replay_from,
+        deterministic_runner=deterministic_runner,
     )
 
 

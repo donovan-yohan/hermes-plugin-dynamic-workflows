@@ -25,6 +25,7 @@ MODULES = (
     "test_script_validator",
     "test_rpc",
     "test_vm_subprocess",
+    "test_script_store",
 )
 
 
