@@ -681,8 +681,13 @@ class DurableKanbanBackend:
                     recorded = None
                 if recorded is not None and is_accepted_resolution(recorded, accept_blocked):
                     with self._lock:
-                        self._served.add(card_id)
-                    return self._stamp(card_id, recorded)  # resume from the durable record.
+                        if card_id in self._served:
+                            should_serve = False
+                        else:
+                            self._served.add(card_id)
+                            should_serve = True
+                    if should_serve:
+                        return self._stamp(card_id, recorded)  # resume from the durable record.
         # Go live. Feed the inner from *its own* version space (the highest inner
         # version we have consumed), never the broker's after_version, which may
         # carry a recorded outcome's foreign version after a first-await resume.
@@ -699,7 +704,7 @@ class DurableKanbanBackend:
             # event); fail closed here rather than let a retry hot-spin.
             raise KanbanError("inner backend returned a stale event (after_version ignored)")
         with self._lock:
-            self._inner_after[card_id] = resolution.version
+            self._inner_after[card_id] = max(self._inner_after.get(card_id, 0), resolution.version)
         self._record_card_state(card_id, _resolution_to_state(resolution))
         return self._stamp(card_id, resolution)
 

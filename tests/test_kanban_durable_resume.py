@@ -14,6 +14,8 @@ and an end-to-end resume in which the inner backend has no memory of the card.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -208,6 +210,51 @@ def test_wrapper_resumes_from_record_without_touching_inner():
         assert res.status == CARD_COMPLETED and res.result == {"plan": "x"}
 
 
+def test_wrapper_serves_recorded_resolution_at_most_once_under_concurrency():
+    # Regression (Gemini): two concurrent first awaits can both observe _served as
+    # false before either records it. Only one may consume the durable record; the
+    # loser must fall through to a live await.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        card_id = kanban_card_id("k:1")
+        store.record_kanban_card_state(
+            card_id, _resolution_to_state(_completed(card_id, {"plan": "recorded"}))
+        )
+
+        barrier = threading.Barrier(2)
+        target_card_id = card_id
+
+        class _RacingStore(ScriptRunStore):
+            def load_kanban_card_state(self, card_id: str):
+                if card_id == target_card_id:
+                    barrier.wait(timeout=2.0)
+                return super().load_kanban_card_state(card_id)
+
+        racing_store = _RacingStore(Path(tmp) / "runs")
+        inner = InMemoryKanbanBackend(known_profiles={"planner"})
+        inner.resolve(card_id, CARD_COMPLETED, result={"plan": "live"})
+        dur = DurableKanbanBackend(inner, racing_store)
+
+        results: list[dict[str, str]] = []
+        errors: list[BaseException] = []
+
+        def await_card():
+            try:
+                results.append(dur.await_resolution(card_id, accept_blocked=True, timeout=1.0).result)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=await_card) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert sorted(result["plan"] for result in results) == ["live", "recorded"]
+
+
 def test_wrapper_retry_after_version_goes_live_not_to_record():
     # A retry (after_version > 0) means the broker already rejected an outcome this
     # run, so it must go to the inner backend, not re-serve the stale record — even
@@ -273,8 +320,15 @@ def test_wrapper_fails_closed_if_inner_ignores_after_version():
         card_id = kanban_card_id("k:1")
 
         class _StaleInner(InMemoryKanbanBackend):
-            def await_resolution(self, cid, *, accept_blocked, timeout, after_version=0):
-                return _completed(cid, {"plan": "x"}, version=1)  # always v1, ignores after_version
+            def await_resolution(
+                self,
+                card_id: str,
+                *,
+                accept_blocked: bool,
+                timeout: float | None,
+                after_version: int = 0,
+            ):
+                return _completed(card_id, {"plan": "x"}, version=1)  # always v1, ignores after_version
 
         dur = DurableKanbanBackend(_StaleInner(known_profiles={"planner"}), store)
         try:
@@ -284,6 +338,75 @@ def test_wrapper_fails_closed_if_inner_ignores_after_version():
             assert "stale event" in str(exc)
             return
         raise AssertionError("expected the wrapper to fail closed on a stale inner event")
+
+
+def test_wrapper_inner_after_never_regresses_under_out_of_order_live_awaits():
+    # Regression (Gemini): concurrent live awaits can finish out of order. A stale
+    # lower inner version must not overwrite the newer consumed version.
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        card_id = kanban_card_id("k:1")
+        first_may_return = threading.Event()
+        second_started = threading.Event()
+
+        class _OutOfOrderInner(InMemoryKanbanBackend):
+            def __init__(self):
+                super().__init__(known_profiles={"planner"})
+                self._calls = 0
+                self._calls_lock = threading.Lock()
+
+            def await_resolution(
+                self,
+                card_id: str,
+                *,
+                accept_blocked: bool,
+                timeout: float | None,
+                after_version: int = 0,
+            ):
+                with self._calls_lock:
+                    self._calls += 1
+                    call = self._calls
+                if call == 1:
+                    assert second_started.wait(timeout=2.0)
+                    assert first_may_return.wait(timeout=2.0)
+                    return _completed(card_id, {"plan": "old"}, version=1)
+                second_started.set()
+                return _completed(card_id, {"plan": "new"}, version=2)
+
+        dur = DurableKanbanBackend(_OutOfOrderInner(), store)
+        results: list[dict[str, str]] = []
+        errors: list[BaseException] = []
+
+        def await_live():
+            try:
+                results.append(
+                    dur.await_resolution(card_id, accept_blocked=True, timeout=1.0, after_version=1).result
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=await_live) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with dur._lock:  # private state asserted by this focused regression test.
+                if dur._inner_after.get(card_id) == 2:
+                    break
+            time.sleep(0.001)
+        else:  # pragma: no cover
+            raise AssertionError("newer live await did not record version 2")
+
+        first_may_return.set()
+        for thread in threads:
+            thread.join(timeout=3.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert sorted(result["plan"] for result in results) == ["new", "old"]
+        with dur._lock:
+            assert dur._inner_after[card_id] == 2
 
 
 # --------------------------------------------------------------------------- #

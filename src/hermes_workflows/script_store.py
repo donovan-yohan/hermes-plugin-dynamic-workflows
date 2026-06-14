@@ -595,14 +595,13 @@ class ScriptRunStore:
         if not kdir.exists():
             return []
         waits: list[dict[str, Any]] = []
-        with self._lock:
-            for path in sorted(kdir.glob("*.json")):
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(data, dict) and data.get("status") not in ("completed", "failed"):
-                    waits.append(data)
+        for path in sorted(kdir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and data.get("status") not in ("completed", "failed"):
+                waits.append(data)
         return waits
 
     def _load_kanban_card_state_unlocked(self, card_id: str) -> Optional[dict[str, Any]]:
