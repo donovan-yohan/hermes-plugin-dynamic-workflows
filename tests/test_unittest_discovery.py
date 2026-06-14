@@ -30,6 +30,7 @@ MODULES = (
     "test_kanban_result_contract",
     "test_kanban_durable_resume",
     "test_kanban_event_log",
+    "test_kanban_notify",
 )
 
 
