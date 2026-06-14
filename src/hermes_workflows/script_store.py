@@ -546,7 +546,7 @@ class ScriptRunStore:
                 continue
             try:
                 meta = self.load_run(child.name)
-            except ScriptRunStoreError:
+            except (ScriptRunStoreError, ValueError):
                 continue
             if meta.status == "suspended":
                 out.append(meta)
