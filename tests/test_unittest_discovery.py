@@ -22,6 +22,9 @@ MODULES = (
     "test_control_flow",
     "test_catalog",
     "test_relay_github_contract",
+    "test_script_validator",
+    "test_rpc",
+    "test_vm_subprocess",
 )
 
 

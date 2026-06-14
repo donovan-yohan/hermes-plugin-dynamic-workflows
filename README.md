@@ -37,6 +37,7 @@ The current runtime supports:
 - in-memory run storage for library use
 - parent-owned filesystem run storage for plugin use: `snapshot.json` + compact `journal.jsonl`
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
+- a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`; not model-facing)
 
 ## Quick start as a Python package
 
@@ -194,6 +195,50 @@ This is the first replacement seam for timer watchdog orchestration: workflows a
 result instead of polling status just to decide the next step. The current stub runner returns a
 deterministic `kb_<hash>` task id for tests.
 
+## Script-led subprocess VM (issue #2)
+
+Alongside the declarative JSON runtime, the plugin can run a **Python workflow
+script** — a deterministic orchestration brain in the Claude Dynamic Workflows
+shape — in a sandboxed subprocess. The script is real code, so it never executes
+inside the parent process: the parent statically validates it as a launch gate,
+runs it under `python -m hermes_workflows.vm_guest` with a scrubbed environment
+(no Hermes/GitHub credentials), and brokers every capability the script reaches
+for over a narrow stdio RPC channel.
+
+```python
+from hermes_workflows import run_workflow_script
+
+script = '''
+meta = {"name": "demo", "description": "greet then shout"}
+log("starting")
+g = await agent("hermes.greeter", {"subject": args["who"]}, schema={"greeting": "string"})
+s = await agent("hermes.uppercaser", {"text": g["greeting"]})
+phase("done")
+return {"shout": s["result"]}
+'''
+
+result = run_workflow_script(script, args={"who": "world"})
+print(result.ok, result.value)          # True {'shout': 'HELLO, WORLD'}
+print([(c["method"], c["call_id"]) for c in result.calls])
+# [('log', 1), ('agent', 2), ('agent', 3), ('phase', 4)]
+```
+
+Scripts may use deterministic control flow (`if`/`for`/`while`/`try`,
+functions, comprehensions, `async`/`await`) and the RPC-backed globals `agent`,
+`kanban_agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`, plus `args`
+and `budget` and the pre-bound deterministic `json` / `math`. They may **not**
+`import`, touch the filesystem/network/process/env/clock/randomness, traverse
+dunder attributes, or call `eval`/`exec`/`open` — all rejected by
+`workflow_validate_script` before launch (and again, defensively, inside the
+guest). The parent broker enforces a method allow-list, the known-agent
+registry, output schemas, and `VMLimits` (`max_rpc_calls`, `max_agent_calls`,
+`max_kanban_calls`, `max_runtime_s`, `token_budget`). A subprocess crash or
+timeout marks the run failed without corrupting parent state. See
+[DESIGN.md §5](DESIGN.md) for the security model.
+
+This surface is intentionally a library/operator primitive: the single
+model-facing `workflow` tool and the JSON runtime are unchanged.
+
 ## Saved workflow catalog
 
 Templates are JSON workflow files named `<template>.workflow.json`. The default catalog searches the
@@ -313,11 +358,12 @@ The repo intentionally avoids runtime dependencies. `pytest` is only a dev conve
 
 ## Current limitations
 
-- The runtime is synchronous and deterministic; `parallel` is modeled, not truly concurrent.
-- The sandbox is a declarative policy checker, not a JS VM.
+- The runtime is synchronous and deterministic; `parallel` is modeled, not truly concurrent (true in both the JSON runtime and the subprocess VM's guest combinators).
+- The JSON runtime's sandbox is a declarative policy checker, not a code VM. The subprocess VM (issue #2) does run code, but only out-of-process behind a static gate + restricted builtins + parent RPC broker.
 - The default `StubAgentRunner` only simulates known demo agents.
-- No durable resume/replay yet; the `RunStore` shape is designed to grow into it.
+- No durable resume/replay yet; the `RunStore` shape and the VM's stable RPC call ids are designed to grow into it (issue #3).
 - The Kanban backend is documented/stubbed, not implemented.
+- The subprocess VM is the smallest coherent issue #2 slice: durable script journals/replay (#3), the full script API with loop guards (#4), and launch-approval/session-policy governance (#11) are deferred.
 
 ## License
 

@@ -21,7 +21,14 @@ See :mod:`hermes_workflows.sandbox` and ``DESIGN.md`` for the security model.
 
 from __future__ import annotations
 
-from .primitives import workflow, workflow_validate, workflow_run, workflow_status
+from .primitives import (
+    workflow,
+    workflow_validate,
+    workflow_run,
+    workflow_status,
+    workflow_validate_script,
+    run_workflow_script,
+)
 from .models import (
     Diagnostic,
     ValidationResult,
@@ -29,6 +36,14 @@ from .models import (
     RunStatus,
     StepStatus,
     Progress,
+)
+from .script_validator import ScriptValidation, validate_script
+from .vm import (
+    CapabilityBroker,
+    ScriptRunResult,
+    VMLimits,
+    WorkflowVM,
+    run_script,
 )
 from .agents import (
     AgentRunner,
@@ -51,6 +66,10 @@ from .errors import (
     WorkflowValidationError,
     RunNotFound,
     SandboxPolicyError,
+    WorkflowScriptError,
+    ScriptValidationError,
+    WorkflowSubprocessError,
+    CapabilityDenied,
 )
 
 __version__ = "0.1.0"
@@ -62,6 +81,16 @@ __all__ = [
     "workflow_validate",
     "workflow_run",
     "workflow_status",
+    "workflow_validate_script",
+    "run_workflow_script",
+    # subprocess workflow VM (issue #2)
+    "validate_script",
+    "ScriptValidation",
+    "WorkflowVM",
+    "CapabilityBroker",
+    "VMLimits",
+    "ScriptRunResult",
+    "run_script",
     # models
     "Diagnostic",
     "ValidationResult",
@@ -88,4 +117,8 @@ __all__ = [
     "WorkflowValidationError",
     "RunNotFound",
     "SandboxPolicyError",
+    "WorkflowScriptError",
+    "ScriptValidationError",
+    "WorkflowSubprocessError",
+    "CapabilityDenied",
 ]

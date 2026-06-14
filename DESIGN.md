@@ -413,7 +413,124 @@ injects it via `registry=`.
 
 ---
 
-## 5. Roadmap
+## 5. Subprocess workflow VM and RPC capability broker (issue #2)
+
+The declarative JSON runtime (§1.5) interprets a static AST. A second,
+additive execution mode lets the model author a **Python workflow script** — a
+deterministic orchestration brain in the Claude Dynamic Workflows shape
+(`agent()` / `kanban_agent()` / `parallel()` / `pipeline()` / `phase()` /
+`log()` / `workflow()`, plus `args` / `budget`). Because a script is real code,
+it is **never executed inside the parent Hermes process**. It runs in a
+sandboxed subprocess; the parent owns every capability.
+
+This mode is exposed only as the library/operator primitives
+`workflow_validate_script` and `run_workflow_script`. The single model-facing
+`workflow` tool and the JSON runtime are unchanged.
+
+### 5.1 Three enforcement layers
+
+```
+   model-authored script
+            │
+            ▼
+   ┌──────────────────────┐   layer 1: static launch gate (parent process)
+   │  script_validator.py │   literal meta-first, bounded AST, no imports,
+   │  validate_script()   │   no fs/process/net/env/clock/randomness names,
+   └──────────┬───────────┘   no dunder traversal, no eval/exec/class/global
+              │ ok
+              ▼
+   ┌──────────────────────┐   layer 2: scrubbed subprocess (vm.py / vm_guest.py)
+   │  WorkflowVM._drive    │   python -B -s -m hermes_workflows.vm_guest with a
+   │  scrubbed env + stdio │   from-scratch env (no Hermes/GitHub creds), narrow
+   └──────────┬───────────┘   newline-framed JSON RPC over the child's stdio;
+              │ boot           guest re-validates, then exec under restricted
+              ▼                __builtins__ (allow-list only) and RPC-backed globals
+   ┌──────────────────────┐   layer 3: capability broker (parent process)
+   │  CapabilityBroker     │   method allow-list, known-agent registry, output
+   │  .handle(call)        │   schema, budget + max_rpc/agent/kanban limits;
+   └──────────────────────┘   every request journaled with a stable call id
+```
+
+The layers are defence-in-depth and mutually distrustful. Even if the static
+gate missed a construct, the guest restricts `__builtins__` to a safe allow-list
+(no `open`/`eval`/`exec`/`__import__`), provides no module to the script except
+deterministic `json`/`math`, and the parent broker treats the subprocess as
+adversarial: it validates **every** RPC frame regardless of what the child sent.
+
+### 5.2 The narrow RPC surface
+
+Each frame is one line of UTF-8 JSON. Parent → child: `boot` (script, args,
+limits, budget) and `ret` (response, with a piggybacked budget view). Child →
+parent: `ready` (parsed meta), `call` (capability request with a stable
+per-run id), and `done` (the script's return value or its structured error).
+The protocol is strictly request/response, so a single stdio pipe pair carries
+it without ambiguity. The guest reclaims the real stdout fd for the channel and
+redirects `sys.stdout` to stderr, so a stray `print`/traceback can never corrupt
+the stream the parent reads.
+
+The only capabilities that cross to the parent are `agent`, `kanban_agent`,
+`log`, `phase`, and `workflow`; `parallel`/`pipeline` are deterministic
+guest-side combinators (sequential in this slice). All `agent`/`kanban_agent`
+effects funnel through the same injected `AgentRunner` boundary as the JSON
+runtime (default `StubAgentRunner`), so script runs are reproducible and
+testable without a live Hermes.
+
+### 5.3 Failure containment and governance seam
+
+A subprocess crash, a CPU-spin timeout (`VMLimits.max_runtime_s`), a protocol
+breach, or an exit-without-result is mapped to a failed `ScriptRunResult` —
+never an uncaught exception — so parent state is never corrupted. `VMLimits`
+(`max_rpc_calls` hard-abort backstop, soft per-`agent`/`kanban` caps,
+`token_budget`, `allow_nested_workflows`) is the first slice of the issue #11
+governance surface; launch-approval/session routing remain parent-owned future
+work. Journal events are metadata-only by default (method, call id, agent
+id/profile, ok) — raw inputs/outputs and prompts are redacted.
+
+### 5.4 What is intentionally deferred
+
+This is the **smallest coherent #2 slice**: it proves the subprocess VM, the
+parent-owned RPC broker, the static launch gate, and capability enforcement with
+tests. Deliberately out of scope here (tracked by #3/#4/#11): durable
+journal/snapshot persistence and the deterministic replay cache (#3), the full
+script-API surface with loop guards and richer helpers (#4), true concurrent
+fan-out, and launch-approval/session-policy governance (#11).
+
+### 5.5 Adversarial review and residual limitations
+
+The validator/guest/broker boundary was red-teamed with an independent
+multi-agent review whose findings were each reproduced against the real VM.
+Confirmed-and-fixed escapes (now regression-tested):
+
+- **Live-module pivot** — the real `json` module exposes `codecs` (`json.codecs.open`,
+  `codecs.builtins.eval`), a full FS + arbitrary-code escape reachable via
+  non-dunder attributes. Closed by injecting curated `json`/`math` proxies
+  instead of live module objects (§5.1).
+- **Frame/coroutine internals** — `coroutine.cr_frame.f_globals` → `sys.modules`
+  → `os`. Closed by rejecting `gi_`/`cr_`/`ag_`/`f_`/`tb_`/`co_` attribute
+  prefixes in the validator.
+- **`str.format` template traversal** — `"{0.__class__.__base__}".format(x)`
+  reaches dunders at runtime, invisible to the AST gate. `.format`/`.format_map`
+  are rejected; f-strings (real AST) remain the safe formatting path.
+- **Unenforced `token_budget`** — now a hard ceiling that aborts the run.
+- **Runner `BaseException`** — a misbehaving `AgentRunner` raising `SystemExit`
+  could escape the broker and crash the parent; it is now contained as a
+  structured `runner_error`.
+
+Known, accepted limitations (not security escapes):
+
+- **Soft per-agent/kanban caps.** `max_agent_calls` / `max_kanban_calls` are
+  *catchable* denials so a script can adapt; total work is still bounded by the
+  `max_rpc_calls` hard cap and `max_runtime_s`.
+- **Object-repr determinism.** A script that deliberately serializes a *live
+  object* (e.g. `repr(some_function)`, or an exception message built by CPython
+  that embeds one) gets a heap address, which varies per process. Pure-data
+  returns are deterministic; the parent's own serialization fallback never emits
+  an address. Fully sanitizing every script-chosen string is out of scope.
+- **No memory/FD quota yet.** A script can exhaust memory; the OS/`max_runtime_s`
+  is the current backstop. A `resource.setrlimit` guard in the guest is future
+  hardening.
+
+## 6. Roadmap
 
 Near-term and future work, roughly in priority order:
 
@@ -439,10 +556,13 @@ Near-term and future work, roughly in priority order:
    steps, map-over-collection fan-out, and additional `$ref` forms — each gated
    behind new `workflow_validate` checks and stable diagnostic codes.
 
-6. **Real sandboxed code execution (separate milestone).** Design and ship an
-   embedded, resource-quota'd, escape-hardened execution sandbox if and only if a
-   scripting surface is required. This is explicitly **out of scope** for the
-   skeleton (see §3.1) and will carry its own threat model and dependency review.
+6. **Real sandboxed code execution.** The subprocess workflow VM (§5) ships the
+   first slice of this: model-authored Python scripts run out-of-process under a
+   scrubbed environment, a static launch gate, restricted builtins, and a
+   parent-owned RPC capability broker — without a JS engine or any runtime
+   dependency. Remaining work: durable journal/replay for scripts (#3), the full
+   script API with loop guards (#4), and resource quotas beyond the wall-clock
+   timeout and call-count caps.
 
 7. **Capability grants beyond default-deny.** Allow `policy` to *request* network
    or filesystem capabilities, mediated by an out-of-band grant mechanism, so the
