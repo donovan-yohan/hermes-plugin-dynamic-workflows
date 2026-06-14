@@ -86,6 +86,24 @@ def test_fifo_notifier_wakes_across_independent_instances():
             sub.close()
 
 
+def test_fifo_subscription_does_not_spin_after_a_notify_and_leave():
+    # Regression (review): the held write end keeps the read end from EOFing, which
+    # select reports as readable forever. After a producer notify-and-leave, the
+    # next wait must BLOCK (time out), not return True instantly in a busy-spin.
+    with TemporaryDirectory() as tmp:
+        producer = FifoEventNotifier(Path(tmp) / "_kanban")
+        consumer = FifoEventNotifier(Path(tmp) / "_kanban")
+        sub = consumer.subscribe("kbc_x")
+        try:
+            producer.notify("kbc_x")  # producer writes a byte and leaves (no lingering writer).
+            assert sub.wait(1.0) is True  # observe the notify.
+            start = time.monotonic()
+            assert sub.wait(0.2) is False  # no new event: blocks to timeout, not instant-True.
+            assert time.monotonic() - start >= 0.15
+        finally:
+            sub.close()
+
+
 def test_fifo_notify_with_no_subscriber_is_harmless():
     with TemporaryDirectory() as tmp:
         n = FifoEventNotifier(Path(tmp) / "_kanban")
@@ -147,6 +165,21 @@ def test_backend_resolves_a_preexisting_log_event_without_waiting():
         publish_kanban_event(store, notifier, card.card_id, status="completed", result={"plan": "done"})
         res = backend.await_resolution(card.card_id, accept_blocked=True, timeout=0.5)
         assert res.status == "completed" and res.result == {"plan": "done"}
+
+
+def test_backend_resolution_clears_the_in_flight_wait_view():
+    # Regression (review): a resolved card must be mirrored to the latest-state
+    # index so kanban_waits() stops reporting it as in-flight (the create_or_reattach
+    # 'waiting' marker would otherwise leak forever).
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        notifier = ThreadEventNotifier()
+        backend = EventLogKanbanBackend(store, notifier, known_profiles={"planner"})
+        card = backend.create_or_reattach("k:1", KanbanCardSpec(profile="planner"))
+        assert [w["card_id"] for w in store.kanban_waits()] == [card.card_id]  # in-flight.
+        publish_kanban_event(store, notifier, card.card_id, status="completed", result={"plan": "x"})
+        backend.await_resolution(card.card_id, accept_blocked=True, timeout=0.5)
+        assert store.kanban_waits() == []  # no longer reported as waiting.
 
 
 def test_backend_is_woken_by_a_concurrent_producer():

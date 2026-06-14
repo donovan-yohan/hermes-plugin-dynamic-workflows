@@ -45,6 +45,7 @@ from .kanban import (
     KanbanCardSpec,
     KanbanTimeout,
     KanbanUnknownProfile,
+    _resolution_to_state,
     _state_to_resolution,
     is_accepted_resolution,
     kanban_card_id,
@@ -236,9 +237,15 @@ class FifoEventNotifier:
         self._ensure(path)
         rfd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         try:
-            wfd: Optional[int] = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            # Hold a write end so the read end never EOFs (a reader-only FIFO with
+            # no writer is reported readable by select, busy-spinning wait()). This
+            # is load-bearing, so fail the subscribe rather than degrade to a
+            # spin-prone subscription if it cannot be opened (only under fd
+            # exhaustion, since rfd is already open on the same FIFO).
+            wfd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
         except OSError:
-            wfd = None
+            os.close(rfd)
+            raise
         return _FifoSubscription(rfd, wfd)
 
 
@@ -349,6 +356,13 @@ class EventLogKanbanBackend:
             while True:
                 resolution = self._latest_accepted(card_id, after_version, accept_blocked)
                 if resolution is not None:
+                    # Mirror the outcome to the latest-state index so kanban_waits()
+                    # stops reporting this card as in-flight (matches the durable
+                    # path; best-effort — the log remains the source of truth).
+                    try:
+                        self._store.record_kanban_card_state(card_id, _resolution_to_state(resolution))
+                    except OSError:
+                        pass
                     return resolution
                 if deadline is None:
                     # No deadline given: block in bounded backstops (re-reading the
