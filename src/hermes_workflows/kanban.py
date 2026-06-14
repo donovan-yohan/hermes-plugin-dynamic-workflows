@@ -28,11 +28,15 @@ failed is surfaced as a structured ``status="failed"`` result):
   structured ``status="blocked"`` result so the script can branch on it.
 * ``"raise"`` — raise into the script (a catchable ``CapabilityError``).
 * ``"pause"`` — do **not** resolve on a blocked event; keep awaiting until the
-  card reaches a terminal completed/failed state (e.g. a human unblocks it). This
-  is an *in-process* await bounded by the run's wall-clock limit; cross-process
-  durable suspend/resume (persisting the suspended run and resuming it in a later
-  process from a replayed event) is **not** implemented in this slice — see
-  "Production integration" below.
+  card reaches a terminal completed/failed state (e.g. a human unblocks it). By
+  default this is an *in-process* await bounded by the run's wall-clock limit. With
+  ``VMLimits.kanban_suspend_after_s`` set, an unresolved paused await instead
+  **suspends the run durably** once that window elapses: the parent stops holding
+  the thread, the run is recorded with status ``suspended`` (the awaited card's
+  ``waiting``/``blocked`` marker persists), and a fresh process resumes it via
+  ``run_workflow_script(..., replay_from=<run_id>)`` once the card produces a
+  terminal event in the durable event log. See "Production integration" below and
+  DESIGN §5.9.
 
 ------------------------------------------------------------------------------
 Production integration (what :class:`InMemoryKanbanBackend` deliberately fakes)
@@ -50,8 +54,12 @@ must replace, specifically:
   in-memory fake cannot. The dispatcher boundary ("do not run a duplicate
   dispatcher") is the production backend's responsibility: the workflow only
   creates/waits; gateway dispatch claims and executes the work.
-* ``on_block="pause"`` — for a true durable pause, persist the suspended run and
-  resume it from a later event in a fresh process rather than holding a thread.
+* ``on_block="pause"`` — the durable-pause *seam* now exists (see the ``"pause"``
+  note above): with ``VMLimits.kanban_suspend_after_s`` the parent suspends an
+  unresolved paused run rather than holding a thread, and resumes it in a fresh
+  process from a replayed event. What a real backend still owns is **producing**
+  that event durably from the gateway/worker side (this slice's resume reads the
+  durable event log; an in-memory backend cannot survive the parent's restart).
 
 This module is pure Python 3.11 stdlib.
 """

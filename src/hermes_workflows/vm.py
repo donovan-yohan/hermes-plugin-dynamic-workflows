@@ -113,6 +113,15 @@ class VMLimits:
     max_runtime_s: float = 30.0
     allow_nested_workflows: bool = False
     token_budget: Optional[int] = None
+    # Durable suspend window for an unresolved ``on_block="pause"`` Kanban await
+    # (issue #5). ``None`` (default) keeps the prior behaviour: a paused await
+    # blocks in-process until the run deadline, then fails with ``kanban_timeout``.
+    # When set, a paused await that has not resolved within this many seconds
+    # **suspends the run durably** (status ``suspended``) instead of holding the
+    # thread to the deadline, so a fresh process resumes it from a replayed event
+    # via ``replay_from`` rather than the parent blocking. Capped at
+    # ``max_runtime_s`` (a value >= it never suspends; the run deadline wins).
+    kanban_suspend_after_s: Optional[float] = None
 
 
 @dataclass
@@ -126,6 +135,12 @@ class ScriptRunResult:
     calls: list[dict[str, Any]] = field(default_factory=list)
     exit_code: Optional[int] = None
     stderr: str = ""
+    # True when the run did not finish but was durably *suspended* on an
+    # unresolved ``on_block="pause"`` Kanban await (issue #5) — distinct from a
+    # genuine failure. ``error`` then carries metadata-safe suspend details
+    # (``type="KanbanSuspended"``, ``card_id``, ``profile``, ``on_block``); the run
+    # is resumable in a fresh process via ``replay_from`` once the card resolves.
+    suspended: bool = False
     # Durable-store fields (issue #3); populated only when a ScriptRunStore is
     # supplied to run_script. Left None/0 for in-memory runs so existing callers
     # are unaffected.
@@ -142,6 +157,7 @@ class ScriptRunResult:
             "calls": self.calls,
             "exit_code": self.exit_code,
             "stderr": self.stderr,
+            "suspended": self.suspended,
             "run_id": self.run_id,
             "journal_path": self.journal_path,
             "replayed_calls": self.replayed_calls,
@@ -204,6 +220,12 @@ class CapabilityBroker:
         self._replayed_calls = 0
         self.should_abort = False
         self.abort_reason: Optional[str] = None
+        # Durable suspend signal (issue #5): set when an unresolved paused Kanban
+        # await exhausts its suspend window. The VM tears down the subprocess (as
+        # for ``should_abort``) but reports a *suspended*, resumable run rather than
+        # a failure; ``suspend_info`` carries the metadata-safe card details.
+        self.should_suspend = False
+        self.suspend_info: Optional[dict[str, Any]] = None
 
     @property
     def replayed_calls(self) -> int:
@@ -424,6 +446,36 @@ class CapabilityBroker:
         remaining = self._deadline - time.monotonic()
         return remaining if remaining > 0.0 else 0.0
 
+    def _pause_suspend_deadline(self, on_block: str) -> Optional[float]:
+        """Monotonic deadline after which an unresolved paused await suspends.
+
+        Applies only under ``on_block="pause"`` with a configured
+        ``kanban_suspend_after_s``; capped at the shared run deadline so a suspend
+        window ``>= max_runtime_s`` never preempts the genuine ``kanban_timeout``
+        (the run deadline wins). ``None`` disables suspension, preserving the prior
+        block-until-the-run-deadline behaviour for every other policy/config.
+        """
+        after = self._limits.kanban_suspend_after_s
+        if on_block != "pause" or after is None:
+            return None
+        return min(self._deadline, time.monotonic() + max(0.0, after))
+
+    def _begin_suspend(self, call_id: Any, card_id: str, profile: str, on_block: str) -> None:
+        """Flag the run for durable suspension on an unresolved paused await.
+
+        The VM observes :attr:`should_suspend` after the (denial) ret frame and
+        tears the subprocess down, reporting a resumable *suspended* run instead of
+        a failure. The metadata-only journal ``call`` event is emitted by the
+        :class:`CapabilityDenied` path in :meth:`handle` (error ``kanban_suspended``).
+        """
+        self.should_suspend = True
+        self.suspend_info = {
+            "card_id": card_id,
+            "profile": profile,
+            "call_id": call_id,
+            "on_block": on_block,
+        }
+
     def _kanban_idempotency_key(self, call_id: Any) -> str:
         """Stable key for one logical ``kanban_agent`` call.
 
@@ -495,19 +547,41 @@ class CapabilityBroker:
         recorded in the run journal and (best-effort) as a Kanban card comment.
         """
         accept_blocked = on_block != "pause"
+        suspend_deadline = self._pause_suspend_deadline(on_block)
         after_version = 0
         has_received = False
         last_recorded: Optional[tuple[str, ...]] = None
         records = 0
         while True:
+            timeout = self._kanban_await_timeout()
+            if suspend_deadline is not None:
+                # Bound this await by the *nearer* of the run deadline and the
+                # suspend window, so an unresolved paused card hands control back
+                # promptly enough to suspend instead of holding the thread.
+                timeout = min(timeout, max(0.0, suspend_deadline - time.monotonic()))
             try:
                 resolution = self._kanban_backend.await_resolution(
                     card_id,
                     accept_blocked=accept_blocked,
-                    timeout=self._kanban_await_timeout(),
+                    timeout=timeout,
                     after_version=after_version,
                 )
             except KanbanTimeout as exc:
+                # Distinguish the suspend window elapsing from the genuine run
+                # deadline. Decide on the two pre-computed deadlines, NOT a fresh
+                # clock read: ``suspend_deadline`` is clamped to ``self._deadline``,
+                # so it is strictly less only when the suspend window is the binding
+                # (nearer) bound — i.e. this timeout was the suspend window. A
+                # config of ``kanban_suspend_after_s >= max_runtime_s`` clamps the
+                # two equal, so the run deadline wins and it falls through to a
+                # genuine ``kanban_timeout``. Re-sampling the clock here would let a
+                # GC/GIL pause misclassify a legitimate suspend near the boundary.
+                if suspend_deadline is not None and suspend_deadline < self._deadline:
+                    self._begin_suspend(call_id, card_id, profile, on_block)
+                    raise CapabilityDenied(
+                        f"kanban await suspended on card {card_id!r}; resume the run to continue",
+                        code="kanban_suspended",
+                    ) from exc
                 raise CapabilityDenied(str(exc), code="kanban_timeout") from exc
             except KanbanError as exc:  # any other backend failure -> structured denial.
                 raise CapabilityDenied(str(exc), code="kanban_error") from exc
@@ -746,6 +820,7 @@ class WorkflowVM:
         meta: Optional[dict[str, Any]] = None
         done: Optional[dict[str, Any]] = None
         protocol_error: Optional[str] = None
+        suspended: Optional[dict[str, Any]] = None
 
         try:
             assert proc.stdin is not None and proc.stdout is not None
@@ -790,6 +865,14 @@ class WorkflowVM:
                         _kill(proc)
                         protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
                         break
+                    if broker.should_suspend:
+                        # An unresolved paused Kanban await suspended the run: tear
+                        # the subprocess down (the script's local state is discarded;
+                        # a resume re-runs it from the replay cache) and report a
+                        # resumable suspended run rather than a failure.
+                        _kill(proc)
+                        suspended = broker.suspend_info or {}
+                        break
                 elif kind == rpc.T_DONE:
                     done = frame
                     break
@@ -802,6 +885,12 @@ class WorkflowVM:
             except subprocess.TimeoutExpired:
                 _kill(proc)
             stderr_thread.join(timeout=5)
+            # Close the read pipes too: on a kill path (timeout / abort / suspend)
+            # the read loop breaks before stdout EOFs, so without this the pipe fds
+            # leak until GC (a ResourceWarning). stderr is closed after the drain
+            # thread has joined, so the close never races the reader.
+            _close(proc.stdout)
+            _close(proc.stderr)
 
         stderr_text = "".join(stderr_chunks)[-4000:]
         exit_code = proc.returncode
@@ -811,6 +900,15 @@ class WorkflowVM:
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
                 error={"type": "WorkflowSubprocessError",
                        "message": f"workflow timed out after {self._limits.max_runtime_s}s"},
+            )
+        if suspended is not None:
+            # Durable, resumable suspension (issue #5) — not a failure. The error
+            # payload is metadata-safe (card id is a content-address, profile is a
+            # role name) so it can live on the operator-facing run.json.
+            return ScriptRunResult(
+                ok=False, suspended=True, meta=meta, calls=calls,
+                exit_code=exit_code, stderr=stderr_text,
+                error={"type": "KanbanSuspended", **suspended},
             )
         if protocol_error is not None:
             return ScriptRunResult(
@@ -893,6 +991,7 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "max_runtime_s": limits.max_runtime_s,
         "allow_nested_workflows": limits.allow_nested_workflows,
         "token_budget": limits.token_budget,
+        "kanban_suspend_after_s": limits.kanban_suspend_after_s,
     }
 
 
@@ -959,6 +1058,27 @@ def _req_bool(view: dict[str, Any], key: str, default: bool) -> bool:
     return value
 
 
+def _req_opt_float(view: dict[str, Any], key: str, default: Optional[float]) -> Optional[float]:
+    """An optional finite cap float from the view; a missing key defaults, null means None.
+
+    Mirrors :func:`_req_float` but ``None`` is a meaningful value (no suspend
+    window), so it is distinguished from an absent key. A present non-number or a
+    non-finite value is corruption and raises, so a forged suspend window cannot
+    silently disable or distort the resume behaviour on a replay.
+    """
+    value = view.get(key, _MISSING)
+    if value is _MISSING:
+        return default
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _CorruptLimitsView(f"{key}={value!r} is not a number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise _CorruptLimitsView(f"{key}={value!r} is not finite")
+    return result
+
+
 def _req_token_budget(view: dict[str, Any], default: Optional[int]) -> Optional[int]:
     """Token budget from the view; a missing key defaults, null means no budget.
 
@@ -1000,6 +1120,9 @@ def _limits_from_view(view: Any) -> VMLimits:
             view, "allow_nested_workflows", default.allow_nested_workflows
         ),
         token_budget=_req_token_budget(view, default.token_budget),
+        kanban_suspend_after_s=_req_opt_float(
+            view, "kanban_suspend_after_s", default.kanban_suspend_after_s
+        ),
     )
 
 
@@ -1066,11 +1189,14 @@ def run_script(
                 f"replay_from {replay_from!r} does not match this script/args "
                 "(script_sha256 or args_hash differs); a replay must reproduce the recorded run"
             )
-        replay_cache = store.load_cache(replay_from)
         source_limits = source.limits
-        # Kanban idempotency must key on the *original* logical run, not the
-        # immediate source: replaying a replay (A <- B <- C) would otherwise open a
-        # fresh card at each generation. Walk replay_of to the first non-replay
+        # Resolve the *logical root* of the replay chain. Both the Kanban
+        # idempotency key and the deterministic replay cache must key on the
+        # original run, not the immediate source: replaying a replay (A <- B <- C)
+        # would otherwise open a fresh card at each generation, and — because a
+        # replay writes no cache.jsonl of its own — would load an *empty* cache
+        # from the immediate suspended source and needlessly re-dispatch every
+        # pre-pause deterministic call. Walk replay_of to the first non-replay
         # ancestor; degrade to the nearest resolvable run if the chain is broken.
         root_meta = source
         visited = {source.run_id}
@@ -1081,6 +1207,11 @@ def run_script(
             except ScriptRunStoreError:
                 break
         replay_idempotency_root = root_meta.run_id
+        # Serve the cache from the root (the only run that actually executed and
+        # recorded the deterministic calls). For a single-generation resume the
+        # root *is* the source, so this is unchanged for the common case. Loaded up
+        # front so a corrupt/missing cache fails closed and typed before any spawn.
+        replay_cache = store.load_cache(root_meta.run_id)
 
     # Default a replay's caps/budget to the recorded run's so budget-/cap-gated
     # control flow reproduces faithfully; an explicit limits= still overrides.
@@ -1158,9 +1289,19 @@ def run_script(
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id
     result.journal_path = str(store.journal_path(persist_run_id))
+    # A durably-suspended run (issue #5) is recorded as its own terminal status so
+    # an operator/resumer can discover it (store.suspended_runs) and resume it with
+    # replay_from once the awaited card produces an event. It is neither succeeded
+    # nor failed.
+    if result.suspended:
+        status = "suspended"
+    elif result.ok:
+        status = "succeeded"
+    else:
+        status = "failed"
     store.finish(
         persist_run_id,
-        status="succeeded" if result.ok else "failed",
+        status=status,
         meta=result.meta,
         value=result.value,
         error=result.error,

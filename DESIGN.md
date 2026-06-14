@@ -492,9 +492,10 @@ The #2 slice proved the subprocess VM, the parent-owned RPC broker, the static
 launch gate, and capability enforcement with tests. The durable run store and
 deterministic replay cache (#3) are now implemented additively (see §5.6).
 Still out of scope here (tracked by #4/#11): the full script-API surface with
-loop guards and richer helpers (#4), true concurrent fan-out, resume from a
-*partial* run (this slice replays a *completed* run; it does not yet resume an
-interrupted one), no-duplicate-Kanban side-effect dedup, and
+loop guards and richer helpers (#4), true concurrent fan-out, general resume from
+a *partial* run (this slice replays a *completed* run; a run suspended on a Kanban
+await now resumes via §5.9, but resuming an arbitrarily-interrupted run from its
+last completed step is still future), no-duplicate-Kanban side-effect dedup, and
 launch-approval/session-policy governance (#11).
 
 ### 5.6 Durable script run store and deterministic replay cache (issue #3)
@@ -657,10 +658,11 @@ production backend implementing the same interface must: create/reattach through
 the real Kanban DB/API using the idempotency key as the unique key (so concurrent
 parents and replays converge), subscribe to **durable** card events that survive a
 parent restart (composing with `DurableKanbanBackend` for the recorded-outcome
-half), defer dispatch to the gateway (the workflow only creates/waits — no
-duplicate dispatcher), and, for a true `pause` of an *unresolved* card, persist
-the suspended run and resume it in a fresh process from a replayed event rather
-than holding a thread. Those are the residual production work for this slice.
+half), and defer dispatch to the gateway (the workflow only creates/waits — no
+duplicate dispatcher). The remaining item — a true `pause` of an *unresolved* card
+that persists the suspended run and resumes it in a fresh process from a replayed
+event rather than holding a thread — now ships as a seam (§5.9); what a real
+backend still owns is durably *producing* the wakeup event from the worker side.
 
 ### 5.8 Structured result contracts for Kanban tasks (issue #6)
 
@@ -693,6 +695,58 @@ dressed as success. The worker-side enforcement (a Kanban tool that rejects a
 completion lacking a valid `metadata.workflow_result`) is the production
 counterpart to this parent-side validation and remains future work alongside the
 real Kanban backend (§5.7).
+
+### 5.9 Durable suspend/resume of an unresolved paused await (issue #5)
+
+§5.7 made `on_block="pause"` keep awaiting a card until a terminal event, bounded
+by the run's wall-clock limit — an *in-process* hold that, on a card that never
+resolves in time, simply failed the run with `kanban_timeout`. This slice closes
+the last residual of the durable-pause story: a paused, **unresolved** card now
+*suspends* the run rather than holding a thread to the deadline, and a fresh
+process *resumes* it from a replayed event. It reuses the existing pieces (the
+durable card-state file, the append-only event log, and the notifier/event-log
+backend of §5.7) — no new store layout, no cross-host transport.
+
+**Opt-in suspend window.** `VMLimits.kanban_suspend_after_s` (default `None`,
+preserving the prior block-to-deadline behaviour) bounds how long a paused await
+waits in-process before suspending. The broker bounds each `await_resolution` by
+the *nearer* of the run deadline and the suspend window; a `KanbanTimeout` raised
+by the suspend window — distinguished from the run deadline by re-checking that
+wall-clock remains — triggers a suspend instead of a failure. The window is capped
+at `max_runtime_s`, so a value `>= max_runtime_s` never preempts the genuine
+`kanban_timeout` (the run deadline wins). Fast human unblocks within the window
+still resolve in-process exactly as before.
+
+**Suspend is a teardown, not a value.** A paused await cannot hand a non-result
+back to the script, so suspension mirrors the existing `should_abort` path: the
+broker sets `should_suspend` + `suspend_info` (the metadata-safe `card_id` /
+`profile` / `call_id` / `on_block`) and the VM kills the subprocess — the script's
+in-subprocess local state is discarded, which is safe because a resume re-runs the
+script from scratch over the §5.6 replay cache. The run is reported as a distinct
+`ScriptRunResult(suspended=True)` (it is neither `succeeded` nor `failed`) and
+recorded with `run.json` status `suspended`; `ScriptRunStore.suspended_runs()` is
+the operator/resumer-facing discovery view.
+
+**Resume is just replay.** Resuming a suspended run is the ordinary
+`run_workflow_script(..., replay_from=<suspended_run_id>)` path (§5.6). The replay
+re-runs the script: deterministic calls before the pause are served from the
+cache, and the paused `kanban_agent` reattaches the **same** content-addressed
+card (its idempotency key keys on the original logical run, stable across the
+replay) and reads the durable event log. If a worker/gateway — possibly a
+different process — has since durably appended a terminal event (§5.7's
+`publish_kanban_event`), the await resolves and the run completes; if the card is
+still unresolved, the run suspends again. Because the Kanban await is excluded
+from the replay cache, the resume never serves a stale value: it always re-reads
+the durable outcome. The recorded run's `kanban_suspend_after_s` is pinned on the
+replay (like the other caps) so a still-unresolved card suspends again rather than
+blocking, unless the resumer overrides `limits=`.
+
+**Boundary.** This is single-host and resume-driven, not a live scheduler: a
+suspended run is resumed when something re-invokes `run_workflow_script` with
+`replay_from` (an operator, a cron, a gateway callback). The parent does not itself
+hold the suspension open. Durably *producing* the wakeup event from the worker
+side, and a cross-host notification transport, remain the production residuals
+(§5.7).
 
 ### 5.5 Adversarial review and residual limitations
 
@@ -748,8 +802,10 @@ Near-term and future work, roughly in priority order:
    realized as a first-class feature. The script-VM side now ships the first
    piece of this: a durable `ScriptRunStore` plus a deterministic replay cache
    that re-runs a *completed* script without duplicating deterministic RPC work
-   (§5.6, issue #3). Remaining: resume from a *partial* run and dedup of durable
-   side effects (e.g. no-duplicate Kanban task creation) on rerun.
+   (§5.6, issue #3), and a run *suspended* on an unresolved paused Kanban await now
+   resumes in a fresh process from a replayed event (§5.9, issue #5). Remaining:
+   general resume from a *partial* run (arbitrary mid-step interruption) and dedup
+   of durable side effects (e.g. no-duplicate Kanban task creation) on rerun.
 
 4. **Durable & Kanban stores.** Provide at least one durable `RunStore`
    implementation and a concrete `KanbanRunStore` against a real board, validating
