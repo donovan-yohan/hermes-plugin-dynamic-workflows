@@ -655,15 +655,12 @@ class ScriptRunStore:
         with self._lock:
             self._kanban_dir().mkdir(parents=True, exist_ok=True)
             path = self._kanban_events_path(card_id)
-            # If a prior crash left a torn (newline-less) final line, start this
-            # event on its own line so it can never concatenate onto — and be lost
-            # with — the partial one.
-            prefix = self._torn_line_prefix(path)
+            line_count, prefix = self._event_log_shape(path)
             with path.open("a", encoding="utf-8") as f:
                 f.write(prefix + line + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-            seq = self._count_lines(path)  # the new line's 1-based position.
+            seq = line_count + 1  # the new line's 1-based position within this process.
         return {"seq": seq, **record}
 
     def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
@@ -719,29 +716,33 @@ class ScriptRunStore:
         }
 
     @staticmethod
-    def _count_lines(path: Path) -> int:
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                return sum(1 for _ in f)
-        except FileNotFoundError:
-            return 0
-
-    @staticmethod
-    def _torn_line_prefix(path: Path) -> str:
-        """Return ``"\\n"`` if the log's final line lacks a trailing newline.
+    def _event_log_shape(path: Path) -> tuple[int, str]:
+        """Return (physical line count, prefix needed before appending).
 
         A crash mid-append can leave a torn final line; prefixing the next event
         with a newline isolates the damage to that one (corrupt, skipped) line
-        instead of letting the next event concatenate onto it.
+        instead of letting the next event concatenate onto it. Count bytes rather
+        than decoding text so even a torn UTF-8 sequence cannot break appends.
         """
         try:
-            if path.stat().st_size == 0:
-                return ""
+            newline_count = 0
+            last_byte = b""
             with path.open("rb") as f:
-                f.seek(-1, os.SEEK_END)
-                return "" if f.read(1) == b"\n" else "\n"
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    newline_count += chunk.count(b"\n")
+                    last_byte = chunk[-1:]
+        except FileNotFoundError:
+            return 0, ""
         except OSError:
-            return ""
+            return 0, ""
+        if not last_byte:
+            return 0, ""
+        line_count = newline_count if last_byte == b"\n" else newline_count + 1
+        prefix = "" if last_byte == b"\n" else "\n"
+        return line_count, prefix
 
     def _kanban_dir(self) -> Path:
         return self.root / "_kanban"
