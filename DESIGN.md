@@ -612,6 +612,38 @@ no duplicate dispatcher), and, for a true `pause`, persist the suspended run and
 resume it in a fresh process from a replayed event rather than holding a thread.
 Those four items are the residual production work for this slice.
 
+### 5.8 Structured result contracts for Kanban tasks (issue #6)
+
+A workflow cannot safely branch on a prose summary. When `kanban_agent` is given
+a `schema=`, that schema is treated as a **template-guided payload schema over a
+stable envelope** — *not* one global workflow schema:
+
+* The worker completes a card by setting `metadata.workflow_result` (the
+  `workflow_result` key) to a structured payload. The card body carries a
+  rendered instruction telling the worker to do exactly that, and to **block**
+  rather than complete with prose if it cannot.
+* The parent runtime validates that payload against the schema with
+  `validate_workflow_result` (`kanban.py`) **before resolving the awaitable**.
+  Every declared `field -> type` must be present with the declared type; **extra
+  fields are preserved** (a repo/agent template may define a stricter shape), and
+  with **no schema** any payload passes through untouched.
+* A completed card whose `workflow_result` is missing or fails the schema is a
+  contract violation, never a success. It is turned into a **deterministic
+  block** with field-level diagnostics: under `on_block="pause"` the broker waits
+  for the worker to **retry** with a valid result (resolutions are versioned so
+  the await blocks for a strictly newer event); under `return`/`raise` it surfaces
+  as a `blocked` envelope / `kanban_blocked` denial.
+* Diagnostics are recorded in two places: a metadata-only `result_invalid` marker
+  in the run journal (the per-field detail stays out of the redacted journal) and
+  a Kanban card comment/event via the backend's optional `record_event` hook.
+
+The awaitable therefore resolves to a **typed object** (`workflow_result`) the
+script can branch on, or to a deterministic block — never to unvalidated prose
+dressed as success. The worker-side enforcement (a Kanban tool that rejects a
+completion lacking a valid `metadata.workflow_result`) is the production
+counterpart to this parent-side validation and remains future work alongside the
+real Kanban backend (§5.7).
+
 ### 5.5 Adversarial review and residual limitations
 
 The validator/guest/broker boundary was red-teamed with an independent

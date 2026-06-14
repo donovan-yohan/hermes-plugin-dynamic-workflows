@@ -202,7 +202,7 @@ def test_broker_pause_then_unblock_resolves_completed():
         worker.join()
     assert ret["ok"] is True
     assert ret["value"]["status"] == CARD_COMPLETED
-    assert ret["value"]["result"] == {"unblocked": True}
+    assert ret["value"]["workflow_result"] == {"unblocked": True}
 
 
 def test_broker_unknown_profile_is_rejected_with_diagnostic():
@@ -273,10 +273,12 @@ def test_broker_forwards_full_spec_to_backend():
 # End-to-end through the subprocess VM + durable store
 # --------------------------------------------------------------------------- #
 
+# Issue #6 moved schema= to validate the worker's workflow_result payload (not the
+# envelope), so these idempotency-focused runs intentionally pass no schema; the
+# result contract has dedicated coverage in test_kanban_result_contract.py.
 _E2E_SCRIPT = META + (
     'r = await kanban_agent("planner", title="plan", prompt="go", '
-    'context={"issue": args["i"]}, parents=["root_card"], on_block="return", '
-    'schema={"status": "string", "card_id": "string"})\n'
+    'context={"issue": args["i"]}, parents=["root_card"], on_block="return")\n'
     'return {"status": r["status"], "card_id": r["card_id"], "reattached": r["reattached"]}\n'
 )
 

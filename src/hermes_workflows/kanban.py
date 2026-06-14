@@ -61,7 +61,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from .registry import utc_now_iso
@@ -84,6 +84,9 @@ __all__ = [
     "KanbanTimeout",
     "kanban_card_id",
     "normalize_on_block",
+    "WORKFLOW_RESULT_KEY",
+    "validate_workflow_result",
+    "result_contract_instruction",
 ]
 
 # Card lifecycle states the awaitable resolves on.
@@ -153,6 +156,86 @@ def kanban_card_id(idempotency_key: str) -> str:
     return f"kbc_{digest}"
 
 
+# The worker completes a card by setting this key in the card's completion
+# metadata (``metadata.workflow_result``). The runtime validates that payload —
+# not the card's free-text body — before resolving the awaitable, so a workflow
+# branches on a typed object and never on prose. (Issue #6.)
+WORKFLOW_RESULT_KEY = "workflow_result"
+
+# Result-schema type table for the workflow result contract. Mirrors the broker's
+# brokered-output table so ``schema=`` means the same thing for an ``agent`` output
+# and a ``kanban_agent`` workflow_result.
+_RESULT_TYPE_MAP: dict[str, tuple[type, ...]] = {
+    "string": (str,), "str": (str,), "number": (int, float), "int": (int,),
+    "integer": (int,), "float": (float,), "bool": (bool,), "boolean": (bool,),
+    "object": (dict,), "dict": (dict,), "list": (list,), "array": (list,), "any": (object,),
+}
+
+
+def validate_workflow_result(payload: Any, schema: Optional[dict[str, Any]]) -> list[str]:
+    """Validate a worker's structured ``workflow_result`` against the call schema.
+
+    Returns a list of human-readable diagnostics; an empty list means valid.
+
+    The contract is deliberately a *template-guided payload schema over a stable
+    envelope*, not one global workflow schema:
+
+    * **No schema** → always valid. Unknown payloads are preserved as-is, so a
+      repo/agent template may hand back any shape it likes.
+    * **With schema** → every declared ``field -> type`` must be present with the
+      declared type. **Extra** fields are preserved, not rejected, so a template
+      can define a stricter-than-declared shape without tripping the contract.
+
+    A non-dict payload (e.g. the worker completed with prose / nothing) is a
+    contract violation, not a silent success — the broker turns a non-empty
+    diagnostics list into a deterministic block/fail.
+    """
+    if not schema:
+        return []
+    if not isinstance(payload, dict):
+        kind = type(payload).__name__
+        return [f"workflow_result is missing or not an object (got {kind})"]
+    diagnostics: list[str] = []
+    for field_name, hint in schema.items():
+        if field_name not in payload:
+            diagnostics.append(f"missing required field {field_name!r}")
+            continue
+        expected = (hint,) if isinstance(hint, type) else _RESULT_TYPE_MAP.get(str(hint).lower())
+        if expected is None:
+            continue  # unknown type hint: leniently accept (matches brokered-output policy).
+        value = payload[field_name]
+        # bool is an int subclass, so reject it for a numeric/text field — but
+        # allow it where bool is explicitly expected or the field is permissive
+        # (``any``/``object``, i.e. ``object in expected``), so a valid bool result
+        # is not wrongly rejected and turned into a contract violation.
+        if isinstance(value, bool) and bool not in expected and object not in expected:
+            diagnostics.append(f"field {field_name!r} expected {hint}, got bool")
+        elif not isinstance(value, expected):
+            diagnostics.append(f"field {field_name!r} expected {hint}, got {type(value).__name__}")
+    return diagnostics
+
+
+def result_contract_instruction(schema: Optional[dict[str, Any]]) -> str:
+    """Render the worker-facing instruction a card body carries when ``schema`` is set.
+
+    Empty string when there is no schema (the worker may complete with any
+    payload). Otherwise it tells the worker to complete with a
+    ``metadata.workflow_result`` matching the schema and to *block* — not complete
+    with prose — if it cannot, which is exactly what the runtime enforces.
+    """
+    if not schema:
+        return ""
+    fields = ", ".join(
+        f"{name}: {hint.__name__ if isinstance(hint, type) else hint}"
+        for name, hint in schema.items()
+    )
+    return (
+        f"Complete this card by setting metadata.{WORKFLOW_RESULT_KEY} to a JSON "
+        f"object matching this schema: {{{fields}}}. Do not complete with prose. "
+        "If you cannot produce the structured result, block the card with a reason."
+    )
+
+
 @dataclass(frozen=True)
 class KanbanCardSpec:
     """The parent-visible specification for one ``kanban_agent`` call.
@@ -187,13 +270,21 @@ class KanbanCard:
 
 @dataclass(frozen=True)
 class KanbanResolution:
-    """A terminal (or, under ``return``/``raise``, blocked) card outcome."""
+    """A terminal (or, under ``return``/``raise``, blocked) card outcome.
+
+    ``result`` is the worker's structured ``metadata.workflow_result`` payload —
+    what the runtime validates against the call's result schema. ``version`` is a
+    per-card monotonic event sequence (assigned by the backend) so an await can
+    block for a *newer* event than one it already rejected (the retry/unblock
+    path after a failed result-contract check).
+    """
 
     card_id: str
     profile: str
     status: str  # completed | blocked | failed
     result: dict[str, Any] = field(default_factory=dict)
     reason: Optional[str] = None
+    version: int = 0
 
 
 @runtime_checkable
@@ -214,13 +305,26 @@ class KanbanBackend(Protocol):
         ...
 
     def await_resolution(
-        self, card_id: str, *, accept_blocked: bool, timeout: Optional[float]
+        self,
+        card_id: str,
+        *,
+        accept_blocked: bool,
+        timeout: Optional[float],
+        after_version: int = 0,
     ) -> KanbanResolution:
         """Block until ``card_id`` reaches an accepted resolution.
 
         Resolves on a terminal completed/failed event always, and on a blocked
         event only when ``accept_blocked`` (i.e. ``on_block`` is not ``"pause"``).
-        Raises :class:`KanbanTimeout` if no accepted resolution arrives in time.
+        Only events with ``version > after_version`` count, so the broker can wait
+        for a *newer* event after rejecting one whose ``workflow_result`` failed
+        the result contract (retry/unblock). Raises :class:`KanbanTimeout` if no
+        accepted resolution arrives in time.
+
+        Optional hook: a backend MAY also implement
+        ``record_event(card_id, kind, detail)`` to attach a comment/event to the
+        card (the broker uses it to surface result-validation diagnostics on the
+        board); it is called only if present.
         """
         ...
 
@@ -256,13 +360,16 @@ class InMemoryKanbanBackend:
         self._by_idem: dict[str, str] = {}
         self._cards: dict[str, KanbanCard] = {}
         self._specs: dict[str, KanbanCardSpec] = {}
+        self._instructions: dict[str, str] = {}
         self._resolutions: dict[str, KanbanResolution] = {}
+        self._seq = 0  # monotonic event sequence for resolution versioning.
         self._auto = auto
         self._known = set(known_profiles) if known_profiles is not None else None
         self._unknown = unknown_profiles
         # Audit surfaces for tests.
         self.created_cards: list[str] = []
         self.reattachments = 0
+        self.events: list[dict[str, Any]] = []  # card comments/events (e.g. result_invalid).
 
     # -- profile policy ---------------------------------------------------
     def _check_profile(self, profile: str) -> None:
@@ -295,11 +402,14 @@ class InMemoryKanbanBackend:
             self._by_idem[idempotency_key] = card_id
             self._cards[card_id] = card
             self._specs[card_id] = spec
+            # When a schema is set, the card body instructs the worker to complete
+            # with a matching metadata.workflow_result (production renders this into
+            # the real card; the fake records it for inspection).
+            self._instructions[card_id] = result_contract_instruction(spec.schema)
             self.created_cards.append(card_id)
             auto = self._auto_resolution(card_id, spec)
             if auto is not None:
-                self._resolutions[card_id] = auto
-                self._cond.notify_all()
+                self._publish(auto)
             return card
 
     def _auto_resolution(self, card_id: str, spec: KanbanCardSpec) -> Optional[KanbanResolution]:
@@ -332,15 +442,30 @@ class InMemoryKanbanBackend:
             )
         raise TypeError(f"cannot coerce {type(value).__name__} to a KanbanResolution")
 
+    def _publish(self, resolution: KanbanResolution) -> None:
+        """Version, store, and announce a card event (caller holds the lock)."""
+        self._seq += 1
+        self._resolutions[resolution.card_id] = replace(resolution, version=self._seq)
+        self._cond.notify_all()
+
     # -- await ------------------------------------------------------------
     def await_resolution(
-        self, card_id: str, *, accept_blocked: bool, timeout: Optional[float]
+        self,
+        card_id: str,
+        *,
+        accept_blocked: bool,
+        timeout: Optional[float],
+        after_version: int = 0,
     ) -> KanbanResolution:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
                 resolution = self._resolutions.get(card_id)
-                if resolution is not None and self._is_accepted(resolution, accept_blocked):
+                if (
+                    resolution is not None
+                    and resolution.version > after_version
+                    and self._is_accepted(resolution, accept_blocked)
+                ):
                     return resolution
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
@@ -363,6 +488,20 @@ class InMemoryKanbanBackend:
         with self._lock:
             return self._specs.get(card_id)
 
+    def instruction_for(self, card_id: str) -> str:
+        """Return the worker-facing result-contract instruction on a card body."""
+        with self._lock:
+            return self._instructions.get(card_id, "")
+
+    def record_event(self, card_id: str, kind: str, detail: dict[str, Any]) -> None:
+        """Attach a comment/event to a card (the durable-comment analogue).
+
+        The broker calls this to surface result-validation diagnostics on the
+        board; production posts a real Kanban comment/event.
+        """
+        with self._lock:
+            self.events.append({"card_id": card_id, "kind": kind, "detail": detail})
+
     def resolve(
         self,
         card_id: str,
@@ -375,11 +514,12 @@ class InMemoryKanbanBackend:
         with self._cond:
             card = self._cards.get(card_id)
             profile = card.profile if card is not None else ""
-            self._resolutions[card_id] = KanbanResolution(
-                card_id=card_id,
-                profile=profile,
-                status=status,
-                result=result or {},
-                reason=reason,
+            self._publish(
+                KanbanResolution(
+                    card_id=card_id,
+                    profile=profile,
+                    status=status,
+                    result=result or {},
+                    reason=reason,
+                )
             )
-            self._cond.notify_all()

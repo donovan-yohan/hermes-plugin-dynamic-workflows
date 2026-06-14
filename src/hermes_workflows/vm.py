@@ -42,14 +42,17 @@ from .errors import (
 )
 from .kanban import (
     CARD_BLOCKED,
+    CARD_COMPLETED,
     DEFAULT_ON_BLOCK,
     KanbanBackend,
     KanbanBlocked,
     KanbanCardSpec,
     KanbanError,
+    KanbanResolution,
     KanbanTimeout,
     KanbanUnknownProfile,
     normalize_on_block,
+    validate_workflow_result,
 )
 from .registry import utc_now_iso
 from .script_store import (
@@ -80,6 +83,12 @@ _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "log", "phase", "workflow
 # Sentinel: a replay consult that found no cache entry for a call id (a miss),
 # so the broker must fall through to a live dispatch.
 _MISS = object()
+
+# Cap on how many distinct result-contract violations one kanban_agent call records
+# (journal marker + card comment). Under on_block="pause" a misbehaving worker can
+# re-complete with bad output rapidly; the await is deadline-bounded, but this keeps
+# a buggy worker from amplifying into unbounded journal writes / board comments.
+_MAX_RESULT_INVALID_RECORDS = 8
 
 # Output-schema type table (mirrors runtime._TYPE_MAP) for brokered agent calls.
 _TYPE_MAP: dict[str, tuple[type, ...]] = {
@@ -444,36 +453,133 @@ class CapabilityBroker:
         idempotency_key = self._kanban_idempotency_key(call_id)
         try:
             card = self._kanban_backend.create_or_reattach(idempotency_key, spec)
-            resolution = self._kanban_backend.await_resolution(
-                card.card_id,
-                accept_blocked=(on_block != "pause"),
-                timeout=self._kanban_await_timeout(),
-            )
         except KanbanUnknownProfile as exc:
             raise CapabilityDenied(str(exc), code="unknown_profile") from exc
-        except KanbanTimeout as exc:
-            raise CapabilityDenied(str(exc), code="kanban_timeout") from exc
-        except KanbanError as exc:  # any other backend failure -> structured denial.
+        except KanbanError as exc:
             raise CapabilityDenied(str(exc), code="kanban_error") from exc
+
+        resolution, diagnostics = self._await_valid_kanban_result(
+            call_id, card.card_id, profile, on_block, spec.schema
+        )
 
         if resolution.status == CARD_BLOCKED and on_block == "raise":
             raise CapabilityDenied(str(KanbanBlocked(resolution)), code="kanban_blocked")
 
         result: dict[str, Any] = {
             "card_id": resolution.card_id,
-            "task_id": resolution.card_id,  # parity with the legacy stub shape.
             "profile": resolution.profile or profile,
             "status": resolution.status,
-            "result": resolution.result or {},
+            # The validated worker payload (issue #6). Unknown payloads are passed
+            # through untouched when the call declared no schema.
+            "workflow_result": resolution.result or {},
             "reattached": card.reattached,
         }
         if resolution.reason is not None:
             result["reason"] = resolution.reason
-        _validate_output(result, spec.schema)
+        if diagnostics:
+            result["diagnostics"] = diagnostics
         usage = (resolution.result or {}).get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
             self._tokens += usage
         return result
+
+    def _await_valid_kanban_result(
+        self, call_id: Any, card_id: str, profile: str, on_block: str, schema: Optional[dict[str, Any]]
+    ) -> tuple[KanbanResolution, list[str]]:
+        """Await a resolution and enforce the workflow-result contract (issue #6).
+
+        A *completed* card whose ``workflow_result`` is missing or fails ``schema``
+        is a contract violation: it must not resolve as success. Under ``pause`` we
+        wait for a newer (re-)completion (retry/unblock); otherwise we surface it
+        as a deterministic ``blocked`` with diagnostics. Validation diagnostics are
+        recorded in the run journal and (best-effort) as a Kanban card comment.
+        """
+        accept_blocked = on_block != "pause"
+        after_version = 0
+        has_received = False
+        last_recorded: Optional[tuple[str, ...]] = None
+        records = 0
+        while True:
+            try:
+                resolution = self._kanban_backend.await_resolution(
+                    card_id,
+                    accept_blocked=accept_blocked,
+                    timeout=self._kanban_await_timeout(),
+                    after_version=after_version,
+                )
+            except KanbanTimeout as exc:
+                raise CapabilityDenied(str(exc), code="kanban_timeout") from exc
+            except KanbanError as exc:  # any other backend failure -> structured denial.
+                raise CapabilityDenied(str(exc), code="kanban_error") from exc
+
+            # Defense: await_resolution must return an event strictly newer than
+            # after_version. A backend that ignores after_version would hand back
+            # the same rejected completion and the pause retry would hot-spin to the
+            # deadline; fail closed instead of spinning.
+            if has_received and resolution.version <= after_version:
+                raise CapabilityDenied(
+                    "kanban backend returned a stale event (after_version ignored)",
+                    code="kanban_error",
+                )
+            after_version = resolution.version
+            has_received = True
+            if resolution.status != CARD_COMPLETED or not schema:
+                return resolution, []  # blocked/failed, or no contract to enforce.
+
+            diagnostics = validate_workflow_result(resolution.result, schema)
+            if not diagnostics:
+                return resolution, []  # valid structured result.
+
+            # Contract violation: a completed card with a bad/missing workflow_result
+            # must not be returned as success. Record the rejection, but de-dup
+            # consecutive identical diagnostics and cap total records so a worker
+            # stuck re-completing with bad output can't amplify into unbounded
+            # journal writes / board comments.
+            diag_key = tuple(diagnostics)
+            if diag_key != last_recorded and records < _MAX_RESULT_INVALID_RECORDS:
+                self._record_kanban_result_invalid(call_id, card_id, profile, diagnostics)
+                last_recorded = diag_key
+                records += 1
+            if on_block == "pause":
+                continue  # wait for the worker to re-complete with a valid result.
+            reason = "workflow_result failed schema: " + "; ".join(diagnostics)
+            blocked = KanbanResolution(
+                card_id=resolution.card_id,
+                profile=resolution.profile or profile,
+                status=CARD_BLOCKED,
+                result=resolution.result or {},
+                reason=reason,
+                version=resolution.version,
+            )
+            return blocked, diagnostics
+
+    def _record_kanban_result_invalid(
+        self, call_id: Any, card_id: str, profile: str, diagnostics: list[str]
+    ) -> None:
+        """Journal the validation failure and post a card comment (both best-effort)."""
+        summary = f"result_invalid ({len(diagnostics)} field(s))"
+        try:
+            # Metadata-only journal marker (the per-field detail goes to the card
+            # comment, not the redacted journal): a call-shaped event the durable
+            # journal sink records with method/ok/profile/error.
+            self._emit(
+                {
+                    "type": "rpc_call",
+                    "call_id": call_id,
+                    "method": "kanban_agent",
+                    "profile": profile,
+                    "ok": False,
+                    "error": summary,
+                }
+            )
+        except Exception:  # noqa: BLE001 — journaling is best-effort.
+            pass
+        recorder = getattr(self._kanban_backend, "record_event", None)
+        if callable(recorder):
+            try:
+                recorder(card_id, "result_invalid", {"diagnostics": list(diagnostics)})
+            except Exception:  # noqa: BLE001 — card comments are best-effort.
+                pass
 
     def _invoke(self, agent_id: str, payload: dict[str, Any], schema: Any) -> dict[str, Any]:
         output = self._runner(agent_id, payload)
