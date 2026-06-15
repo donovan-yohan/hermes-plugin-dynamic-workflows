@@ -179,6 +179,22 @@ def test_backend_resolves_a_preexisting_log_event_without_waiting():
         assert res.status == "completed" and res.result == {"plan": "done"}
 
 
+def test_event_log_backend_tolerates_store_without_event_reader():
+    class _StateOnlyStore:
+        def __init__(self):
+            self.state = {kanban_card_id("k:1"): {"status": "waiting"}}
+
+        def load_kanban_card_state(self, card_id):
+            return self.state.get(card_id)
+
+        def record_kanban_card_state(self, card_id, state):
+            self.state[card_id] = state
+
+    backend = EventLogKanbanBackend(_StateOnlyStore(), ThreadEventNotifier(), known_profiles={"planner"})
+    card = backend.create_or_reattach("k:1", KanbanCardSpec(profile="planner"))
+    assert card.reattached is True
+
+
 def test_backend_resolution_clears_the_in_flight_wait_view():
     # Regression (review): a resolved card must be mirrored to the latest-state
     # index so kanban_waits() stops reporting it as in-flight (the create_or_reattach

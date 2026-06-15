@@ -664,6 +664,56 @@ that persists the suspended run and resumes it in a fresh process from a replaye
 event rather than holding a thread — now ships as a seam (§5.9); what a real
 backend still owns is durably *producing* the wakeup event from the worker side.
 
+### 5.10 Real Hermes Kanban backend adapter (issue #5)
+
+`hermes_kanban.py` is the production-shaped backend that closes the
+"documented/stubbed, not implemented" residual. `HermesKanbanBackend` implements
+the same `KanbanBackend` interface and composes the shipped durability rather than
+re-implementing it:
+
+* **create/reattach via a CLI seam.** `create_or_reattach` rejects an unknown
+  assignee profile **before** any card is opened, derives the content-addressed
+  `kanban_card_id(idempotency_key)` (stable across replays), and — only when the
+  durable store has *no* record of that card — opens a real card through the
+  `HermesKanbanClient` seam. The default `SubprocessHermesKanbanClient` shells out
+  to **exactly one** current-contract `hermes kanban create` invocation: global
+  `--board` (when supplied), positional title plus `--body`, `--assignee`,
+  repeated `--parent`, `--workspace`, `--tenant`, and `--idempotency-key`. Fields
+  the CLI does not support as flags (labels and the logical card id) are not
+  passed as fake options; they remain visible in the rendered body together with
+  the worker prompt, context, task/input payloads, and the issue-#6
+  result-contract instruction. This runs in
+  the **parent/operator** process (it legitimately holds Hermes credentials) —
+  never the sandboxed workflow subprocess, preserving the same trust boundary every
+  other capability uses. A restart/replay that already has a durable record
+  **reattaches** with no second create, preserving idempotency and the no-duplicate
+  guarantee.
+
+* **resolve from real terminal events.** `await_resolution` delegates to a
+  composed `EventLogKanbanBackend` (§5.7), so the await is event-driven from the
+  durable log, bounded by the run deadline, and honours `after_version` and the
+  `on_block` policy. The narrow **Kanban task-event bridge** (the only #7 seam
+  this slice touches) is `map_hermes_terminal_status` /
+  `publish_hermes_kanban_event`: a worker/gateway normalises a real Hermes
+  terminal task status — `completed`/`blocked`/`failed`/`timed_out`/`crashed`/
+  `gave_up`/cancellation — onto the three resolution statuses (the failure family
+  folds onto a single structured `failed`, with the specific name preserved in
+  `reason`), then durably publishes it. A non-terminal/unknown status is rejected,
+  so a transient running/queued update is never mistaken for an outcome.
+
+* **never a dispatcher.** The adapter only creates and awaits. `assert_no_dispatch`
+  refuses any `hermes kanban` argv whose subcommand is not `create`/`comment`, so
+  it can never shell out to `dispatch`/`daemon`/`worker`/`spawn`/`serve` even if a
+  builder is changed carelessly — gateway dispatch owns claiming and executing the
+  work.
+
+This is a **library/operator** backend injected via
+`run_workflow_script(kanban_backend=)`; it is not registered as a model-facing
+tool. Production residuals (tracked for the gateway integration, not this slice):
+durably *producing* terminal events from the worker side, a `hermes kanban
+comment` path for board-side result-validation diagnostics, and a cross-host
+notifier transport (§5.7).
+
 ### 5.8 Structured result contracts for Kanban tasks (issue #6)
 
 A workflow cannot safely branch on a prose summary. When `kanban_agent` is given

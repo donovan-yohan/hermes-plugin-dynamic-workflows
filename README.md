@@ -437,7 +437,7 @@ The repo intentionally avoids runtime dependencies. `pytest` is only a dev conve
 - The JSON runtime's sandbox is a declarative policy checker, not a code VM. The subprocess VM (issue #2) does run code, but only out-of-process behind a static gate + restricted builtins + parent RPC broker.
 - The default `StubAgentRunner` only simulates known demo agents.
 - The script VM now has a durable run store + deterministic replay cache (issue #3): completed script runs persist a metadata-only journal and replay deterministic RPC calls from cache. Still missing: resume from a *partial* run, dedup of durable side effects (e.g. no-duplicate Kanban creation) on rerun, and replay for the declarative JSON `RunStore` path.
-- The Kanban backend is documented/stubbed, not implemented.
+- The durable `kanban_agent` awaitable now has a **real Hermes Kanban backend adapter** (`HermesKanbanBackend`, issue #5): it opens/reattaches real cards through a `hermes kanban create` CLI seam and resolves from real Kanban terminal events bridged into the durable event log. It is a library/operator backend (injected into `run_workflow_script(kanban_backend=)`), not a model-facing control; the in-memory/event-log backends remain for tests and local dev. Still residual on the production side: the gateway dispatcher integration that *produces* terminal events from the worker side, a `hermes kanban comment` path for board-side diagnostics, and a cross-host notifier transport.
 - The subprocess VM (#2) plus the durable run store + deterministic replay cache (#3) are now in place; the full script API with loop guards (#4) and launch-approval/session-policy governance (#11) are deferred.
 
 ## License
