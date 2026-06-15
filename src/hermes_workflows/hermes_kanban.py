@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkable
 
 from .kanban import (
     CARD_BLOCKED,
@@ -223,17 +223,67 @@ def assert_no_dispatch(argv: list[str]) -> None:
     A defence-in-depth check so the adapter can never shell out to a dispatcher,
     daemon, worker, or poll loop even if a builder is changed carelessly. Raises
     :class:`HermesKanbanError` on a non-create/comment subcommand or a malformed
-    argv.
+    argv. The only accepted Kanban global option is ``--board <slug>``, and only
+    in the real CLI's global-option slot before the subcommand.
     """
     if not isinstance(argv, (list, tuple)) or len(argv) < 3:
         raise HermesKanbanError(f"not a 'hermes kanban' command: {argv!r}")
     if argv[1] != "kanban":
         raise HermesKanbanError(f"not a 'hermes kanban' command: {argv!r}")
-    sub = argv[2]
+
+    sub_index = 2
+    if argv[sub_index] == "--board":
+        if len(argv) < 5 or not argv[sub_index + 1] or str(argv[sub_index + 1]).startswith("-"):
+            raise HermesKanbanError(f"malformed kanban --board option: {argv!r}")
+        sub_index += 2
+    elif str(argv[sub_index]).startswith("--board="):
+        raise HermesKanbanError(
+            "use '--board <slug>' before the kanban subcommand; inline --board=... is refused"
+        )
+
+    sub = argv[sub_index]
     if sub not in _ALLOWED_SUBCOMMANDS:
         raise HermesKanbanError(
             f"refusing non-create kanban subcommand {sub!r}; the adapter never dispatches"
         )
+    for token in _kanban_option_tokens(argv[sub_index], argv[sub_index + 1 :]):
+        if token == "--board" or str(token).startswith("--board="):
+            raise HermesKanbanError(
+                "kanban --board is only allowed as a global option before create/comment"
+            )
+
+
+def _kanban_option_tokens(subcommand: str, args: Sequence[Any]) -> Iterable[Any]:
+    """Yield option-position tokens for the Kanban subcommand guard.
+
+    ``--board`` inside a title/body/comment is user content, not routing. The
+    guard only rejects board-looking tokens where they would be parsed as
+    command options after the subcommand.
+    """
+    if subcommand == "create" and args:
+        args = args[1:]  # positional title
+    elif subcommand == "comment" and args:
+        args = args[1:]  # positional card id; remaining tokens are comment text
+        return
+
+    value_flags = {
+        "--assignee",
+        "--idempotency-key",
+        "--tenant",
+        "--parent",
+        "--workspace",
+        "--body",
+    }
+    skip_value = False
+    for token in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if token in value_flags:
+            skip_value = True
+            yield token
+            continue
+        yield token
 
 
 def build_card_body(spec: KanbanCardSpec, *, logical_card_id: Optional[str] = None) -> str:
@@ -278,16 +328,17 @@ def build_create_argv(
     """Build the exact ``hermes kanban create`` argv for one new card.
 
     Carries everything the current CLI accepts and nothing the adapter is not
-    allowed to do: the positional title, idempotency key (so concurrent
-    parents/replays converge on one card), assignee profile, tenant, parents,
-    workspace, and the rendered body with the result-contract instruction.
-    Unsupported fields (board/labels/logical card id) are not passed as fake
-    flags.
+    allowed to do: the global board option (when present), positional title,
+    idempotency key (so concurrent parents/replays converge on one card),
+    assignee profile, tenant, parents, workspace, and the rendered body with the
+    result-contract instruction. Unsupported fields (labels/logical card id) are
+    not passed as fake flags.
     """
     title = spec.title or f"Workflow Kanban card {card_id}"
-    argv: list[str] = [
-        hermes_bin,
-        "kanban",
+    argv: list[str] = [hermes_bin, "kanban"]
+    if spec.board:
+        argv += ["--board", spec.board]
+    argv += [
         "create",
         title,
         "--assignee",

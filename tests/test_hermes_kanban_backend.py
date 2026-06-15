@@ -149,7 +149,14 @@ def test_build_create_argv_carries_every_field_and_the_result_contract():  # cri
     )
     argv = build_create_argv("kbc_abc", "root:1", spec)
 
-    assert argv[:4] == ["hermes", "kanban", "create", "plan #9"]
+    assert argv[:6] == [
+        "hermes",
+        "kanban",
+        "--board",
+        "board-1",
+        "create",
+        "plan #9",
+    ]
 
     def _val(flag):
         return argv[argv.index(flag) + 1]
@@ -157,7 +164,8 @@ def test_build_create_argv_carries_every_field_and_the_result_contract():  # cri
     assert _val("--idempotency-key") == "root:1"
     assert "--card-id" not in argv
     assert _val("--assignee") == "planner"
-    assert "--board" not in argv
+    assert argv.index("--board") == 2
+    assert _val("--board") == "board-1"
     assert _val("--tenant") == "acme"
     assert "--title" not in argv
     # repeated parents present; unsupported labels become body metadata, not CLI flags.
@@ -228,6 +236,30 @@ def test_assert_no_dispatch_refuses_dispatcher_subcommands():  # criterion 4
         pass
     else:  # pragma: no cover
         raise AssertionError("expected refusal of reordered dispatch argv")
+    # Global --board is allowed only before create/comment, matching the live CLI
+    # shape. Placing it after the subcommand is refused so a builder cannot hide
+    # board routing inside create-specific args.
+    assert_no_dispatch(
+        ["hermes", "kanban", "--board", "b", "create", "title", "--body", "x"]
+    )
+    assert_no_dispatch(
+        ["hermes", "kanban", "--board", "b", "comment", "kbc_x", "x"]
+    )
+    assert_no_dispatch(
+        ["hermes", "kanban", "create", "title", "--body", "--board is body text"]
+    )
+    assert_no_dispatch(["hermes", "kanban", "comment", "kbc_x", "--board"])
+    for bad in (
+        ["hermes", "kanban", "create", "title", "--board", "b"],
+        ["hermes", "kanban", "--board=b", "create", "title"],
+        ["hermes", "kanban", "--board", "--not-a-board", "create", "title"],
+    ):
+        try:
+            assert_no_dispatch(bad)
+        except HermesKanbanError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f"expected refusal of unsafe board placement: {bad!r}")
     # create / comment are allowed.
     assert_no_dispatch(["hermes", "kanban", "create", "title", "--body", "x"])
     assert_no_dispatch(["hermes", "kanban", "comment", "kbc_x", "x"])
@@ -307,10 +339,19 @@ def test_create_opens_one_card_and_records_a_waiting_marker():  # criterion 1
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")
         backend = _backend(store, client=client)
-        card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner", board="b"))
+        card = backend.create_or_reattach(
+            "root:1", KanbanCardSpec(profile="planner", board="b")
+        )
         assert card.card_id == kanban_card_id("root:1")
         assert card.reattached is False
         assert len(client.calls) == 1
+        assert client.calls[0]["argv"][:5] == [
+            "hermes",
+            "kanban",
+            "--board",
+            "b",
+            "create",
+        ]
         # the card is now a durable in-flight wait.
         assert [w["card_id"] for w in store.kanban_waits()] == [card.card_id]
 
