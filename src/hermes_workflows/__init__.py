@@ -98,6 +98,19 @@ from .kanban_notify import (
     EventLogKanbanBackend,
     publish_kanban_event,
 )
+from .hermes_kanban import (
+    HermesKanbanBackend,
+    HermesKanbanClient,
+    SubprocessHermesKanbanClient,
+    HermesKanbanError,
+    HermesKanbanCommandError,
+    HERMES_TERMINAL_STATUS_MAP,
+    build_create_argv,
+    build_card_body,
+    assert_no_dispatch,
+    map_hermes_terminal_status,
+    publish_hermes_kanban_event,
+)
 from .errors import (
     WorkflowError,
     WorkflowValidationError,
@@ -187,6 +200,18 @@ __all__ = [
     "FifoEventNotifier",
     "EventLogKanbanBackend",
     "publish_kanban_event",
+    # real Hermes Kanban backend adapter (issue #5)
+    "HermesKanbanBackend",
+    "HermesKanbanClient",
+    "SubprocessHermesKanbanClient",
+    "HermesKanbanError",
+    "HermesKanbanCommandError",
+    "HERMES_TERMINAL_STATUS_MAP",
+    "build_create_argv",
+    "build_card_body",
+    "assert_no_dispatch",
+    "map_hermes_terminal_status",
+    "publish_hermes_kanban_event",
     # errors
     "WorkflowError",
     "WorkflowValidationError",
