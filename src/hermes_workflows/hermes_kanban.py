@@ -88,8 +88,13 @@ __all__ = [
 def _redact_command_argv(argv: list[str]) -> list[str]:
     """Retain command shape for diagnostics without prompt/body payloads."""
     redacted = [str(part) for part in argv]
-    if len(redacted) > 3 and redacted[1:3] == ["kanban", "create"]:
-        redacted[3] = "<redacted-title>"
+    sub_index = _kanban_subcommand_index(redacted)
+    if (
+        sub_index is not None
+        and len(redacted) > sub_index + 1
+        and redacted[sub_index] == "create"
+    ):
+        redacted[sub_index + 1] = "<redacted-title>"
     for flag in ("--body",):
         try:
             idx = redacted.index(flag)
@@ -98,6 +103,16 @@ def _redact_command_argv(argv: list[str]) -> list[str]:
         if idx + 1 < len(redacted):
             redacted[idx + 1] = "<redacted>"
     return redacted
+
+
+def _kanban_subcommand_index(argv: Sequence[Any]) -> Optional[int]:
+    """Return the index of the ``hermes kanban`` subcommand, if parseable."""
+    if len(argv) < 3 or argv[1] != "kanban":
+        return None
+    sub_index = 2
+    if argv[sub_index] == "--board" and len(argv) > sub_index + 2:
+        sub_index += 2
+    return sub_index
 
 
 class HermesKanbanError(RuntimeError):
@@ -113,7 +128,8 @@ class HermesKanbanCommandError(HermesKanbanError):
         self.stderr = stderr
         # The original argv may carry prompt/context/input in the body, so only a
         # redacted shape is retained and only the subcommand/code are surfaced.
-        sub = argv[2] if len(argv) > 2 else "?"
+        sub_index = _kanban_subcommand_index(argv)
+        sub = argv[sub_index] if sub_index is not None and len(argv) > sub_index else "?"
         super().__init__(f"hermes kanban {sub} exited {returncode}")
 
 
@@ -147,6 +163,10 @@ HERMES_TERMINAL_STATUS_MAP: dict[str, str] = {
 
 _REAL_TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9][A-Za-z0-9_.-]{0,125}$")
 _REAL_TASK_ALIAS_STATUS = "alias"
+
+
+def _unmapped_real_task_error(card_id: str) -> HermesKanbanError:
+    return HermesKanbanError(f"no logical workflow card mapping recorded for real task {card_id!r}")
 
 
 def map_hermes_terminal_status(status: Any) -> Optional[str]:
@@ -203,22 +223,27 @@ def resolve_hermes_kanban_event_card_id(store: Any, card_id: str) -> str:
     records a durable alias under that real id; this helper follows it before the
     event is appended/notified so a waiting parent wakes on the logical id.
     """
+    is_real_task_id = _REAL_TASK_ID_RE.fullmatch(card_id) is not None
     load_state = getattr(store, "load_kanban_card_state", None)
     if not callable(load_state):
+        if is_real_task_id:
+            raise _unmapped_real_task_error(card_id)
         return card_id
     try:
         state = load_state(card_id)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        if is_real_task_id:
+            raise _unmapped_real_task_error(card_id) from exc
         return card_id
     if not isinstance(state, dict):
-        if _REAL_TASK_ID_RE.fullmatch(card_id) is not None:
-            raise HermesKanbanError(f"no logical workflow card mapping recorded for real task {card_id!r}")
+        if is_real_task_id:
+            raise _unmapped_real_task_error(card_id)
         return card_id
     logical = state.get("logical_card_id")
     if isinstance(logical, str) and logical:
         return logical
-    if _REAL_TASK_ID_RE.fullmatch(card_id) is not None:
-        raise HermesKanbanError(f"no logical workflow card mapping recorded for real task {card_id!r}")
+    if is_real_task_id:
+        raise _unmapped_real_task_error(card_id)
     return card_id
 
 
