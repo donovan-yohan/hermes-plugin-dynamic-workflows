@@ -79,10 +79,12 @@ SCRIPT_SCHEMA_VERSION = 1
 # JSON-runtime FileRunStore guard). Minted ids are ``wfs_<hash8>_<uuid12>``.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
-# Durable kanban card *terminal* states (issue #5). Once a card reaches one of
-# these it is final: a non-terminal write (``waiting`` or ``blocked``) must never
+# Latest-state writes use this to prevent stale wait/block markers from landing after
+# a completed/failed resolution and making an already-finished card appear to
 # regress it (see ``record_kanban_card_state``).
 _KANBAN_TERMINAL_STATUSES = frozenset({"completed", "failed"})
+_KANBAN_ALIAS_STATUS = "alias"
+_KANBAN_NON_WAIT_STATUSES = _KANBAN_TERMINAL_STATUSES | {_KANBAN_ALIAS_STATUS}
 
 # Methods whose result is a deterministic constant regardless of any runner:
 # both ``log`` and ``phase`` are pure side-effect metadata and return ``None``.
@@ -625,7 +627,7 @@ class ScriptRunStore:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if isinstance(data, dict) and data.get("status") not in ("completed", "failed"):
+            if isinstance(data, dict) and data.get("status") not in _KANBAN_NON_WAIT_STATUSES:
                 waits.append(data)
         return waits
 

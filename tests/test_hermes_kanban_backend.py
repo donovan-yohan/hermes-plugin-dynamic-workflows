@@ -64,9 +64,10 @@ class _RecordingClient:
     exact invocation without spawning anything.
     """
 
-    def __init__(self, on_create=None) -> None:
+    def __init__(self, on_create=None, result=None) -> None:
         self.calls: list[dict] = []
         self._on_create = on_create
+        self._result = result
 
     def create(self, card_id, idempotency_key, spec):
         argv = build_create_argv(card_id, idempotency_key, spec)
@@ -76,7 +77,7 @@ class _RecordingClient:
         )
         if self._on_create is not None:
             self._on_create.set()
-        return {"card_id": card_id}
+        return self._result if self._result is not None else {"card_id": card_id}
 
 
 class _ObservedSubscription:
@@ -168,6 +169,7 @@ def test_build_create_argv_carries_every_field_and_the_result_contract():  # cri
     assert _val("--board") == "board-1"
     assert _val("--tenant") == "acme"
     assert "--title" not in argv
+    assert "--json" in argv
     # repeated parents present; unsupported labels become body metadata, not CLI flags.
     assert argv.count("--parent") == 2
     assert "root_card" in argv and "epic_card" in argv
@@ -284,19 +286,53 @@ def test_subprocess_timeout_is_wrapped_as_command_error(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", _timeout)
     client = SubprocessHermesKanbanClient(timeout=0.01)
-    spec = KanbanCardSpec(profile="planner", title="secret title", input={"secret": "payload"})
+    spec = KanbanCardSpec(
+        profile="planner",
+        title="secret title",
+        input={"secret": "payload"},
+        board="workflow-board",
+    )
     try:
         client.create("kbc_abc", "root:1", spec)
     except HermesKanbanCommandError as exc:
         assert exc.returncode == -1
+        assert str(exc) == "hermes kanban create exited -1"
         assert "timed out after 0.01s" in exc.stderr
         assert "slow stderr" in exc.stderr
         argv_text = " ".join(exc.argv)
         assert "secret title" not in argv_text
         assert "payload" not in argv_text
+        assert exc.argv[:5] == ["hermes", "kanban", "--board", "workflow-board", "create"]
+        assert exc.argv[5] == "<redacted-title>"
         assert "<redacted>" in exc.argv
         return
     raise AssertionError("expected HermesKanbanCommandError")
+
+
+def test_subprocess_create_requires_json_with_real_task_id(monkeypatch):
+    outputs = iter([
+        "",
+        "not json",
+        '{"card_id":"kbc_abc"}',
+        '{"task_id":"t_real789"}',
+    ])
+
+    def _run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=next(outputs), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    client = SubprocessHermesKanbanClient()
+    spec = KanbanCardSpec(profile="planner")
+
+    for expected in ("empty JSON output", "invalid JSON output", "did not include a real t_* task id"):
+        try:
+            client.create("kbc_abc", "root:1", spec)
+        except HermesKanbanCommandError as exc:
+            assert expected in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError(f"expected HermesKanbanCommandError containing {expected!r}")
+
+    assert client.create("kbc_abc", "root:1", spec) == {"task_id": "t_real789"}
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +405,118 @@ def test_reattach_when_durable_state_exists_creates_no_duplicate():  # criterion
         assert second.card_id == first.card_id
         assert second.reattached is True
         assert len(client.calls) == 1  # still exactly one real create.
+
+
+def test_real_task_id_from_create_result_is_persisted_without_extra_wait():
+    real_task_id = "t_real123"
+    client = _RecordingClient(result={"task_id": real_task_id})
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = _backend(store, client=client)
+        card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner"))
+
+        logical_state = store.load_kanban_card_state(card.card_id)
+        assert logical_state["real_task_id"] == real_task_id
+        alias_state = store.load_kanban_card_state(real_task_id)
+        assert alias_state["logical_card_id"] == card.card_id
+        # The alias is lookup metadata, not another in-flight workflow wait.
+        assert [w["card_id"] for w in store.kanban_waits()] == [card.card_id]
+
+
+def test_real_task_id_event_resolves_logical_workflow_card():
+    real_task_id = "t_real456"
+    client = _RecordingClient(result={"task": {"id": real_task_id}})
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        notifier = ThreadEventNotifier()
+        backend = _backend(store, notifier=notifier, client=client)
+        card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner"))
+
+        publish_hermes_kanban_event(
+            store, notifier, real_task_id, status="completed", result={"plan": "real"}, profile="planner"
+        )
+        res = backend.await_resolution(card.card_id, accept_blocked=True, timeout=0.5)
+        assert res.status == CARD_COMPLETED
+        assert res.card_id == card.card_id
+        assert res.result == {"plan": "real"}
+        assert store.read_kanban_events(real_task_id) == []
+        assert store.read_kanban_events(card.card_id)[0]["card_id"] == card.card_id
+
+
+def test_real_task_id_event_without_mapping_is_rejected_not_orphaned():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        notifier = ThreadEventNotifier()
+        try:
+            publish_hermes_kanban_event(store, notifier, "t_missing", status="completed")
+        except HermesKanbanError as exc:
+            assert "no logical workflow card mapping" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected HermesKanbanError for unmapped real task id")
+        assert store.read_kanban_events("t_missing") == []
+
+
+class _EventOnlyStore:
+    def __init__(self):
+        self.events = []
+
+    def append_kanban_event(self, card_id, *, status, result=None, reason=None, profile=""):
+        record = {
+            "seq": len(self.events) + 1,
+            "card_id": card_id,
+            "status": status,
+            "workflow_result": result,
+            "reason": reason,
+            "profile": profile,
+        }
+        self.events.append(record)
+        return record
+
+
+class _UnreadableAliasStore(_EventOnlyStore):
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def load_kanban_card_state(self, card_id):
+        raise self._exc
+
+
+def test_real_task_id_event_without_alias_lookup_is_rejected_not_orphaned():
+    for store in (_EventOnlyStore(), _UnreadableAliasStore(OSError("nope")), _UnreadableAliasStore(ValueError("bad json"))):
+        try:
+            publish_hermes_kanban_event(store, ThreadEventNotifier(), "t_real789", status="completed")
+        except HermesKanbanError as exc:
+            assert "no logical workflow card mapping" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected HermesKanbanError for unavailable real task alias lookup")
+        assert store.events == []
+
+
+def test_logical_event_without_alias_lookup_still_passes_through():
+    store = _EventOnlyStore()
+    record = publish_hermes_kanban_event(
+        store, ThreadEventNotifier(), "kbc_logical", status="completed", result={"plan": "ok"}
+    )
+    assert record["card_id"] == "kbc_logical"
+    assert store.events == [record]
+
+
+def test_reattach_repairs_missing_real_task_alias():
+    real_task_id = "t_repair1"
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        logical_card_id = kanban_card_id("root:1")
+        store.record_kanban_card_state(
+            logical_card_id,
+            {"card_id": logical_card_id, "status": "waiting", "profile": "planner", "version": 0,
+             "real_task_id": real_task_id},
+        )
+        backend = _backend(store, client=_RecordingClient())
+        card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner"))
+
+        assert card.reattached is True
+        assert store.load_kanban_card_state(real_task_id)["logical_card_id"] == logical_card_id
 
 
 def test_has_history_tolerates_store_without_event_reader():
