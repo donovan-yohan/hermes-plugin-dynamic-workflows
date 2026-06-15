@@ -46,6 +46,7 @@ This module is pure Python 3.11 stdlib.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkable
 
@@ -79,6 +80,7 @@ __all__ = [
     "build_card_body",
     "assert_no_dispatch",
     "map_hermes_terminal_status",
+    "resolve_hermes_kanban_event_card_id",
     "publish_hermes_kanban_event",
 ]
 
@@ -143,6 +145,9 @@ HERMES_TERMINAL_STATUS_MAP: dict[str, str] = {
     "abandoned": CARD_FAILED,
 }
 
+_REAL_TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9][A-Za-z0-9_.-]{0,125}$")
+_REAL_TASK_ALIAS_STATUS = "alias"
+
 
 def map_hermes_terminal_status(status: Any) -> Optional[str]:
     """Map a real Hermes Kanban terminal task status onto a resolution status.
@@ -154,6 +159,67 @@ def map_hermes_terminal_status(status: Any) -> Optional[str]:
     if not isinstance(status, str):
         return None
     return HERMES_TERMINAL_STATUS_MAP.get(status.strip().lower())
+
+
+def _extract_real_task_id(create_result: Any, logical_card_id: str) -> Optional[str]:
+    """Return the real Hermes ``t_*`` task id from a create result, if present.
+
+    Older/unit fake clients return ``{"card_id": <logical kbc_* id>}``; that must
+    not be treated as a real board id. The live CLI/API result is expected to
+    carry the real task id as ``task_id`` (or an adjacent id/card_id field), so be
+    liberal about the shape while only accepting actual Hermes ``t_*`` task ids.
+    """
+    if not isinstance(create_result, dict):
+        return None
+
+    def _candidate(value: Any) -> Optional[str]:
+        if (
+            isinstance(value, str)
+            and value != logical_card_id
+            and _REAL_TASK_ID_RE.fullmatch(value) is not None
+        ):
+            return value
+        return None
+
+    for key in ("task_id", "taskId", "id", "card_id"):
+        found = _candidate(create_result.get(key))
+        if found is not None:
+            return found
+    for key in ("task", "card", "result"):
+        nested = create_result.get(key)
+        if isinstance(nested, dict):
+            found = _extract_real_task_id(nested, logical_card_id)
+            if found is not None:
+                return found
+    return None
+
+
+def resolve_hermes_kanban_event_card_id(store: Any, card_id: str) -> str:
+    """Map a real Hermes ``t_*`` event id back to the logical workflow card id.
+
+    ``await kanban_agent`` waits on the deterministic ``kbc_*`` id. Live gateway
+    terminal events, however, arrive keyed by the real Kanban task id returned by
+    ``hermes kanban create --json``. ``HermesKanbanBackend.create_or_reattach``
+    records a durable alias under that real id; this helper follows it before the
+    event is appended/notified so a waiting parent wakes on the logical id.
+    """
+    load_state = getattr(store, "load_kanban_card_state", None)
+    if not callable(load_state):
+        return card_id
+    try:
+        state = load_state(card_id)
+    except (OSError, ValueError):
+        return card_id
+    if not isinstance(state, dict):
+        if _REAL_TASK_ID_RE.fullmatch(card_id) is not None:
+            raise HermesKanbanError(f"no logical workflow card mapping recorded for real task {card_id!r}")
+        return card_id
+    logical = state.get("logical_card_id")
+    if isinstance(logical, str) and logical:
+        return logical
+    if _REAL_TASK_ID_RE.fullmatch(card_id) is not None:
+        raise HermesKanbanError(f"no logical workflow card mapping recorded for real task {card_id!r}")
+    return card_id
 
 
 def publish_hermes_kanban_event(
@@ -187,8 +253,9 @@ def publish_hermes_kanban_event(
         raise HermesKanbanError(f"not a terminal Hermes Kanban status: {status!r}")
     if reason is None and canonical != str(status).strip().lower():
         reason = str(status).strip().lower()  # preserve the specific failure name.
+    logical_card_id = resolve_hermes_kanban_event_card_id(store, card_id)
     return publish_kanban_event(
-        store, notifier, card_id, status=canonical, result=result, reason=reason, profile=profile
+        store, notifier, logical_card_id, status=canonical, result=result, reason=reason, profile=profile
     )
 
 
@@ -330,9 +397,10 @@ def build_create_argv(
     Carries everything the current CLI accepts and nothing the adapter is not
     allowed to do: the global board option (when present), positional title,
     idempotency key (so concurrent parents/replays converge on one card),
-    assignee profile, tenant, parents, workspace, and the rendered body with the
-    result-contract instruction. Unsupported fields (labels/logical card id) are
-    not passed as fake flags.
+    assignee profile, tenant, parents, workspace, the rendered body with the
+    result-contract instruction, and ``--json`` so the real ``t_*`` task id
+    can be durably mapped back to the logical workflow card id. Unsupported
+    fields (labels/logical card id) are not passed as fake flags.
     """
     title = spec.title or f"Workflow Kanban card {card_id}"
     argv: list[str] = [hermes_bin, "kanban"]
@@ -352,7 +420,7 @@ def build_create_argv(
         argv += ["--parent", parent]
     if spec.workspace is not None:
         argv += ["--workspace", _workspace_arg(spec.workspace)]
-    argv += ["--body", build_card_body(spec, logical_card_id=card_id)]
+    argv += ["--body", build_card_body(spec, logical_card_id=card_id), "--json"]
     return argv
 
 
@@ -416,12 +484,21 @@ class SubprocessHermesKanbanClient:
             raise HermesKanbanCommandError(argv, proc.returncode, (proc.stderr or "")[-2000:])
         out = (proc.stdout or "").strip()
         if not out:
-            return {"card_id": card_id}
+            raise HermesKanbanCommandError(argv, 0, "empty JSON output from hermes kanban create --json")
         try:
             parsed = json.loads(out)
-        except json.JSONDecodeError:
-            return {"card_id": card_id, "raw": out[-2000:]}
-        return parsed if isinstance(parsed, dict) else {"card_id": card_id, "result": parsed}
+        except json.JSONDecodeError as exc:
+            detail = f"invalid JSON output from hermes kanban create --json: {exc}; stdout: {out[-2000:]}"
+            raise HermesKanbanCommandError(argv, 0, detail) from exc
+        if not isinstance(parsed, dict):
+            raise HermesKanbanCommandError(
+                argv, 0, f"expected JSON object from hermes kanban create --json, got {type(parsed).__name__}"
+            )
+        if _extract_real_task_id(parsed, card_id) is None:
+            raise HermesKanbanCommandError(
+                argv, 0, "JSON output from hermes kanban create --json did not include a real t_* task id"
+            )
+        return parsed
 
 
 # --------------------------------------------------------------------------- #
@@ -486,24 +563,67 @@ class HermesKanbanBackend:
         """
         return has_kanban_history(self._store, card_id)
 
+    def _load_card_state(self, card_id: str) -> Optional[dict[str, Any]]:
+        load_state = getattr(self._store, "load_kanban_card_state", None)
+        if not callable(load_state):
+            return None
+        try:
+            state = load_state(card_id)
+        except (OSError, ValueError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _record_real_task_alias(self, real_task_id: str, logical_card_id: str, profile: str) -> None:
+        self._store.record_kanban_card_state(
+            real_task_id,
+            {
+                "card_id": real_task_id,
+                "logical_card_id": logical_card_id,
+                "real_task_id": real_task_id,
+                "status": _REAL_TASK_ALIAS_STATUS,
+                "profile": profile,
+                "version": 0,
+            },
+        )
+
     def create_or_reattach(self, idempotency_key: str, spec: KanbanCardSpec) -> KanbanCard:
         self._check_profile(spec.profile)  # reject unknown assignee BEFORE any create.
         card_id = kanban_card_id(idempotency_key)
         if self._has_history(card_id):
             # Durable record exists (prior run / restart / replay): reattach, no
             # second create — preserves idempotency and the no-duplicate guarantee.
+            state = self._load_card_state(card_id)
+            real_task_id = state.get("real_task_id") if isinstance(state, dict) else None
+            if isinstance(real_task_id, str) and _REAL_TASK_ID_RE.fullmatch(real_task_id) is not None:
+                try:
+                    self._record_real_task_alias(real_task_id, card_id, spec.profile)
+                except (OSError, ValueError) as exc:
+                    raise HermesKanbanError(
+                        f"failed to repair real task mapping for {real_task_id!r} -> {card_id!r}"
+                    ) from exc
             return KanbanCard(
                 card_id=card_id, profile=spec.profile, reattached=True, created_at=utc_now_iso()
             )
         # First sight of this logical call: open the real card (one CLI invocation).
-        self._client.create(card_id, idempotency_key, spec)
+        create_result = self._client.create(card_id, idempotency_key, spec)
+        real_task_id = _extract_real_task_id(create_result, card_id)
+        state = {"card_id": card_id, "status": "waiting", "profile": spec.profile, "version": 0}
+        if real_task_id is not None:
+            state["real_task_id"] = real_task_id
         try:
-            self._store.record_kanban_card_state(
-                card_id,
-                {"card_id": card_id, "status": "waiting", "profile": spec.profile, "version": 0},
-            )
-        except OSError:  # the waiting marker is a best-effort operator view.
-            pass
+            self._store.record_kanban_card_state(card_id, state)
+        except OSError as exc:
+            if real_task_id is not None:
+                raise HermesKanbanError(
+                    f"failed to persist real task mapping for {real_task_id!r} -> {card_id!r}"
+                ) from exc
+        if real_task_id is not None:
+            try:
+                self._record_real_task_alias(real_task_id, card_id, spec.profile)
+            except (OSError, ValueError) as exc:
+                raise HermesKanbanError(
+                    f"failed to persist real task mapping for {real_task_id!r} -> {card_id!r}"
+                ) from exc
         return KanbanCard(
             card_id=card_id, profile=spec.profile, reattached=False, created_at=utc_now_iso()
         )
