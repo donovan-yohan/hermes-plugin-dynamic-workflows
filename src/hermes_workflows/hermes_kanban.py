@@ -60,7 +60,12 @@ from .kanban import (
     kanban_card_id,
     result_contract_instruction,
 )
-from .kanban_notify import EventLogKanbanBackend, KanbanEventNotifier, publish_kanban_event
+from .kanban_notify import (
+    EventLogKanbanBackend,
+    KanbanEventNotifier,
+    has_kanban_history,
+    publish_kanban_event,
+)
 from .registry import utc_now_iso
 
 __all__ = [
@@ -78,6 +83,21 @@ __all__ = [
 ]
 
 
+def _redact_command_argv(argv: list[str]) -> list[str]:
+    """Retain command shape for diagnostics without prompt/body payloads."""
+    redacted = [str(part) for part in argv]
+    if len(redacted) > 3 and redacted[1:3] == ["kanban", "create"]:
+        redacted[3] = "<redacted-title>"
+    for flag in ("--body",):
+        try:
+            idx = redacted.index(flag)
+        except ValueError:
+            continue
+        if idx + 1 < len(redacted):
+            redacted[idx + 1] = "<redacted>"
+    return redacted
+
+
 class HermesKanbanError(RuntimeError):
     """Base class for Hermes Kanban adapter failures."""
 
@@ -86,11 +106,11 @@ class HermesKanbanCommandError(HermesKanbanError):
     """A ``hermes kanban`` CLI invocation exited non-zero or returned bad output."""
 
     def __init__(self, argv: list[str], returncode: int, stderr: str) -> None:
-        self.argv = argv
+        self.argv = _redact_command_argv(argv)
         self.returncode = returncode
         self.stderr = stderr
-        # The argv carries no secrets (idempotency key, board, profile, card id),
-        # but the body/stderr might, so only the subcommand + code are surfaced.
+        # The original argv may carry prompt/context/input in the body, so only a
+        # redacted shape is retained and only the subcommand/code are surfaced.
         sub = argv[2] if len(argv) > 2 else "?"
         super().__init__(f"hermes kanban {sub} exited {returncode}")
 
@@ -183,6 +203,20 @@ def publish_hermes_kanban_event(
 _ALLOWED_SUBCOMMANDS = frozenset({"create", "comment"})
 
 
+def _workspace_arg(workspace: dict[str, Any]) -> str:
+    """Render the current ``hermes kanban create --workspace`` value.
+
+    The CLI accepts ``scratch``, ``dir:<path>``, ``worktree`` or
+    ``worktree:<path>`` — not the JSON object carried inside a
+    :class:`KanbanCardSpec`.
+    """
+    kind = str(workspace.get("type") or workspace.get("kind") or "scratch")
+    path = workspace.get("path")
+    if kind in {"dir", "worktree"} and isinstance(path, str) and path:
+        return f"{kind}:{path}"
+    return kind
+
+
 def assert_no_dispatch(argv: list[str]) -> None:
     """Guard: refuse any ``hermes kanban`` argv that is not a create/comment.
 
@@ -191,17 +225,18 @@ def assert_no_dispatch(argv: list[str]) -> None:
     :class:`HermesKanbanError` on a non-create/comment subcommand or a malformed
     argv.
     """
-    if not isinstance(argv, (list, tuple)) or "kanban" not in argv:
+    if not isinstance(argv, (list, tuple)) or len(argv) < 3:
         raise HermesKanbanError(f"not a 'hermes kanban' command: {argv!r}")
-    idx = argv.index("kanban")
-    sub = argv[idx + 1] if idx + 1 < len(argv) else None
+    if argv[1] != "kanban":
+        raise HermesKanbanError(f"not a 'hermes kanban' command: {argv!r}")
+    sub = argv[2]
     if sub not in _ALLOWED_SUBCOMMANDS:
         raise HermesKanbanError(
             f"refusing non-create kanban subcommand {sub!r}; the adapter never dispatches"
         )
 
 
-def build_card_body(spec: KanbanCardSpec) -> str:
+def build_card_body(spec: KanbanCardSpec, *, logical_card_id: Optional[str] = None) -> str:
     """Render the card body: the worker prompt, context, and result contract.
 
     The result-contract instruction (issue #6) is embedded here so a worker
@@ -216,6 +251,17 @@ def build_card_body(spec: KanbanCardSpec) -> str:
         parts.append("Context:\n" + json.dumps(spec.context, sort_keys=True, indent=2))
     if spec.task:
         parts.append("Task:\n" + json.dumps(spec.task, sort_keys=True, indent=2))
+    if spec.input:
+        parts.append("Input:\n" + json.dumps(spec.input, sort_keys=True, indent=2))
+    metadata: dict[str, Any] = {}
+    if logical_card_id:
+        metadata["logical_card_id"] = logical_card_id
+    if spec.board:
+        metadata["board"] = spec.board
+    if spec.labels:
+        metadata["labels"] = list(spec.labels)
+    if metadata:
+        parts.append("Kanban metadata:\n" + json.dumps(metadata, sort_keys=True, indent=2))
     instruction = result_contract_instruction(spec.schema)
     if instruction:
         parts.append(instruction)
@@ -231,37 +277,31 @@ def build_create_argv(
 ) -> list[str]:
     """Build the exact ``hermes kanban create`` argv for one new card.
 
-    Carries everything the real board needs and nothing the adapter is not
-    allowed to do: the idempotency key (so concurrent parents/replays converge on
-    one card), the content-addressed ``--card-id`` (stable across replays — the
-    real card adopts the same logical id the durable store keys on), the assignee
-    profile, board, tenant, parents, labels, workspace, title, and the rendered
-    body with the result-contract instruction.
+    Carries everything the current CLI accepts and nothing the adapter is not
+    allowed to do: the positional title, idempotency key (so concurrent
+    parents/replays converge on one card), assignee profile, tenant, parents,
+    workspace, and the rendered body with the result-contract instruction.
+    Unsupported fields (board/labels/logical card id) are not passed as fake
+    flags.
     """
+    title = spec.title or f"Workflow Kanban card {card_id}"
     argv: list[str] = [
         hermes_bin,
         "kanban",
         "create",
-        "--idempotency-key",
-        idempotency_key,
-        "--card-id",
-        card_id,
+        title,
         "--assignee",
         spec.profile,
+        "--idempotency-key",
+        idempotency_key,
     ]
-    if spec.board:
-        argv += ["--board", spec.board]
     if spec.tenant:
         argv += ["--tenant", spec.tenant]
-    if spec.title:
-        argv += ["--title", spec.title]
     for parent in spec.parents:
         argv += ["--parent", parent]
-    for label in spec.labels:
-        argv += ["--label", label]
     if spec.workspace is not None:
-        argv += ["--workspace", json.dumps(spec.workspace, sort_keys=True)]
-    argv += ["--body", build_card_body(spec)]
+        argv += ["--workspace", _workspace_arg(spec.workspace)]
+    argv += ["--body", build_card_body(spec, logical_card_id=card_id)]
     return argv
 
 
@@ -313,6 +353,12 @@ class SubprocessHermesKanbanClient:
                 env=self._env,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            detail = f"timed out after {exc.timeout}s"
+            if exc.stderr:
+                stderr = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", "replace")
+                detail = f"{detail}; stderr: {stderr[-2000:]}"
+            raise HermesKanbanCommandError(argv, -1, detail) from exc
         except OSError as exc:
             raise HermesKanbanCommandError(argv, -1, str(exc)) from exc
         if proc.returncode != 0:
@@ -387,15 +433,7 @@ class HermesKanbanBackend:
         best-effort — an IO error degrades to "no history" (re-create), which the
         real client's idempotency key still de-duplicates.
         """
-        try:
-            if self._store.read_kanban_events(card_id):
-                return True
-        except OSError:
-            pass
-        try:
-            return self._store.load_kanban_card_state(card_id) is not None
-        except OSError:
-            return False
+        return has_kanban_history(self._store, card_id)
 
     def create_or_reattach(self, idempotency_key: str, spec: KanbanCardSpec) -> KanbanCard:
         self._check_profile(spec.profile)  # reject unknown assignee BEFORE any create.

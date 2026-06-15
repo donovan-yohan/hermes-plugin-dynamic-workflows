@@ -676,14 +676,17 @@ re-implementing it:
   `kanban_card_id(idempotency_key)` (stable across replays), and — only when the
   durable store has *no* record of that card — opens a real card through the
   `HermesKanbanClient` seam. The default `SubprocessHermesKanbanClient` shells out
-  to **exactly one** `hermes kanban create` invocation carrying the idempotency
-  key, `--card-id`, assignee profile, board, tenant, parents, labels, workspace,
-  title, and a rendered body that includes the issue-#6 result-contract
-  instruction. This runs in the **parent/operator** process (it legitimately holds
-  Hermes credentials) — never the sandboxed workflow subprocess, preserving the
-  same trust boundary every other capability uses. A restart/replay that already
-  has a durable record **reattaches** with no second create, preserving
-  idempotency and the no-duplicate guarantee.
+  to **exactly one** current-contract `hermes kanban create` invocation: positional
+  title plus `--body`, `--assignee`, repeated `--parent`, `--workspace`, `--tenant`,
+  and `--idempotency-key`. Fields the CLI does not support as flags (board,
+  labels, and the logical card id) are not passed as fake options; they remain
+  visible in the rendered body together with the worker prompt, context,
+  task/input payloads, and the issue-#6 result-contract instruction. This runs in
+  the **parent/operator** process (it legitimately holds Hermes credentials) —
+  never the sandboxed workflow subprocess, preserving the same trust boundary every
+  other capability uses. A restart/replay that already has a durable record
+  **reattaches** with no second create, preserving idempotency and the no-duplicate
+  guarantee.
 
 * **resolve from real terminal events.** `await_resolution` delegates to a
   composed `EventLogKanbanBackend` (§5.7), so the await is event-driven from the

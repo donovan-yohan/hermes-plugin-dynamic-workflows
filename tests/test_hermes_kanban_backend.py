@@ -22,8 +22,8 @@ Acceptance criteria covered:
 
 from __future__ import annotations
 
+import subprocess
 import threading
-import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -31,7 +31,9 @@ from hermes_workflows import run_workflow_script
 from hermes_workflows.hermes_kanban import (
     HERMES_TERMINAL_STATUS_MAP,
     HermesKanbanBackend,
+    HermesKanbanCommandError,
     HermesKanbanError,
+    SubprocessHermesKanbanClient,
     assert_no_dispatch,
     build_card_body,
     build_create_argv,
@@ -62,8 +64,9 @@ class _RecordingClient:
     exact invocation without spawning anything.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_create=None) -> None:
         self.calls: list[dict] = []
+        self._on_create = on_create
 
     def create(self, card_id, idempotency_key, spec):
         argv = build_create_argv(card_id, idempotency_key, spec)
@@ -71,7 +74,34 @@ class _RecordingClient:
         self.calls.append(
             {"card_id": card_id, "idempotency_key": idempotency_key, "spec": spec, "argv": argv}
         )
+        if self._on_create is not None:
+            self._on_create.set()
         return {"card_id": card_id}
+
+
+class _ObservedSubscription:
+    def __init__(self, inner, entered) -> None:
+        self._inner = inner
+        self._entered = entered
+
+    def wait(self, timeout):
+        self._entered.set()
+        return self._inner.wait(timeout)
+
+    def close(self):
+        self._inner.close()
+
+
+class _ObservedNotifier:
+    def __init__(self) -> None:
+        self._inner = ThreadEventNotifier()
+        self.wait_entered = threading.Event()
+
+    def notify(self, card_id):
+        self._inner.notify(card_id)
+
+    def subscribe(self, card_id):
+        return _ObservedSubscription(self._inner.subscribe(card_id), self.wait_entered)
 
 
 def _backend(store, *, notifier=None, client=None, known=("planner",), unknown=frozenset()):
@@ -108,6 +138,8 @@ def test_build_create_argv_carries_every_field_and_the_result_contract():  # cri
         title="plan #9",
         prompt="produce a plan",
         context={"issue": "#9"},
+        task={"kind": "plan"},
+        input={"payload": {"n": 1}},
         board="board-1",
         tenant="acme",
         parents=("root_card", "epic_card"),
@@ -117,26 +149,32 @@ def test_build_create_argv_carries_every_field_and_the_result_contract():  # cri
     )
     argv = build_create_argv("kbc_abc", "root:1", spec)
 
-    assert argv[:3] == ["hermes", "kanban", "create"]
+    assert argv[:4] == ["hermes", "kanban", "create", "plan #9"]
 
     def _val(flag):
         return argv[argv.index(flag) + 1]
 
     assert _val("--idempotency-key") == "root:1"
-    assert _val("--card-id") == "kbc_abc"
+    assert "--card-id" not in argv
     assert _val("--assignee") == "planner"
-    assert _val("--board") == "board-1"
+    assert "--board" not in argv
     assert _val("--tenant") == "acme"
-    assert _val("--title") == "plan #9"
-    # repeated parents / labels both present.
+    assert "--title" not in argv
+    # repeated parents present; unsupported labels become body metadata, not CLI flags.
     assert argv.count("--parent") == 2
     assert "root_card" in argv and "epic_card" in argv
-    assert argv.count("--label") == 2
-    # workspace serialised as JSON.
-    assert '"path"' in _val("--workspace") and '"/repo"' in _val("--workspace")
-    # the body carries the worker prompt AND the issue #6 result-contract instruction.
+    assert "--label" not in argv
+    # workspace follows the real CLI shape.
+    assert _val("--workspace") == "dir:/repo"
+    # the body carries the worker prompt, task/input payloads, unsupported metadata,
+    # and the issue #6 result-contract instruction.
     body = _val("--body")
     assert "produce a plan" in body
+    assert '"kind": "plan"' in body
+    assert '"payload"' in body and '"n": 1' in body
+    assert '"board": "board-1"' in body
+    assert '"logical_card_id": "kbc_abc"' in body
+    assert '"labels"' in body and '"triage"' in body
     assert result_contract_instruction(spec.schema) in body
 
 
@@ -182,9 +220,17 @@ def test_assert_no_dispatch_refuses_dispatcher_subcommands():  # criterion 4
         except HermesKanbanError:
             continue
         raise AssertionError(f"expected refusal of 'hermes kanban {sub}'")
+    # argv-order bypass regression: a dispatch path with "kanban create" later in
+    # argv must still be rejected because the command is not exactly hermes kanban.
+    try:
+        assert_no_dispatch(["hermes", "dispatch", "kanban", "create"])
+    except HermesKanbanError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected refusal of reordered dispatch argv")
     # create / comment are allowed.
-    assert_no_dispatch(["hermes", "kanban", "create", "--card-id", "x"])
-    assert_no_dispatch(["hermes", "kanban", "comment", "--card-id", "x"])
+    assert_no_dispatch(["hermes", "kanban", "create", "title", "--body", "x"])
+    assert_no_dispatch(["hermes", "kanban", "comment", "kbc_x", "x"])
 
 
 def test_every_adapter_argv_is_a_create():  # criterion 4
@@ -198,6 +244,27 @@ def test_every_adapter_argv_is_a_create():  # criterion 4
         assert call["argv"][:3] == ["hermes", "kanban", "create"]
         for forbidden in ("dispatch", "daemon", "worker", "spawn", "serve"):
             assert forbidden not in call["argv"]
+
+
+def test_subprocess_timeout_is_wrapped_as_command_error(monkeypatch):
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=0.01, stderr="slow stderr")
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    client = SubprocessHermesKanbanClient(timeout=0.01)
+    spec = KanbanCardSpec(profile="planner", title="secret title", input={"secret": "payload"})
+    try:
+        client.create("kbc_abc", "root:1", spec)
+    except HermesKanbanCommandError as exc:
+        assert exc.returncode == -1
+        assert "timed out after 0.01s" in exc.stderr
+        assert "slow stderr" in exc.stderr
+        argv_text = " ".join(exc.argv)
+        assert "secret title" not in argv_text
+        assert "payload" not in argv_text
+        assert "<redacted>" in exc.argv
+        return
+    raise AssertionError("expected HermesKanbanCommandError")
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +328,24 @@ def test_reattach_when_durable_state_exists_creates_no_duplicate():  # criterion
         assert second.card_id == first.card_id
         assert second.reattached is True
         assert len(client.calls) == 1  # still exactly one real create.
+
+
+def test_has_history_tolerates_store_without_event_reader():
+    class _StateOnlyStore:
+        def __init__(self):
+            self.state = {kanban_card_id("root:1"): {"status": "waiting"}}
+
+        def load_kanban_card_state(self, card_id):
+            return self.state.get(card_id)
+
+        def record_kanban_card_state(self, card_id, state):
+            self.state[card_id] = state
+
+    client = _RecordingClient()
+    backend = _backend(_StateOnlyStore(), client=client, known=("planner",))
+    card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner"))
+    assert card.reattached is True
+    assert client.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -341,15 +426,15 @@ def test_after_version_skips_stale_and_waits_for_a_newer_event():  # criterion 8
 def test_await_is_woken_by_a_concurrent_producer():  # criterion 5 (event-driven)
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")
-        notifier = ThreadEventNotifier()
+        notifier = _ObservedNotifier()
         backend = _backend(store, notifier=notifier)
         card = backend.create_or_reattach("root:1", KanbanCardSpec(profile="planner"))
 
         def _produce():
-            time.sleep(0.1)
-            publish_hermes_kanban_event(
-                store, notifier, card.card_id, status="completed", result={"plan": "live"}
-            )
+            if notifier.wait_entered.wait(2.0):
+                publish_hermes_kanban_event(
+                    store, notifier, card.card_id, status="completed", result={"plan": "live"}
+                )
 
         worker = threading.Thread(target=_produce)
         worker.start()
@@ -413,7 +498,8 @@ def test_broker_unknown_profile_rejected_no_card():  # criterion 3
 
 _E2E_SCRIPT = META + (
     'r = await kanban_agent("planner", title="plan", prompt="go", '
-    'context={"issue": args["i"]}, board="b1", parents=["root_card"], on_block="return")\n'
+    'context={"issue": args["i"]}, input={"caller": args["i"]}, '
+    'board="b1", parents=["root_card"], on_block="return")\n'
     'return {"status": r["status"], "card_id": r["card_id"], "reattached": r["reattached"]}\n'
 )
 
@@ -425,17 +511,19 @@ _SCHEMA_SCRIPT = META + (
 
 
 def test_e2e_creates_one_real_card_and_completes():  # criterion 1/5
-    client = _RecordingClient()
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")
         notifier = ThreadEventNotifier()
         card_id = kanban_card_id("A:1")
 
+        created = threading.Event()
+        client = _RecordingClient(on_create=created)
+
         def _produce():
-            time.sleep(0.15)
-            publish_hermes_kanban_event(
-                store, notifier, card_id, status="completed", result={"plan": "x"}, profile="planner"
-            )
+            if created.wait(2.0):
+                publish_hermes_kanban_event(
+                    store, notifier, card_id, status="completed", result={"plan": "x"}, profile="planner"
+                )
 
         worker = threading.Thread(target=_produce)
         worker.start()
@@ -451,9 +539,13 @@ def test_e2e_creates_one_real_card_and_completes():  # criterion 1/5
         assert res.value["card_id"] == card_id
         assert res.value["reattached"] is False
         assert len(client.calls) == 1  # exactly one hermes kanban create.
-        # board + parent reached the real create argv.
+        # board, parent, and caller input reached the real create argv/body.
         argv = client.calls[0]["argv"]
-        assert "b1" in argv and "root_card" in argv
+        assert "root_card" in argv
+        body = argv[argv.index("--body") + 1]
+        assert '"board": "b1"' in body
+        assert '"caller": "#42"' in body
+        assert f'"logical_card_id": "{card_id}"' in body
 
 
 def test_e2e_replay_reattaches_without_a_duplicate_create():  # criterion 2
@@ -461,16 +553,17 @@ def test_e2e_replay_reattaches_without_a_duplicate_create():  # criterion 2
         store = ScriptRunStore(Path(tmp) / "runs")
         notifier = ThreadEventNotifier()
         card_id = kanban_card_id("A:1")
-        client_a = _RecordingClient()
+        created = threading.Event()
+        client_a = _RecordingClient(on_create=created)
         client_b = _RecordingClient()
 
-        # Produce the terminal event concurrently DURING A's await, so A genuinely
-        # creates the card first (history is empty at create time) and then resolves.
+        # Produce the terminal event after A creates the card, so A genuinely
+        # creates first (history is empty at create time) and then resolves.
         def _produce():
-            time.sleep(0.15)
-            publish_hermes_kanban_event(
-                store, notifier, card_id, status="completed", result={"plan": "x"}, profile="planner"
-            )
+            if created.wait(2.0):
+                publish_hermes_kanban_event(
+                    store, notifier, card_id, status="completed", result={"plan": "x"}, profile="planner"
+                )
 
         worker = threading.Thread(target=_produce)
         worker.start()
@@ -504,18 +597,21 @@ def test_e2e_failed_event_resolves_failed_through_the_vm():  # criterion 7
         notifier = ThreadEventNotifier()
         card_id = kanban_card_id("A:1")
 
+        created = threading.Event()
+        client = _RecordingClient(on_create=created)
+
         def _produce():
-            time.sleep(0.1)
-            publish_hermes_kanban_event(
-                store, notifier, card_id, status="timed_out", profile="planner"
-            )
+            if created.wait(2.0):
+                publish_hermes_kanban_event(
+                    store, notifier, card_id, status="timed_out", profile="planner"
+                )
 
         worker = threading.Thread(target=_produce)
         worker.start()
         try:
             res = run_workflow_script(
                 _E2E_SCRIPT, args={"i": "#1"}, store=store, run_id="A",
-                kanban_backend=_backend(store, notifier=notifier),
+                kanban_backend=_backend(store, notifier=notifier, client=client),
             )
         finally:
             worker.join()
@@ -529,20 +625,23 @@ def test_e2e_invalid_workflow_result_fails_the_contract():  # criterion 9
         notifier = ThreadEventNotifier()
         card_id = kanban_card_id("A:1")
 
+        created = threading.Event()
+        client = _RecordingClient(on_create=created)
+
         def _produce():
-            time.sleep(0.1)
-            # Completed but with a workflow_result that violates schema={"plan":"string"}:
-            # 'plan' is missing entirely.
-            publish_hermes_kanban_event(
-                store, notifier, card_id, status="completed", result={"wrong": 1}, profile="planner"
-            )
+            if created.wait(2.0):
+                # Completed but with a workflow_result that violates schema={"plan":"string"}:
+                # 'plan' is missing entirely.
+                publish_hermes_kanban_event(
+                    store, notifier, card_id, status="completed", result={"wrong": 1}, profile="planner"
+                )
 
         worker = threading.Thread(target=_produce)
         worker.start()
         try:
             res = run_workflow_script(
                 _SCHEMA_SCRIPT, args={"i": 1}, store=store, run_id="A",
-                kanban_backend=_backend(store, notifier=notifier),
+                kanban_backend=_backend(store, notifier=notifier, client=client),
             )
         finally:
             worker.join()

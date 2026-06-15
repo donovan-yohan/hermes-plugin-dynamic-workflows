@@ -291,6 +291,30 @@ def publish_kanban_event(
     return record
 
 
+def has_kanban_history(store: Any, card_id: str) -> bool:
+    """Best-effort check for any durable state/event history for ``card_id``.
+
+    Custom stores may implement only the latest-state index or only the event log.
+    Prefer the latest-state lookup because it is cheap for ``ScriptRunStore``;
+    fall back to reading events only when no state marker is present.
+    """
+    load_state = getattr(store, "load_kanban_card_state", None)
+    if callable(load_state):
+        try:
+            if load_state(card_id) is not None:
+                return True
+        except OSError:
+            pass
+
+    read_events = getattr(store, "read_kanban_events", None)
+    if not callable(read_events):
+        return False
+    try:
+        return bool(read_events(card_id))
+    except OSError:
+        return False
+
+
 class EventLogKanbanBackend:
     """A :class:`~hermes_workflows.kanban.KanbanBackend` resolving a card from the
     durable event log, woken event-driven by a :class:`KanbanEventNotifier`.
@@ -343,15 +367,7 @@ class EventLogKanbanBackend:
         )
 
     def _has_history(self, card_id: str) -> bool:
-        try:
-            if self._store.read_kanban_events(card_id):
-                return True
-        except OSError:
-            pass
-        try:
-            return self._store.load_kanban_card_state(card_id) is not None
-        except OSError:
-            return False
+        return has_kanban_history(self._store, card_id)
 
     def await_resolution(
         self,
