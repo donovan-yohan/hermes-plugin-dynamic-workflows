@@ -49,6 +49,7 @@ def workflow(
     validate: bool = True,
     max_parallel: int = 8,
     include_steps: bool = True,
+    session_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
 
@@ -57,6 +58,7 @@ def workflow(
     only a ``run_id``. The narrower primitives remain available for tests and
     operator/debug usage.
     """
+    store = registry if registry is not None else get_default_store(session_id=session_id)
     op = action or (
         "validate" if dry_run else "run_template" if template_name else "status" if definition is None and run_id else "run"
     )
@@ -68,7 +70,7 @@ def workflow(
     if op == "status":
         if not run_id:
             raise ValueError("workflow status requires 'run_id'")
-        status = workflow_status(run_id, registry=registry, include_steps=include_steps)
+        status = workflow_status(run_id, registry=store, include_steps=include_steps)
         return {"operation": "status", "status": status.as_dict()}
     if op == "run":
         if definition is None:
@@ -76,7 +78,7 @@ def workflow(
         handle, status = _run_and_status(
             definition,
             inputs=inputs,
-            registry=registry,
+            registry=store,
             agent_runner=agent_runner,
             validate=validate,
             max_parallel=max_parallel,
@@ -95,7 +97,7 @@ def workflow(
         handle, status = _run_and_status(
             loaded,
             inputs=inputs,
-            registry=registry,
+            registry=store,
             agent_runner=agent_runner,
             validate=validate,
             max_parallel=max_parallel,
@@ -210,6 +212,7 @@ def workflow_run(
     validate: bool = True,
     max_parallel: int = 8,
     run_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> RunHandle:
     """Execute a workflow definition in the deterministic sandboxed runtime.
 
@@ -227,12 +230,13 @@ def workflow_run(
         validate: Validate before running (default ``True``).
         max_parallel: Logical fan-out bound for ``parallel`` steps.
         run_id: Optional caller-supplied id for idempotency/testing.
+        session_id: Optional Hermes session id for store scoping.
 
     Returns:
         A :class:`RunHandle` describing the (already-completed in the skeleton)
         run. Query progress/result later via :func:`workflow_status`.
     """
-    store = registry if registry is not None else get_default_store()
+    store = registry if registry is not None else get_default_store(session_id=session_id)
     runner = agent_runner if agent_runner is not None else StubAgentRunner()
 
     # Validate first (non-strict so benign warnings do not block execution).
@@ -263,6 +267,7 @@ def workflow_run(
         agent_runner=runner,
         inputs=dict(inputs or {}),
         max_parallel=_effective_max_parallel(normalized, max_parallel),
+        workflow_id=rid,
     )
 
     try:
@@ -346,6 +351,7 @@ def workflow_status(
     *,
     registry: Optional[RunStore] = None,
     include_steps: bool = True,
+    session_id: Optional[str] = None,
 ) -> RunStatus:
     """Query the state/progress of a run by id.
 
@@ -357,11 +363,12 @@ def workflow_status(
         run_id: The run id to look up.
         registry: Run store; defaults to the process-global in-memory store.
         include_steps: Include the per-step status list (default ``True``).
+        session_id: Optional Hermes session id for store scoping.
 
     Returns:
         A :class:`~hermes_workflows.models.RunStatus` snapshot.
     """
-    store = registry if registry is not None else get_default_store()
+    store = registry if registry is not None else get_default_store(session_id=session_id)
     record = store.get(run_id)
     if record is None:
         return RunStatus(

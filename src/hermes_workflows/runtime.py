@@ -45,6 +45,9 @@ class RunContext:
         max_parallel: Logical fan-out bound for ``parallel`` steps.
         outputs: Map of ``step_id -> output dict`` for ``$ref:<id>.output``.
         last_output: Output of the most recently completed step (pipeline feed).
+        workflow_id: Optional workflow id surfaced in subagent metadata.
+        phase_id: Optional phase id inherited by steps inside a ``phase``.
+        phase_title: Optional phase title inherited by steps inside a ``phase``.
     """
 
     run_id: str
@@ -54,6 +57,27 @@ class RunContext:
     max_parallel: int = 8
     outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_output: Optional[dict[str, Any]] = None
+    workflow_id: Optional[str] = None
+    phase_id: Optional[str] = None
+    phase_title: Optional[str] = None
+
+
+def _step_metadata(step: dict[str, Any], ctx: RunContext, *, phase_id: Optional[str] = None, phase_title: Optional[str] = None) -> dict[str, Any]:
+    """Build native workflow metadata fields for a step status record."""
+    meta: dict[str, Any] = {
+        "workflow_id": ctx.workflow_id,
+        "workflow_node_id": step.get("id"),
+    }
+    effective_phase_id = phase_id or step.get("phase_id") or ctx.phase_id
+    effective_phase_title = phase_title or step.get("phase_title") or ctx.phase_title
+    if effective_phase_id:
+        meta["workflow_phase_id"] = effective_phase_id
+    if effective_phase_title:
+        meta["workflow_phase_title"] = effective_phase_title
+    task_title = step.get("title") or step.get("task_title") or step.get("id")
+    if task_title:
+        meta["workflow_task_title"] = task_title
+    return meta
 
 
 def execute(steps: list[dict[str, Any]], ctx: RunContext) -> dict[str, Any]:
@@ -165,6 +189,7 @@ def _exec_effect_step(
         status="running",
         agent=agent_id,
         started_at=utc_now_iso(),
+        **_step_metadata(step, ctx),
     )
     ctx.store.update_step(ctx.run_id, status)
 
@@ -206,7 +231,17 @@ def _exec_parallel(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
             f"parallel step {step_id!r} fan-out {len(branches)} exceeds max_parallel={ctx.max_parallel}"
         )
 
-    status = StepStatus(step_id=step_id, kind="parallel", status="running", started_at=utc_now_iso())
+    status = StepStatus(
+        step_id=step_id,
+        kind="parallel",
+        status="running",
+        started_at=utc_now_iso(),
+        workflow_id=ctx.workflow_id,
+        workflow_node_id=step_id,
+        workflow_phase_id=ctx.phase_id,
+        workflow_phase_title=ctx.phase_title,
+        workflow_task_title=step_id,
+    )
     ctx.store.update_step(ctx.run_id, status)
 
     joined: dict[str, Any] = {}
@@ -236,7 +271,17 @@ def _exec_parallel(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
 def _exec_pipeline(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute a ``pipeline`` step: chain inner steps, output feeds next."""
     step_id = step["id"]
-    status = StepStatus(step_id=step_id, kind="pipeline", status="running", started_at=utc_now_iso())
+    status = StepStatus(
+        step_id=step_id,
+        kind="pipeline",
+        status="running",
+        started_at=utc_now_iso(),
+        workflow_id=ctx.workflow_id,
+        workflow_node_id=step_id,
+        workflow_phase_id=ctx.phase_id,
+        workflow_phase_title=ctx.phase_title,
+        workflow_task_title=step_id,
+    )
     ctx.store.update_step(ctx.run_id, status)
 
     try:
@@ -258,6 +303,7 @@ def _exec_pipeline(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     return result
 
 
+
 def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute a ``phase`` step: a barrier; all inner steps complete first.
 
@@ -266,11 +312,32 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     distinctly so callers can see the barrier in the step list.
     """
     step_id = step["id"]
-    status = StepStatus(step_id=step_id, kind="phase", status="running", started_at=utc_now_iso())
+    phase_id = step.get("phase_id") or step_id
+    phase_title = step.get("phase_title") or step.get("label")
+    status = StepStatus(
+        step_id=step_id,
+        kind="phase",
+        status="running",
+        started_at=utc_now_iso(),
+        **_step_metadata(step, ctx, phase_id=phase_id, phase_title=phase_title),
+    )
     ctx.store.update_step(ctx.run_id, status)
 
+    child_ctx = RunContext(
+        run_id=ctx.run_id,
+        store=ctx.store,
+        agent_runner=ctx.agent_runner,
+        inputs=ctx.inputs,
+        max_parallel=ctx.max_parallel,
+        outputs=ctx.outputs,
+        last_output=ctx.last_output,
+        workflow_id=ctx.workflow_id,
+        phase_id=phase_id,
+        phase_title=phase_title,
+    )
+
     try:
-        _exec_sequence(step["steps"], ctx)
+        _exec_sequence(step["steps"], child_ctx)
     except Exception as exc:
         status.status = "failed"
         status.ended_at = utc_now_iso()
@@ -286,13 +353,23 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
 
     ctx.outputs[step_id] = result
     ctx.last_output = result
+    ctx.phase_id = child_ctx.phase_id
+    ctx.phase_title = child_ctx.phase_title
     return result
-
-
 def _exec_if(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute a deterministic conditional step without leaking branch-local ids."""
     step_id = step["id"]
-    status = StepStatus(step_id=step_id, kind="if", status="running", started_at=utc_now_iso())
+    status = StepStatus(
+        step_id=step_id,
+        kind="if",
+        status="running",
+        started_at=utc_now_iso(),
+        workflow_id=ctx.workflow_id,
+        workflow_node_id=step_id,
+        workflow_phase_id=ctx.phase_id,
+        workflow_phase_title=ctx.phase_title,
+        workflow_task_title=step_id,
+    )
     ctx.store.update_step(ctx.run_id, status)
 
     try:
@@ -324,8 +401,6 @@ def _exec_if(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     ctx.outputs[step_id] = result
     ctx.last_output = result
     return result
-
-
 def _eval_condition(condition: dict[str, Any], ctx: RunContext) -> bool:
     """Evaluate the tiny declarative condition grammar."""
     op = condition.get("op")

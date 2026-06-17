@@ -187,7 +187,22 @@ def _validate_steps(
                 continue
             if kind == "phase" and "label" in step and not isinstance(step["label"], str):
                 diags.append(_e(err.E_SCHEMA_STEP, "phase 'label' must be a string", f"{ptr}/label"))
+            if kind == "phase" and "phase_id" in step and not isinstance(step["phase_id"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "phase 'phase_id' must be a string", f"{ptr}/phase_id"))
+            if kind == "phase" and "phase_title" in step and not isinstance(step["phase_title"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "phase 'phase_title' must be a string", f"{ptr}/phase_title"))
             _validate_steps(children, f"{ptr}/{child_key}", diags, seen_ids)
+
+        if kind in _EFFECT_STEP_KINDS:
+            if "title" in step and not isinstance(step["title"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "'title' must be a string", f"{ptr}/title"))
+            if "task_title" in step and not isinstance(step["task_title"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "'task_title' must be a string", f"{ptr}/task_title"))
+            if "phase_id" in step and not isinstance(step["phase_id"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "'phase_id' must be a string", f"{ptr}/phase_id"))
+            if "phase_title" in step and not isinstance(step["phase_title"], str):
+                diags.append(_e(err.E_SCHEMA_STEP, "'phase_title' must be a string", f"{ptr}/phase_title"))
+            _validate_effect_input_contract(step, ptr, diags)
 
 
 def _validate_agent_step(step: dict[str, Any], ptr: str, diags: list[Diagnostic]) -> None:
