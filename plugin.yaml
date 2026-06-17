@@ -6,7 +6,8 @@ description: >-
   saved catalog/run_template operations, and debug/operator primitives with
   agent/kanban_agent/if/parallel/pipeline/phase composition,
   schema-validated structured output, parent-owned journaled run persistence,
-  and a default-deny sandbox policy.
+  optional session-scoped run stores, native workflow metadata on dispatched
+  agents for TUI/Desktop phase grouping, and a default-deny sandbox policy.
 author: Hermes
 license: MIT
 provides_tools:

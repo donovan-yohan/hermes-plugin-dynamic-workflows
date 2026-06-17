@@ -12,7 +12,7 @@ import os
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Project-local plugin loading does not necessarily install the src-layout
 # package first. Make a checkout usable as a Hermes plugin directory.
@@ -60,16 +60,30 @@ def _error(exc: Exception) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _plugin_store() -> FileRunStore:
+def _plugin_store(session_id: Optional[str] = None) -> FileRunStore:
     root = os.getenv("HERMES_WORKFLOWS_STATE_DIR")
     if not root:
         hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
         root = str(hermes_home / "dynamic-workflows" / "runs")
-    return FileRunStore(root)
+    return FileRunStore(root, session_id=session_id)
 
 
 def _plugin_catalog() -> FileWorkflowCatalog:
     return FileWorkflowCatalog()
+
+
+def _session_id_from_kwargs(kwargs: dict[str, Any]) -> Optional[str]:
+    """Extract a Hermes session id from dispatched kwargs when available."""
+    parent_agent = kwargs.get("parent_agent")
+    if parent_agent is None:
+        return None
+    session_id = getattr(parent_agent, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    gateway_key = getattr(parent_agent, "_gateway_session_key", None)
+    if isinstance(gateway_key, str) and gateway_key:
+        return gateway_key
+    return None
 
 
 WORKFLOW_SCHEMA = {
@@ -216,9 +230,10 @@ WORKFLOW_STATUS_SCHEMA = {
 }
 
 
-def _handle_workflow(params: dict[str, Any], **_: Any) -> str:
+def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
     try:
-        store = _plugin_store()
+        session_id = _session_id_from_kwargs(kwargs)
+        store = _plugin_store(session_id=session_id)
         result = _workflow(
             action=params.get("action"),
             definition=params.get("definition"),
@@ -231,6 +246,7 @@ def _handle_workflow(params: dict[str, Any], **_: Any) -> str:
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),
+            session_id=session_id,
         )
         if params.get("include_journal") and params.get("run_id"):
             result["journal"] = store.journal(params["run_id"], limit=params.get("journal_limit", 100))
@@ -244,27 +260,17 @@ def _handle_workflow(params: dict[str, Any], **_: Any) -> str:
         return _error(exc)
 
 
-def _handle_validate(params: dict[str, Any], **_: Any) -> str:
+def _handle_run(params: dict[str, Any], **kwargs: Any) -> str:
     try:
-        result = _workflow_validate(
-            params["definition"],
-            source_path=params.get("source_path"),
-            strict=params.get("strict", True),
-        )
-        return _ok(result)
-    except Exception as exc:  # pragma: no cover - defensive boundary
-        return _error(exc)
-
-
-def _handle_run(params: dict[str, Any], **_: Any) -> str:
-    try:
+        session_id = _session_id_from_kwargs(kwargs)
         handle = _workflow_run(
             params["definition"],
             inputs=params.get("inputs"),
-            registry=_plugin_store(),
+            registry=_plugin_store(session_id=session_id),
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             run_id=params.get("run_id"),
+            session_id=session_id,
         )
         return _ok(handle)
     except WorkflowError as exc:
@@ -273,14 +279,28 @@ def _handle_run(params: dict[str, Any], **_: Any) -> str:
         return _error(exc)
 
 
-def _handle_status(params: dict[str, Any], **_: Any) -> str:
+def _handle_status(params: dict[str, Any], **kwargs: Any) -> str:
     try:
+        session_id = _session_id_from_kwargs(kwargs)
         status = _workflow_status(
             params["run_id"],
-            registry=_plugin_store(),
+            registry=_plugin_store(session_id=session_id),
             include_steps=params.get("include_steps", True),
+            session_id=session_id,
         )
         return _ok(status)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return _error(exc)
+
+
+def _handle_validate(params: dict[str, Any], **_: Any) -> str:
+    try:
+        result = _workflow_validate(
+            params["definition"],
+            source_path=params.get("source_path"),
+            strict=params.get("strict", True),
+        )
+        return _ok(result)
     except Exception as exc:  # pragma: no cover - defensive boundary
         return _error(exc)
 

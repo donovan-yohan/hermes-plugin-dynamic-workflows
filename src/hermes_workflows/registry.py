@@ -69,6 +69,15 @@ def _require_safe_run_id(run_id: str) -> None:
         raise ValueError(f"unsafe run_id: {run_id!r}")
 
 
+def _require_safe_session_id(session_id: Optional[str]) -> Optional[str]:
+    """Return a normalized session id or None; reject unsafe values."""
+    if session_id is None:
+        return None
+    if not isinstance(session_id, str) or not _RUN_ID_RE.fullmatch(session_id):
+        raise ValueError(f"unsafe session_id: {session_id!r}")
+    return session_id
+
+
 def _apply_status(
     rec: "RunRecord",
     status: RunState,
@@ -138,8 +147,18 @@ class RunRecord:
         completed = sum(1 for s in self.steps if s.status == "succeeded")
         failed = sum(1 for s in self.steps if s.status == "failed")
         running = sum(1 for s in self.steps if s.status == "running")
-        pct = round(100.0 * (completed + failed) / total, 2) if total else 0.0
-        return Progress(total=total, completed=completed, failed=failed, running=running, pct=pct)
+        queued = sum(1 for s in self.steps if s.status == "queued")
+        cancelled = sum(1 for s in self.steps if s.status == "cancelled")
+        pct = round(100.0 * (completed + failed + cancelled) / total, 2) if total else 0.0
+        return Progress(
+            total=total,
+            completed=completed,
+            failed=failed,
+            running=running,
+            queued=queued,
+            cancelled=cancelled,
+            pct=pct,
+        )
 
 
 @runtime_checkable
@@ -180,9 +199,14 @@ class InMemoryRunStore:
 
     All mutating operations take a single ``Lock``. Run ids follow the
     ``wf_<def_hash8>_<uuid4hex12>`` scheme documented in the module docstring.
+
+    When ``session_id`` is supplied the store is scoped to that session: runs
+    created in one session are invisible to other sessions. This mirrors the
+    native ``dynamic_workflow`` session-scoping behavior.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: Optional[str] = None) -> None:
+        self._session_id = _require_safe_session_id(session_id)
         self._lock = threading.Lock()
         self._records: dict[str, RunRecord] = {}
 
@@ -241,8 +265,12 @@ class FileRunStore:
     spam.
     """
 
-    def __init__(self, root: str | Path) -> None:
-        self.root = Path(root).expanduser().resolve()
+    def __init__(self, root: str | Path, session_id: Optional[str] = None) -> None:
+        self._session_id = _require_safe_session_id(session_id)
+        base = Path(root).expanduser().resolve()
+        if self._session_id:
+            base = base / self._session_id
+        self.root = base
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._records: dict[str, RunRecord] = {}
@@ -419,6 +447,21 @@ class KanbanRunStore:
 # Process-global default store used when a primitive is called without an
 # explicit ``registry=``. Tests that need isolation should pass their own.
 _DEFAULT_STORE = InMemoryRunStore()
+_DEFAULT_SESSION_STORES: dict[str, InMemoryRunStore] = {}
+
+
+def get_default_store(session_id: Optional[str] = None) -> InMemoryRunStore:
+    """Return the process-global default :class:`InMemoryRunStore`.
+
+    When ``session_id`` is provided, returns a cached session-scoped store so
+    runs from one Hermes session do not leak into another and multiple calls in
+    the same session see the same records.
+    """
+    if not session_id:
+        return _DEFAULT_STORE
+    if session_id not in _DEFAULT_SESSION_STORES:
+        _DEFAULT_SESSION_STORES[session_id] = InMemoryRunStore(session_id=session_id)
+    return _DEFAULT_SESSION_STORES[session_id]
 
 
 def _record_to_dict(record: RunRecord) -> dict[str, Any]:
@@ -428,7 +471,26 @@ def _record_to_dict(record: RunRecord) -> dict[str, Any]:
 
 def _record_from_dict(data: dict[str, Any]) -> RunRecord:
     """Restore a :class:`RunRecord` from ``snapshot.json``."""
-    steps = [StepStatus(**step) for step in data.get("steps", [])]
+    steps = []
+    for step in data.get("steps", []):
+        # Back-compat: older snapshots did not write workflow metadata fields.
+        steps.append(
+            StepStatus(
+                step_id=step["step_id"],
+                kind=step.get("kind", "agent"),
+                status=step.get("status", "queued"),
+                agent=step.get("agent"),
+                started_at=step.get("started_at"),
+                ended_at=step.get("ended_at"),
+                output=step.get("output"),
+                error=step.get("error"),
+                workflow_id=step.get("workflow_id"),
+                workflow_node_id=step.get("workflow_node_id"),
+                workflow_phase_id=step.get("workflow_phase_id"),
+                workflow_phase_title=step.get("workflow_phase_title"),
+                workflow_task_title=step.get("workflow_task_title"),
+            )
+        )
     return RunRecord(
         run_id=data["run_id"],
         def_hash=data["def_hash"],
@@ -439,8 +501,3 @@ def _record_from_dict(data: dict[str, Any]) -> RunRecord:
         result=data.get("result"),
         error=data.get("error"),
     )
-
-
-def get_default_store() -> InMemoryRunStore:
-    """Return the process-global default :class:`InMemoryRunStore`."""
-    return _DEFAULT_STORE

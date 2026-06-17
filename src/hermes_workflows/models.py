@@ -118,6 +118,8 @@ class Progress:
     completed: int = 0
     failed: int = 0
     running: int = 0
+    queued: int = 0
+    cancelled: int = 0
     pct: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -138,6 +140,11 @@ class StepStatus:
         ended_at: ISO-8601 UTC end timestamp, or ``None`` if not finished.
         output: Structured agent output (schema-validated), or ``None``.
         error: Structured error info, or ``None``.
+        workflow_id: Optional run id; maps to native ``workflowId`` in UIs.
+        workflow_node_id: Optional step id for native workflow grouping.
+        workflow_phase_id: Optional phase id for native workflow grouping.
+        workflow_phase_title: Optional human-readable phase label.
+        workflow_task_title: Optional human-readable task label.
     """
 
     step_id: str
@@ -148,6 +155,11 @@ class StepStatus:
     ended_at: Optional[str] = None
     output: Optional[dict[str, Any]] = None
     error: Optional[dict[str, Any]] = None
+    workflow_id: Optional[str] = None
+    workflow_node_id: Optional[str] = None
+    workflow_phase_id: Optional[str] = None
+    workflow_phase_title: Optional[str] = None
+    workflow_task_title: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a plain ``dict`` representation."""
