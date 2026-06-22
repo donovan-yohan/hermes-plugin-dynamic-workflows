@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -76,9 +77,10 @@ SIDE_EFFECT_CLASSES: tuple[str, ...] = (
 )
 
 # Credential-shaped keys that must never appear in a grant request, handle, or
-# audit blob. This is the line that separates a scoped grant from raw token /
-# browser-cookie reuse: the authority lives in the scope+expiry, never in a
-# smuggled secret. Membership is checked case-insensitively.
+# audit blob. Credential-looking string values are also rejected/redacted for
+# common bearer/cookie/token shapes. This is the line that separates a scoped
+# grant from raw token / browser-cookie reuse: the authority lives in the
+# scope+expiry, never in a smuggled secret.
 _FORBIDDEN_CRED_KEYS: frozenset[str] = frozenset(
     {
         "authorization",
@@ -382,8 +384,10 @@ class StaticPolicyGrantBroker:
         if isinstance(allowed_scope, str):
             raise GrantError("allowed_scope must be an iterable of strings, not a single string")
         self.allowed_scope = frozenset(allowed_scope)
-        if max_ttl_seconds <= 0:
-            raise GrantError("StaticPolicyGrantBroker requires positive max_ttl_seconds")
+        if isinstance(max_ttl_seconds, bool) or not isinstance(max_ttl_seconds, (int, float)):
+            raise GrantError("StaticPolicyGrantBroker requires finite numeric max_ttl_seconds")
+        if float(max_ttl_seconds) <= 0 or not math.isfinite(float(max_ttl_seconds)):
+            raise GrantError("StaticPolicyGrantBroker requires positive finite max_ttl_seconds")
         self.max_ttl_seconds = float(max_ttl_seconds)
         if isinstance(allowed_side_effect_classes, str):
             raise GrantError("allowed_side_effect_classes must be an iterable of strings, not a single string")
@@ -433,10 +437,10 @@ class StaticPolicyGrantBroker:
             backend=self.backend,
             handle=handle,
             audit={
+                **dict(request.audit),
                 "requested_by": request.requested_by,
                 "reason": request.reason,
                 "policy_max_ttl_seconds": self.max_ttl_seconds,
-                **dict(request.audit),
             },
         )
         return GrantDecision(True, "granted", "issued by static policy", grant)
@@ -484,7 +488,7 @@ def request_grant(
     if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
         raise GrantError("grant request 'ttl_seconds' must be a positive number")
     ttl = float(ttl_seconds)
-    if ttl != ttl or ttl <= 0 or ttl == float("inf"):
+    if ttl <= 0 or not math.isfinite(ttl):
         raise GrantError("grant request 'ttl_seconds' must be a positive, finite number")
     audit_blob = dict(audit or {})
     offender = find_raw_credential(audit_blob)
@@ -568,6 +572,8 @@ def validate_grant(
         return GrantValidation(False, "revoked", f"grant status is {parsed.status!r}", parsed)
 
     clock = float(now) if now is not None else time.time()
+    if not math.isfinite(clock):
+        return GrantValidation(False, "malformed", "validation clock must be finite", parsed)
     if clock >= parsed.expires_at_epoch:
         return GrantValidation(False, "expired", f"grant expired at {parsed.expires_at}", parsed)
     if action is not None and action not in parsed.scope:
@@ -581,7 +587,7 @@ def validate_grant(
 
 
 def find_raw_credential(payload: Any) -> Optional[str]:
-    """Return the first credential-shaped key found in ``payload``, else ``None``.
+    """Return the first credential-shaped key/value marker in ``payload``.
 
     Recurses through nested dicts/lists. This is the guard that keeps scoped
     grants from degrading into raw token or browser-cookie reuse.
@@ -600,6 +606,8 @@ def find_raw_credential(payload: Any) -> Optional[str]:
             found = find_raw_credential(item)
             if found is not None:
                 return found
+    if isinstance(payload, str) and _looks_like_credential_value(payload):
+        return "credential_value"
     return None
 
 
@@ -620,6 +628,8 @@ def redact_credentials(payload: Any) -> Any:
         return out
     if isinstance(payload, (list, tuple)):
         return [redact_credentials(item) for item in payload]
+    if isinstance(payload, str) and _looks_like_credential_value(payload):
+        return REDACTED
     return payload
 
 
@@ -636,6 +646,10 @@ def _audit_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) ->
     offender = find_raw_credential(grant.to_dict())
     if offender is not None:
         return GrantDecision(False, "malformed", f"issued grant carries a raw credential ({offender!r})")
+    if grant.subject != request.subject:
+        return GrantDecision(False, "denied_subject", "issued grant subject does not match request")
+    if grant.request_id != request.request_id:
+        return GrantDecision(False, "denied_request_id", "issued grant request_id does not match request")
     extra = sorted(set(grant.scope) - set(request.scope))
     if extra:
         return GrantDecision(
@@ -650,6 +664,8 @@ def _audit_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) ->
             "issued grant side_effect_class does not match request",
         )
     ttl = grant.expires_at_epoch - grant.issued_at_epoch
+    if not math.isfinite(grant.issued_at_epoch) or not math.isfinite(grant.expires_at_epoch) or not math.isfinite(ttl):
+        return GrantDecision(False, "malformed", "issued grant timestamps must be finite")
     if ttl <= 0:
         return GrantDecision(False, "denied_ttl", "issued grant is already expired")
     if ttl > request.ttl_seconds:
@@ -664,6 +680,29 @@ def _is_credential_key(key: str) -> bool:
     if lowered in _FORBIDDEN_CRED_KEYS:
         return True
     return any(part in lowered for part in _FORBIDDEN_CRED_SUBSTRINGS)
+
+
+def _looks_like_credential_value(value: str) -> bool:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if lowered.startswith(("bearer ", "basic ")):
+        return True
+    if "session=" in lowered or "cookie=" in lowered or "set-cookie:" in lowered:
+        return True
+    token_prefixes = (
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+    )
+    return any(lowered.startswith(prefix) for prefix in token_prefixes)
 
 
 def _normalize_scope(scope: Any) -> tuple[str, ...]:
@@ -701,7 +740,10 @@ def _opt_str(value: Any, label: str) -> Optional[str]:
 def _require_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise GrantError(f"grant {label!r} must be a number")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise GrantError(f"grant {label!r} must be finite")
+    return number
 
 
 def _safe_grant_id(grant_id: str) -> str:

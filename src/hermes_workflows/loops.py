@@ -711,22 +711,17 @@ def _validate_request_identity(request: dict[str, Any], label: str) -> None:
 
 
 def _redact_grant_envelopes(action: dict[str, Any]) -> dict[str, Any]:
-    """Mask credential-shaped values inside grant envelopes before journaling.
+    """Mask credential-shaped values before journaling grant-bearing actions.
 
-    Only the ``grant_request`` / ``grant`` sub-objects are touched, so legitimate
-    ``wait`` / ``approval_request`` identity tokens are left intact. The
-    controller still inspects the *original* action to fail closed on a smuggled
-    secret; this only governs what is persisted into run state and events.
+    For grant-bearing actuator results, redact the whole action so top-level
+    smuggling attempts cannot leak before the grant handler rejects them. Plain
+    wait/approval actions without a grant envelope are left intact because their
+    identity tokens are product data rather than grant authority.
     """
 
     if "grant_request" not in action and "grant" not in action:
         return action
-    redacted = dict(action)
-    for key in ("grant_request", "grant"):
-        if key in action:
-            value = action[key]
-            redacted[key] = redact_credentials(value) if isinstance(value, dict) else REDACTED
-    return redacted
+    return redact_credentials(action)
 
 
 def _handle_actuator_grant(
@@ -775,6 +770,10 @@ def _handle_actuator_grant(
         return denied("malformed", "actuator result cannot combine grant_request and grant")
     if suspension is not None:
         return denied("malformed", "grant envelope cannot combine with wait/approval suspension")
+    credential_scan = {key: value for key, value in action.items() if key not in ("wait", "approval_request")}
+    offender = find_raw_credential(credential_scan)
+    if offender is not None:
+        return denied("malformed", f"actuator grant envelope must not carry a raw credential ({offender!r})")
 
     if has_request:
         envelope = action["grant_request"]
@@ -843,14 +842,16 @@ def _grant_audit(
     spec: dict[str, Any],
     iteration: int,
 ) -> dict[str, Any]:
-    audit: dict[str, Any] = {
+    reserved = {
         "run_id": status.run_id,
         "def_hash": status.def_hash,
         "loop_name": spec.get("name"),
         "iteration": iteration,
     }
+    audit: dict[str, Any] = {}
     if isinstance(envelope_audit, dict):
-        audit.update(envelope_audit)
+        audit.update({key: value for key, value in envelope_audit.items() if key not in reserved})
+    audit.update(reserved)
     return audit
 
 
