@@ -21,11 +21,14 @@ adapter responsibilities behind the injected actuator/sensor callables.
 
 from __future__ import annotations
 
+import copy
+import json
 import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from . import schema as _schema
 from .errors import WorkflowValidationError
@@ -33,10 +36,15 @@ from .models import Diagnostic, ValidationResult
 
 __all__ = [
     "LoopState",
+    "LoopEvent",
     "LoopSensorResult",
     "LoopRunStatus",
     "SensorCallable",
     "ActuatorCallable",
+    "LoopEventSink",
+    "LoopRunStore",
+    "InMemoryLoopRunStore",
+    "FileLoopRunStore",
     "loop_validate",
     "loop_run",
 ]
@@ -56,6 +64,8 @@ LoopState = Literal[
     "halted_sensor_error",
     "halted_actuator_error",
 ]
+
+LoopEvent = dict[str, Any]
 
 
 @dataclass
@@ -121,6 +131,62 @@ class ActuatorCallable(Protocol):
         ...
 
 
+@runtime_checkable
+class LoopEventSink(Protocol):
+    """Live loop lifecycle event sink, e.g. ATH/gateway notifier adapter."""
+
+    def __call__(self, event: LoopEvent, status: LoopRunStatus) -> None:
+        ...
+
+
+@runtime_checkable
+class LoopRunStore(Protocol):
+    """Persistence boundary for inspectable loop-controller run state."""
+
+    def save_status(self, status: LoopRunStatus) -> None:
+        ...
+
+    def get_status(self, run_id: str) -> Optional[dict[str, Any]]:
+        ...
+
+
+class InMemoryLoopRunStore:
+    """Small in-process loop status store for tests and embedders."""
+
+    def __init__(self) -> None:
+        self._runs: dict[str, dict[str, Any]] = {}
+
+    def save_status(self, status: LoopRunStatus) -> None:
+        self._runs[status.run_id] = copy.deepcopy(status.as_dict())
+
+    def get_status(self, run_id: str) -> Optional[dict[str, Any]]:
+        snapshot = self._runs.get(run_id)
+        return None if snapshot is None else copy.deepcopy(snapshot)
+
+
+class FileLoopRunStore:
+    """Filesystem loop status store: ``<root>/<run_id>/snapshot.json`` + events journal."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    def save_status(self, status: LoopRunStatus) -> None:
+        run_dir = self.root / _safe_run_id(status.run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = status.as_dict()
+        tmp = run_dir / "snapshot.json.tmp"
+        tmp.write_text(json.dumps(snapshot, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(run_dir / "snapshot.json")
+        events = "".join(json.dumps(event, sort_keys=True) + "\n" for event in snapshot["events"])
+        (run_dir / "events.jsonl").write_text(events, encoding="utf-8")
+
+    def get_status(self, run_id: str) -> Optional[dict[str, Any]]:
+        path = self.root / _safe_run_id(run_id) / "snapshot.json"
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
 def loop_validate(spec: dict[str, Any] | str) -> ValidationResult:
     """Validate a loop-controller spec without running sensors or actuators.
 
@@ -150,6 +216,8 @@ def loop_run(
     actuator: Optional[ActuatorCallable] = None,
     inputs: Optional[dict[str, Any]] = None,
     run_id: Optional[str] = None,
+    store: Optional[LoopRunStore] = None,
+    on_event: Optional[LoopEventSink] = None,
 ) -> LoopRunStatus:
     """Run a bounded feedback-controller loop synchronously.
 
@@ -180,8 +248,12 @@ def loop_run(
         created_at=now,
         updated_at=now,
         def_hash=validation.def_hash,
-        events=[_event("planned", "planned", 0, "loop planned")],
+        events=[],
     )
+    _record_event(status, normalized, store, on_event, "planned", "planned", 0, "loop planned")
+
+    def halt(state: LoopState, reason: str) -> None:
+        _halt(status, normalized, store, on_event, state, reason)
 
     started = time.monotonic()
     last_signal: Optional[str] = None
@@ -191,13 +263,13 @@ def loop_run(
 
     while True:
         if _time_exceeded(started, brakes):
-            _halt(status, "halted_time_cap", "max_wall_seconds exceeded before sensing")
+            halt("halted_time_cap", "max_wall_seconds exceeded before sensing")
             break
 
         status.iterations += 1
         iteration = status.iterations
         status.state = "sensing"
-        status.events.append(_event("sensing", "sensing", iteration, "sensor started"))
+        _record_event(status, normalized, store, on_event, "sensing", "sensing", iteration, "sensor started")
         sensor_result = _read_sensor_with_noise_retry(
             sensor,
             context=_context(
@@ -211,34 +283,37 @@ def loop_run(
                 total_cost=total_cost,
             ),
             max_retries=int(brakes["max_sensor_retries"]),
-            status=status,
-            iteration=iteration,
+            record_event=lambda kind, state, item_iteration, summary, **extra: _record_event(
+                status, normalized, store, on_event, kind, state, item_iteration, summary, **extra
+            ),
         )
         if isinstance(sensor_result, Exception):
-            _halt(status, "halted_sensor_error", str(sensor_result))
+            halt("halted_sensor_error", str(sensor_result))
             break
 
         status.sensor_results.append(sensor_result)
-        status.events.append(
-            _event(
-                "sensor_result",
-                "verifying",
-                iteration,
-                sensor_result.summary,
-                signal_key=sensor_result.signal_key,
-                converged=sensor_result.converged,
-            )
+        _record_event(
+            status,
+            normalized,
+            store,
+            on_event,
+            "sensor_result",
+            "verifying",
+            iteration,
+            sensor_result.summary,
+            signal_key=sensor_result.signal_key,
+            converged=sensor_result.converged,
         )
 
         if _time_exceeded(started, brakes):
-            _halt(status, "halted_time_cap", "max_wall_seconds exceeded during sensing")
+            halt("halted_time_cap", "max_wall_seconds exceeded during sensing")
             break
 
         if sensor_result.converged:
             status.state = "converged"
             status.halted_reason = None
             status.report = _report(status, "converged_by_sensor")
-            status.events.append(_event("converged", "converged", iteration, sensor_result.summary))
+            _record_event(status, normalized, store, on_event, "converged", "converged", iteration, sensor_result.summary)
             break
 
         if sensor_result.signal_key == last_signal:
@@ -248,27 +323,26 @@ def loop_run(
             repeated_signal_count = 1
 
         if iteration > 1 and repeated_signal_count >= int(brakes["max_repeated_signal"]):
-            _halt(
-                status,
+            halt(
                 "halted_stalled",
                 f"sensor signal {sensor_result.signal_key!r} repeated {repeated_signal_count} times",
             )
             break
 
         if actuator is None:
-            _halt(status, "halted_actuator_error", "non-converged loop has no actuator")
+            halt("halted_actuator_error", "non-converged loop has no actuator")
             break
 
         if action_count >= max_actions:
-            _halt(status, "halted_step_cap", f"max_steps {max_actions} exhausted without convergence")
+            halt("halted_step_cap", f"max_steps {max_actions} exhausted without convergence")
             break
 
         if _time_exceeded(started, brakes):
-            _halt(status, "halted_time_cap", "max_wall_seconds exceeded before acting")
+            halt("halted_time_cap", "max_wall_seconds exceeded before acting")
             break
 
         status.state = "acting"
-        status.events.append(_event("acting", "acting", iteration, "actuator started"))
+        _record_event(status, normalized, store, on_event, "acting", "acting", iteration, "actuator started")
         try:
             action = actuator(
                 _context(
@@ -286,25 +360,26 @@ def loop_run(
                 raise TypeError(f"actuator returned {type(action).__name__}, expected dict")
             action_cost = _action_cost(action)
         except Exception as exc:  # pragma: no cover - exact exception type is caller-owned
-            _halt(status, "halted_actuator_error", f"{type(exc).__name__}: {exc}")
+            halt("halted_actuator_error", f"{type(exc).__name__}: {exc}")
             break
 
         action_count += 1
         status.actuator_results.append(action)
-        status.events.append(_event("actuator_result", "verifying", iteration, "actuator completed", result=action))
+        _record_event(status, normalized, store, on_event, "actuator_result", "verifying", iteration, "actuator completed", result=action)
 
         if _time_exceeded(started, brakes):
-            _halt(status, "halted_time_cap", "max_wall_seconds exceeded during acting")
+            halt("halted_time_cap", "max_wall_seconds exceeded during acting")
             break
 
         total_cost += action_cost
         if brakes.get("max_cost") is not None and total_cost > float(brakes["max_cost"]):
-            _halt(status, "halted_budget_cap", f"cost {total_cost} exceeded max_cost {brakes['max_cost']}")
+            halt("halted_budget_cap", f"cost {total_cost} exceeded max_cost {brakes['max_cost']}")
             break
 
     status.updated_at = _utc_now_iso()
     if not status.report:
         status.report = _report(status, "not_converged")
+    _persist_status(store, status)
     return status
 
 
@@ -402,8 +477,7 @@ def _read_sensor_with_noise_retry(
     *,
     context: dict[str, Any],
     max_retries: int,
-    status: LoopRunStatus,
-    iteration: int,
+    record_event: Callable[..., LoopEvent],
 ) -> LoopSensorResult | Exception:
     attempts = 0
     while True:
@@ -418,15 +492,13 @@ def _read_sensor_with_noise_retry(
                 f"sensor still marked retryable_noise after {attempts} retries: {result.summary}"
             )
         attempts += 1
-        status.events.append(
-            _event(
-                "sensor_noise_retry",
-                "sensing",
-                iteration,
-                result.summary,
-                signal_key=result.signal_key,
-                attempt=attempts,
-            )
+        record_event(
+            "sensor_noise_retry",
+            "sensing",
+            context.get("iteration", 0),
+            result.summary,
+            signal_key=result.signal_key,
+            attempt=attempts,
         )
 
 
@@ -548,10 +620,17 @@ def _action_cost(action: dict[str, Any]) -> float:
     return cost
 
 
-def _halt(status: LoopRunStatus, state: LoopState, reason: str) -> None:
+def _halt(
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    store: Optional[LoopRunStore],
+    on_event: Optional[LoopEventSink],
+    state: LoopState,
+    reason: str,
+) -> None:
     status.state = state
     status.halted_reason = reason
-    status.events.append(_event("halted", state, status.iterations, reason))
+    _record_event(status, spec, store, on_event, "halted", state, status.iterations, reason)
 
 
 def _report(status: LoopRunStatus, convergence_risk: str) -> dict[str, Any]:
@@ -566,6 +645,34 @@ def _report(status: LoopRunStatus, convergence_risk: str) -> dict[str, Any]:
     }
 
 
+def _record_event(
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    store: Optional[LoopRunStore],
+    on_event: Optional[LoopEventSink],
+    kind: str,
+    state: LoopState,
+    iteration: int,
+    summary: str,
+    **extra: Any,
+) -> LoopEvent:
+    event = _event(kind, state, iteration, summary, **extra)
+    event["run_id"] = status.run_id
+    event["def_hash"] = status.def_hash
+    event["loop_name"] = spec.get("name")
+    event["event_index"] = len(status.events)
+    status.events.append(event)
+    _persist_status(store, status)
+    if on_event is not None:
+        on_event(copy.deepcopy(event), status)
+    return event
+
+
+def _persist_status(store: Optional[LoopRunStore], status: LoopRunStatus) -> None:
+    if store is not None:
+        store.save_status(status)
+
+
 def _event(kind: str, state: LoopState, iteration: int, summary: str, **extra: Any) -> dict[str, Any]:
     payload = {
         "kind": kind,
@@ -576,6 +683,12 @@ def _event(kind: str, state: LoopState, iteration: int, summary: str, **extra: A
     }
     payload.update(extra)
     return payload
+
+
+def _safe_run_id(run_id: str) -> str:
+    if not run_id or not isinstance(run_id, str) or not _identifier_safe(run_id):
+        raise ValueError("loop run_id must be identifier-safe")
+    return run_id
 
 
 def _identifier_safe(value: str) -> bool:

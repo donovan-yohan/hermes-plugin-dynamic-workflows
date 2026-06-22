@@ -1,9 +1,11 @@
 """Tests for the feedback-controller loop runtime (issue #31 slice)."""
 
+import json
+import tempfile
 import time
 
 from hermes_workflows.errors import WorkflowValidationError
-from hermes_workflows.loops import LoopSensorResult, loop_run, loop_validate
+from hermes_workflows.loops import FileLoopRunStore, InMemoryLoopRunStore, LoopSensorResult, loop_run, loop_validate
 
 
 def loop_spec(**brake_overrides):
@@ -93,6 +95,91 @@ def test_loop_run_acts_on_failed_sensor_then_converges_on_next_signal():
     assert calls == {"sensor": 2, "actuator": 1}
     assert status.report["convergence_risk"] == "converged_by_sensor"
     assert status.sensor_results[-1].evidence[0]["status"] == "passed"
+
+
+def test_loop_run_emits_live_events_with_run_identity():
+    events = []
+
+    def sensor(context):
+        if context["iteration"] == 1:
+            return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "patched code"}
+
+    def on_event(event, status):
+        assert status.run_id == "loop.events.1"
+        events.append(event)
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, run_id="loop.events.1", on_event=on_event)
+
+    assert status.state == "converged"
+    assert [event["kind"] for event in events] == [
+        "planned",
+        "sensing",
+        "sensor_result",
+        "acting",
+        "actuator_result",
+        "sensing",
+        "sensor_result",
+        "converged",
+    ]
+    assert [event["event_index"] for event in events] == list(range(len(events)))
+    assert {event["run_id"] for event in events} == {"loop.events.1"}
+    assert {event["loop_name"] for event in events} == {"ticket_loop"}
+    assert all(event["def_hash"] == status.def_hash for event in events)
+
+
+def test_loop_run_persists_inspectable_status_in_memory_store():
+    store = InMemoryLoopRunStore()
+    calls = {"sensor": 0}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] == 1:
+            return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        stored = store.get_status("loop.store.1")
+        assert stored is not None
+        assert stored["state"] == "acting"
+        assert stored["events"][-1]["kind"] == "acting"
+        return {"summary": "patched", "artifacts": ["src/example.py"]}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, run_id="loop.store.1", store=store)
+    stored = store.get_status("loop.store.1")
+
+    assert stored is not None
+    assert stored["state"] == "converged"
+    assert stored["report"]["convergence_risk"] == "converged_by_sensor"
+    assert stored["sensor_results"][-1]["signal_key"] == "done"
+    assert stored["actuator_results"][0]["artifacts"] == ["src/example.py"]
+    stored["state"] = "mutated"
+    fresh = store.get_status("loop.store.1")
+    assert fresh is not None
+    assert fresh["state"] == "converged"
+    assert status.as_dict() == fresh
+
+
+def test_file_loop_run_store_writes_snapshot_and_event_journal():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = FileLoopRunStore(tmp)
+
+        def sensor(context):
+            return {"converged": True, "signal_key": "green", "summary": "green"}
+
+        status = loop_run(loop_spec(), sensor=sensor, run_id="loop.file.1", store=store)
+        stored = store.get_status("loop.file.1")
+
+        assert stored == status.as_dict()
+        with open(f"{tmp}/loop.file.1/snapshot.json", encoding="utf-8") as handle:
+            assert json.load(handle)["state"] == "converged"
+        with open(f"{tmp}/loop.file.1/events.jsonl", encoding="utf-8") as handle:
+            events = [json.loads(line) for line in handle]
+        assert [event["kind"] for event in events] == ["planned", "sensing", "sensor_result", "converged"]
+        assert all(event["run_id"] == "loop.file.1" for event in events)
 
 
 def test_loop_run_retries_retryable_noise_once_before_acting():

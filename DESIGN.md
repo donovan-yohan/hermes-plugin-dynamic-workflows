@@ -222,6 +222,17 @@ remaining budget so adapters can enforce cooperative internal timeouts. This kee
 Dynamic Workflows' product primitive generic while still making Relay/ATH handoffs
 possible through adapter configuration and run inputs.
 
+Persistence and visibility are generic boundaries, not ATH-specific code paths.
+`LoopRunStore.save_status(status)` is called at each lifecycle event and at final
+report update; `InMemoryLoopRunStore` and `FileLoopRunStore` are the bundled
+embeddable stores. The file store writes a full `snapshot.json` and an `events.jsonl`
+journal under `<root>/<run_id>/` so external tooling can inspect the latest state
+without importing Python objects. `loop_run(..., on_event=...)` is the live event
+observer seam for ATH, gateways, CLIs, notebooks, or dashboards. Event payloads
+include run id, loop name, definition hash, event index, controller state,
+iteration, summary, and event-specific evidence/handles. The controller still owns
+state transitions; adapters own delivery, redaction, retries, and auth.
+
 ### 1.6 The sandboxed runtime (skeleton)
 
 The runtime in `runtime.py` is a **deterministic AST interpreter**, not a

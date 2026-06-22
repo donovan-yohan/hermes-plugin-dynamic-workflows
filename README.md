@@ -324,7 +324,7 @@ must halt. The controller never trusts an implementation worker saying "done";
 only the sensor can converge the run.
 
 ```python
-from hermes_workflows import loop_run
+from hermes_workflows import FileLoopRunStore, loop_run
 
 spec = {
     "version": "1",
@@ -351,8 +351,11 @@ def actuator(ctx):
     # Adapter-owned: could call Relay, Kanban, delegate_task, process, etc.
     return {"summary": "patched implementation", "artifacts": ["src/example.py"]}
 
-status = loop_run(spec, sensor=sensor, actuator=actuator)
+events = []
+store = FileLoopRunStore(".workflow-runs/loops")
+status = loop_run(spec, sensor=sensor, actuator=actuator, store=store, on_event=lambda event, status: events.append(event))
 print(status.state, status.report["convergence_risk"])  # converged converged_by_sensor
+print(store.get_status(status.run_id)["state"])  # converged
 ```
 
 The generic checked-in example lives at `examples/issue_controller.loop.json`.
@@ -366,6 +369,15 @@ kinds like `relay_*` or `github_*`. Actuator contexts include a small handoff
 contract (`prompt`, expected artifact/session/check handles, optional numeric
 `cost`) so Relay, Kanban, ATH, or local process adapters can execute one bounded
 step and return evidence without becoming the workflow abstraction.
+
+`loop_run(..., store=...)` persists each lifecycle transition through the generic
+`LoopRunStore` protocol. `InMemoryLoopRunStore` is useful for embedders/tests;
+`FileLoopRunStore` writes `<root>/<run_id>/snapshot.json` plus `events.jsonl` so
+loop status, sensor output, actuator output, reports, and events remain
+inspectable after the function returns. `loop_run(..., on_event=...)` is the live
+observer hook for ATH, gateway, CLI, notebook, or UI adapters; every event carries
+`run_id`, loop name, definition hash, event index, state, iteration, and a
+reply-safe summary.
 
 ## Saved workflow catalog
 
