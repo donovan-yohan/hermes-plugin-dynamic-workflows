@@ -367,8 +367,12 @@ sensor/actuator calls, and the context exposes `limits.remaining_wall_seconds` /
 Repo/tool specifics are intentionally inputs or adapter config, not new primitive
 kinds like `relay_*` or `github_*`. Actuator contexts include a small handoff
 contract (`prompt`, expected artifact/session/check handles, optional numeric
-`cost`) so Relay, Kanban, ATH, or local process adapters can execute one bounded
-step and return evidence without becoming the workflow abstraction.
+`cost`, optional `wait`, and optional `approval_request`) so Relay, Kanban, ATH,
+or local process adapters can execute one bounded step and return evidence without
+becoming the workflow abstraction. An actuator can return `wait: {"token": "..."}`
+to suspend the run in `waiting_for_event`, or `approval_request: {"id": "..."}` to
+suspend in `waiting_for_approval`; the controller records the request and stops
+until a future adapter/resume slice advances it.
 
 `loop_run(..., store=...)` persists each lifecycle transition through the generic
 `LoopRunStore` protocol. `InMemoryLoopRunStore` is useful for embedders/tests;

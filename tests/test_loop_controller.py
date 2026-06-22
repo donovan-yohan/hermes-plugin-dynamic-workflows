@@ -338,6 +338,70 @@ def test_loop_run_allows_final_verification_to_converge_after_last_action():
     assert calls == {"sensor": 2, "actuator": 1}
 
 
+def test_loop_run_suspends_when_actuator_requests_event_wait():
+    store = InMemoryLoopRunStore()
+    events = []
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "waiting-ci", "summary": "waiting on ci"}
+
+    def actuator(context):
+        return {
+            "summary": "started external check",
+            "handles": [{"kind": "check", "id": "ci-123"}],
+            "wait": {"kind": "github_check", "token": "ci-123", "summary": "waiting for GitHub check"},
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, store=store, on_event=lambda event, status: events.append(event))
+    stored = store.get_status(status.run_id)
+
+    assert status.state == "waiting_for_event"
+    assert status.halted_reason is None
+    assert status.report["convergence_risk"] == "waiting_for_event"
+    assert status.events[-1]["kind"] == "waiting_for_event"
+    assert status.events[-1]["request"]["token"] == "ci-123"
+    assert stored is not None
+    assert stored["state"] == "waiting_for_event"
+    assert events[-1]["kind"] == "waiting_for_event"
+
+
+def test_loop_run_suspends_when_actuator_requests_approval():
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-human", "summary": "needs approval"}
+
+    def actuator(context):
+        return {
+            "summary": "approval required",
+            "approval_request": {
+                "id": "merge-gate",
+                "summary": "approve merge",
+                "choices": ["approve", "deny"],
+            },
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator)
+
+    assert status.state == "waiting_for_approval"
+    assert status.halted_reason is None
+    assert status.report["convergence_risk"] == "waiting_for_approval"
+    assert status.events[-1]["kind"] == "waiting_for_approval"
+    assert status.events[-1]["request"]["id"] == "merge-gate"
+
+
+def test_loop_run_halts_on_malformed_suspension_request():
+    def sensor(context):
+        return {"converged": False, "signal_key": "bad-wait", "summary": "bad wait"}
+
+    def actuator(context):
+        return {"summary": "bad wait", "wait": {}}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator)
+
+    assert status.state == "halted_actuator_error"
+    assert status.halted_reason is not None
+    assert "wait requires non-empty id, token, or kind" in status.halted_reason
+
+
 def test_loop_run_enforces_budget_cap_from_actuator_cost():
     def sensor(context):
         return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}

@@ -359,6 +359,7 @@ def loop_run(
             if not isinstance(action, dict):
                 raise TypeError(f"actuator returned {type(action).__name__}, expected dict")
             action_cost = _action_cost(action)
+            suspension = _actuator_suspension(action)
         except Exception as exc:  # pragma: no cover - exact exception type is caller-owned
             halt("halted_actuator_error", f"{type(exc).__name__}: {exc}")
             break
@@ -374,6 +375,24 @@ def loop_run(
         total_cost += action_cost
         if brakes.get("max_cost") is not None and total_cost > float(brakes["max_cost"]):
             halt("halted_budget_cap", f"cost {total_cost} exceeded max_cost {brakes['max_cost']}")
+            break
+
+        if suspension is not None:
+            state, convergence_risk, request = suspension
+            status.state = state
+            status.halted_reason = None
+            status.report = _report(status, convergence_risk)
+            _record_event(
+                status,
+                normalized,
+                store,
+                on_event,
+                state,
+                state,
+                iteration,
+                str(request.get("summary") or action.get("summary") or state),
+                request=request,
+            )
             break
 
     status.updated_at = _utc_now_iso()
@@ -585,6 +604,8 @@ def _context(
             "expected_return": {
                 "artifacts": "list of changed files, PR/check/session handles, or other evidence",
                 "cost": "optional non-negative numeric cost for budget brakes",
+                "wait": "optional {id|token|kind, summary?, ...} to suspend in waiting_for_event",
+                "approval_request": "optional {id|token|kind, summary?, choices?, ...} to suspend in waiting_for_approval",
                 "summary": "bounded action summary; success still requires a later sensor result",
             },
         },
@@ -618,6 +639,30 @@ def _action_cost(action: dict[str, Any]) -> float:
     if not math.isfinite(cost) or cost < 0:
         raise ValueError("actuator cost must be a non-negative number")
     return cost
+
+
+def _actuator_suspension(action: dict[str, Any]) -> Optional[tuple[LoopState, str, dict[str, Any]]]:
+    wait = action.get("wait")
+    approval = action.get("approval_request")
+    if wait is not None and approval is not None:
+        raise ValueError("actuator result cannot request both wait and approval")
+    if wait is not None:
+        if not isinstance(wait, dict):
+            raise ValueError("actuator wait must be an object")
+        _validate_request_identity(wait, "wait")
+        return "waiting_for_event", "waiting_for_event", copy.deepcopy(wait)
+    if approval is not None:
+        if not isinstance(approval, dict):
+            raise ValueError("actuator approval_request must be an object")
+        _validate_request_identity(approval, "approval_request")
+        return "waiting_for_approval", "waiting_for_approval", copy.deepcopy(approval)
+    return None
+
+
+def _validate_request_identity(request: dict[str, Any], label: str) -> None:
+    ident = request.get("id") or request.get("token") or request.get("kind")
+    if not isinstance(ident, str) or not ident:
+        raise ValueError(f"actuator {label} requires non-empty id, token, or kind")
 
 
 def _halt(
