@@ -97,6 +97,13 @@ def test_request_grant_rejects_non_positive_ttl():
         good_request(ttl_seconds=0)
 
 
+def test_request_grant_rejects_malformed_request_id():
+    with pytest.raises(GrantError):
+        good_request(request_id=123)
+    with pytest.raises(GrantError):
+        good_request(request_id="")
+
+
 def test_request_grant_rejects_raw_credential_in_audit():
     with pytest.raises(GrantError):
         good_request(audit={"cookie": "session=abc123"})
@@ -271,6 +278,68 @@ def test_resolve_grant_rejects_non_finite_broker_timestamps():
     assert decision.code == "malformed"
 
 
+def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
+    req = good_request(requested_by="real-requester", reason="real reason", audit={"run_id": "real-run", "operator_note": "kept"})
+
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=request.scope,
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T22:14:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + 60,
+            backend="rogue",
+            handle=GrantHandle(backend="rogue"),
+            audit={"run_id": "fake", "requested_by": "evil", "reason": "lie", "operator_note": "overwritten", "custom": "kept"},
+        )
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    store = InMemoryGrantStore()
+    decision = resolve_grant(rogue_broker, req, store=store)
+
+    assert decision.granted is True
+    assert decision.grant is not None
+    audit = decision.grant.audit
+    assert audit["run_id"] == "real-run"
+    assert audit["requested_by"] == "real-requester"
+    assert audit["reason"] == "real reason"
+    assert audit["operator_note"] == "kept"
+    assert audit["custom"] == "kept"
+    persisted = store.get_grant(decision.grant.grant_id)
+    assert persisted is not None
+    assert persisted["audit"] == audit
+
+
+def test_resolve_grant_sanitizes_missing_broker_audit_blob():
+    req = good_request(requested_by="real-requester", reason="real reason", audit={"run_id": "real-run"})
+
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=request.scope,
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T22:14:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + 60,
+            backend="rogue",
+        )
+        object.__setattr__(grant, "audit", None)
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    decision = resolve_grant(rogue_broker, req)
+
+    assert decision.granted is True
+    assert decision.grant is not None
+    assert decision.grant.audit == {"run_id": "real-run", "requested_by": "real-requester", "reason": "real reason"}
+
+
 def test_resolve_grant_rejects_grant_that_widens_ttl():
     def rogue_broker(request):
         grant = SessionGrant(
@@ -388,6 +457,37 @@ def test_validate_grant_rejects_non_finite_timestamps():
 
     assert result.ok is False
     assert result.code == "malformed"
+
+
+def test_validate_grant_rejects_non_finite_timestamps_on_session_grant_objects():
+    grant_obj = resolve_grant(policy_broker(), good_request()).grant
+    assert grant_obj is not None
+    poisoned = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(poisoned, "expires_at_epoch", float("nan"))
+
+    result = validate_grant(poisoned, action="session.status", now=FIXED_NOW + 10)
+
+    assert result.ok is False
+    assert result.code == "malformed"
+
+
+def test_validate_grant_rejects_non_positive_validity_interval_for_dict_and_object():
+    grant_obj = resolve_grant(policy_broker(), good_request()).grant
+    assert grant_obj is not None
+    payload = grant_obj.to_dict()
+    payload["issued_at_epoch"] = FIXED_NOW + 100
+    payload["expires_at_epoch"] = FIXED_NOW + 50
+    object_grant = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(object_grant, "issued_at_epoch", FIXED_NOW + 100)
+    object.__setattr__(object_grant, "expires_at_epoch", FIXED_NOW + 50)
+
+    dict_result = validate_grant(payload, action="session.status", now=FIXED_NOW + 10)
+    object_result = validate_grant(object_grant, action="session.status", now=FIXED_NOW + 10)
+
+    assert dict_result.ok is False
+    assert dict_result.code == "malformed"
+    assert object_result.ok is False
+    assert object_result.code == "malformed"
 
 
 # ---------------------------------------------------------------------------

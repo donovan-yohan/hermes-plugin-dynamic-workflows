@@ -37,7 +37,7 @@ import json
 import math
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
@@ -220,7 +220,7 @@ class SessionGrant:
             "expires_at_epoch": self.expires_at_epoch,
             "backend": self.backend,
             "handle": self.handle.to_dict() if self.handle is not None else None,
-            "audit": dict(self.audit),
+            "audit": dict(self.audit or {}),
             "status": self.status,
         }
 
@@ -491,6 +491,8 @@ def request_grant(
     if ttl <= 0 or not math.isfinite(ttl):
         raise GrantError("grant request 'ttl_seconds' must be a positive, finite number")
     audit_blob = dict(audit or {})
+    if request_id is not None and (not isinstance(request_id, str) or not request_id):
+        raise GrantError("grant request 'request_id' must be a non-empty string when provided")
     offender = find_raw_credential(audit_blob)
     if offender is not None:
         raise GrantError(f"grant request audit must not carry a raw credential ({offender!r})")
@@ -538,6 +540,8 @@ def resolve_grant(
     problem = _audit_issued_grant(decision.grant, request)
     if problem is not None:
         return problem
+    grant = _sanitize_issued_grant(decision.grant, request)
+    decision = replace(decision, grant=grant)
     if store is not None:
         try:
             store.save_grant(decision.grant)  # type: ignore[arg-type]
@@ -561,9 +565,13 @@ def validate_grant(
     """
 
     try:
-        parsed = grant if isinstance(grant, SessionGrant) else SessionGrant.from_dict(grant)
+        parsed = SessionGrant.from_dict(grant.to_dict() if isinstance(grant, SessionGrant) else grant)
     except GrantError as exc:
         return GrantValidation(False, "malformed", str(exc))
+
+    interval_problem = _grant_time_problem(parsed)
+    if interval_problem is not None:
+        return GrantValidation(False, "malformed", interval_problem, parsed)
 
     offender = find_raw_credential(parsed.to_dict())
     if offender is not None:
@@ -664,15 +672,35 @@ def _audit_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) ->
             "issued grant side_effect_class does not match request",
         )
     ttl = grant.expires_at_epoch - grant.issued_at_epoch
-    if not math.isfinite(grant.issued_at_epoch) or not math.isfinite(grant.expires_at_epoch) or not math.isfinite(ttl):
-        return GrantDecision(False, "malformed", "issued grant timestamps must be finite")
-    if ttl <= 0:
-        return GrantDecision(False, "denied_ttl", "issued grant is already expired")
+    interval_problem = _grant_time_problem(grant)
+    if interval_problem is not None:
+        return GrantDecision(False, "malformed", f"issued grant {interval_problem}")
     if ttl > request.ttl_seconds:
         return GrantDecision(False, "denied_ttl", "issued grant widened ttl beyond request")
     if grant.status != "granted":
         return GrantDecision(False, "revoked", f"issued grant status is {grant.status!r}")
     return None
+
+
+def _grant_time_problem(grant: SessionGrant) -> Optional[str]:
+    ttl = grant.expires_at_epoch - grant.issued_at_epoch
+    if not math.isfinite(grant.issued_at_epoch) or not math.isfinite(grant.expires_at_epoch) or not math.isfinite(ttl):
+        return "timestamps must be finite"
+    if ttl <= 0:
+        return "validity interval must be positive"
+    return None
+
+
+def _sanitize_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) -> SessionGrant:
+    if grant is None:  # guarded by _audit_issued_grant; defensive for type checkers
+        raise GrantError("broker granted without a grant object")
+    audit = dict(grant.audit or {})
+    for key, value in request.audit.items():
+        if key not in {"requested_by", "reason", "policy_max_ttl_seconds"}:
+            audit[key] = value
+    audit["requested_by"] = request.requested_by
+    audit["reason"] = request.reason
+    return replace(grant, audit=audit)
 
 
 def _is_credential_key(key: str) -> bool:
