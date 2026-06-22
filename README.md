@@ -38,6 +38,7 @@ The current runtime supports:
 - parent-owned filesystem run storage for plugin use: `snapshot.json` + compact `journal.jsonl`
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
 - a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`; not model-facing)
+- a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 
 ## Quick start as a Python package
 
@@ -313,6 +314,53 @@ canonical `args_hash` drifts from the recorded run **fails closed** (a
 `replay_mismatch` abort) instead of serving the wrong value; a corrupt/missing
 run or cache raises a typed `ScriptRunStoreError` before any subprocess spawns.
 See [DESIGN.md §5.6](DESIGN.md) for the full contract and trust boundary.
+
+## Loop-controller runtime (issue #31)
+
+The feedback-loop slice treats agent automation as a controller: a sensor/verifier
+measures the gap to a setpoint, an actuator/backend performs one bounded action,
+and the next sensor result decides whether the run converged, should continue, or
+must halt. The controller never trusts an implementation worker saying "done";
+only the sensor can converge the run.
+
+```python
+from hermes_workflows import loop_run
+
+spec = {
+    "version": "1",
+    "name": "issue_controller",
+    "setpoint": {"target": "acceptance criteria pass with evidence"},
+    "sensors": [{"id": "acceptance_verifier", "primary": True}],
+    "actuators": [{"id": "implementation_step", "kind": "adapter"}],
+    "brakes": {"max_steps": 4, "max_repeated_signal": 2, "max_sensor_retries": 1},
+}
+
+seen = {"n": 0}
+def sensor(ctx):
+    seen["n"] += 1
+    if seen["n"] == 1:
+        return {
+            "converged": False,
+            "signal_key": "tests-failing",
+            "summary": "targeted test fails",
+            "next_hint": "fix the failing test only",
+        }
+    return {"converged": True, "signal_key": "tests-green", "summary": "targeted test passes"}
+
+def actuator(ctx):
+    # Adapter-owned: could call Relay, Kanban, delegate_task, process, etc.
+    return {"summary": "patched implementation", "artifacts": ["src/example.py"]}
+
+status = loop_run(spec, sensor=sensor, actuator=actuator)
+print(status.state, status.report["convergence_risk"])  # converged converged_by_sensor
+```
+
+The generic checked-in example lives at `examples/issue_controller.loop.json`.
+Repo/tool specifics are intentionally inputs or adapter config, not new primitive
+kinds like `relay_*` or `github_*`. Actuator contexts include a small handoff
+contract (`prompt`, expected artifact/session/check handles, optional `cost`) so
+Relay, Kanban, ATH, or local process adapters can execute one bounded step and
+return evidence without becoming the workflow abstraction.
 
 ## Saved workflow catalog
 

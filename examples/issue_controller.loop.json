@@ -1,0 +1,36 @@
+{
+  "version": "1",
+  "name": "issue_controller",
+  "setpoint": {
+    "target": "the issue acceptance criteria are satisfied with durable evidence",
+    "stop_condition": "the primary verifier reports converged=true after inspecting code, tests, PR/check state, and residual scope",
+    "invariants": [
+      "do not trust agent self-report as success",
+      "do not run irreversible actions without an approval gate",
+      "repo/tool specifics must be provided as inputs or adapter config"
+    ]
+  },
+  "sensors": [
+    {
+      "id": "acceptance_verifier",
+      "primary": true,
+      "kind": "callable",
+      "returns": "{converged, signal_key, summary, evidence[], retryable_noise, next_hint}"
+    }
+  ],
+  "actuators": [
+    {
+      "id": "implementation_step",
+      "kind": "adapter",
+      "allowed_backends": ["inline", "delegate_task", "process", "kanban", "relay"],
+      "returns": "{summary, artifacts[], handles[], cost?}"
+    }
+  ],
+  "brakes": {
+    "max_steps": 6,
+    "max_repeated_signal": 3,
+    "max_sensor_retries": 1,
+    "max_wall_seconds": 14400,
+    "max_cost": 50
+  }
+}

@@ -134,6 +134,7 @@ def workflow_status(
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
 | `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `FileRunStore` snapshots/journals; `KanbanRunStore` documented/stubbed. |
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
+| `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
 | `errors.py` | `WorkflowError` base, `WorkflowValidationError`, `RunNotFound`, `SandboxPolicyError`. |
 
@@ -184,7 +185,40 @@ sortable-by-source, collision-resistant, and lets `workflow_status` correlate a
 run back to its definition. Callers may pass an explicit `run_id` for
 idempotency or deterministic tests.
 
-### 1.5 The sandboxed runtime (skeleton)
+### 1.5 Feedback-controller loops
+
+Issue #31 adds a controller layer beside the workflow interpreter rather than
+turning `workflow` steps into a repo-specific ticket bot. `loops.py` validates a
+generic loop spec (`setpoint`, primary sensor, actuator adapters, brakes) and runs
+an injected sensor/actuator pair through explicit controller states:
+
+```text
+planned -> sensing -> acting -> sensing ... -> converged | halted_*
+```
+
+The sensor contract is the source of truth:
+
+```json
+{
+  "converged": false,
+  "signal_key": "stable hash/key for stall detection",
+  "summary": "short human-readable result",
+  "evidence": [{"kind": "test", "name": "...", "status": "failed"}],
+  "retryable_noise": false,
+  "next_hint": "bounded context for the next actuator step"
+}
+```
+
+Actuators are backend adapters: inline code, `delegate_task`, managed processes,
+Kanban, Relay, or ATH-triggered execution can all fit behind the same callable
+shape. The controller does not trust an actuator's success claim; only a later
+sensor result can converge the run. Runtime-enforced brakes cover max steps,
+wall time, repeated `signal_key` stall detection, optional actuator-reported cost,
+and retry-once handling for noisy sensors. This keeps Dynamic Workflows' product
+primitive generic while still making Relay/ATH handoffs possible through adapter
+configuration and run inputs.
+
+### 1.6 The sandboxed runtime (skeleton)
 
 The runtime in `runtime.py` is a **deterministic AST interpreter**, not a
 language VM. It walks the validated step tree and:
