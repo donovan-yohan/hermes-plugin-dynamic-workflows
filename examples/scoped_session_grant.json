@@ -1,0 +1,25 @@
+{
+  "about": "Backend-neutral scoped actuator grant example (issue #33). A loop actuator returns 'grant_request' instead of holding a raw token; the controller resolves it through a GrantBroker. No secrets appear anywhere in this file by design.",
+  "policy": {
+    "comment": "Shape a StaticPolicyGrantBroker(allowed_scope=..., max_ttl_seconds=..., allowed_side_effect_classes=...). Real backends authenticate here; the bundled default does not.",
+    "allowed_scope": ["session.launch", "session.status", "session.cancel"],
+    "allowed_side_effect_classes": ["session_launch", "session_control"],
+    "max_ttl_seconds": 3600
+  },
+  "actuator_grant_request": {
+    "comment": "Returned by an actuator from loop_run as action['grant_request']. Credential-free: authority lives in scope + expiry, never in a token or cookie.",
+    "scope": ["session.launch", "session.status"],
+    "side_effect_class": "session_launch",
+    "subject": "work-context-abc",
+    "reason": "launch a managed agent session to drive the issue",
+    "requested_by": "issue_controller",
+    "ttl_seconds": 1800
+  },
+  "issued_grant_handle": {
+    "comment": "Shape of the persistable handle inside the issued SessionGrant. Persist this (e.g. via FileGrantStore) and re-validate it after a restart to resume status checks. handle_ref is a revocable, scope-bound backend reference, NOT a reusable browser cookie or shell token.",
+    "backend": "inproc",
+    "session_id": "sess-grant-1-abcdef01",
+    "work_context_id": "work-context-abc",
+    "handle_ref": "inproc:grant-1-abcdef01"
+  }
+}

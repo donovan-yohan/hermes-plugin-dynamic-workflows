@@ -1,0 +1,555 @@
+"""Tests for backend-neutral scoped actuator grants (issue #33 slice)."""
+
+import tempfile
+
+import pytest
+
+from hermes_workflows.errors import GrantError
+from hermes_workflows.grants import (
+    FileGrantStore,
+    GrantDecision,
+    GrantHandle,
+    InMemoryGrantStore,
+    SessionGrant,
+    StaticPolicyGrantBroker,
+    find_raw_credential,
+    request_grant,
+    resolve_grant,
+    validate_grant,
+)
+from hermes_workflows.loops import loop_run
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers.
+# ---------------------------------------------------------------------------
+
+FIXED_NOW = 1_700_000_000.0
+
+
+def fixed_clock(value=FIXED_NOW):
+    return lambda: value
+
+
+def policy_broker(**overrides):
+    kwargs = dict(
+        allowed_scope={"session.launch", "session.status", "session.cancel"},
+        max_ttl_seconds=3600,
+        clock=fixed_clock(),
+    )
+    kwargs.update(overrides)
+    return StaticPolicyGrantBroker(**kwargs)
+
+
+def good_request(**overrides):
+    kwargs = dict(
+        scope=("session.launch", "session.status"),
+        side_effect_class="session_launch",
+        subject="work-context-abc",
+        reason="launch a managed session to drive the issue",
+        requested_by="issue_controller",
+        ttl_seconds=1800,
+    )
+    kwargs.update(overrides)
+    return request_grant(**kwargs)
+
+
+def loop_spec(**brake_overrides):
+    brakes = {"max_steps": 4, "max_repeated_signal": 3, "max_sensor_retries": 1}
+    brakes.update(brake_overrides)
+    return {
+        "version": "1",
+        "name": "session_loop",
+        "setpoint": {"target": "managed session reaches a verified state"},
+        "sensors": [{"id": "verification", "primary": True, "kind": "callable"}],
+        "actuators": [{"id": "launcher", "kind": "adapter"}],
+        "brakes": brakes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# request_grant / model validation.
+# ---------------------------------------------------------------------------
+
+
+def test_request_grant_builds_credential_free_scoped_request():
+    req = good_request()
+
+    assert req.scope == ("session.launch", "session.status")
+    assert req.side_effect_class == "session_launch"
+    assert req.subject == "work-context-abc"
+    assert req.ttl_seconds == 1800
+    assert req.request_id
+
+
+def test_request_grant_rejects_unknown_side_effect_class():
+    with pytest.raises(GrantError):
+        good_request(side_effect_class="root_shell")
+
+
+def test_request_grant_rejects_scope_passed_as_bare_string():
+    with pytest.raises(GrantError):
+        good_request(scope="session.launch")
+
+
+def test_request_grant_rejects_non_positive_ttl():
+    with pytest.raises(GrantError):
+        good_request(ttl_seconds=0)
+
+
+def test_request_grant_rejects_raw_credential_in_audit():
+    with pytest.raises(GrantError):
+        good_request(audit={"cookie": "session=abc123"})
+
+
+def test_find_raw_credential_walks_nested_payloads():
+    assert find_raw_credential({"handle": {"authorization": "Bearer x"}}) == "authorization"
+    assert find_raw_credential({"items": [{"password": "p"}]}) == "password"
+    assert find_raw_credential({"session_id": "s", "work_context_id": "w"}) is None
+
+
+# ---------------------------------------------------------------------------
+# StaticPolicyGrantBroker + resolve_grant.
+# ---------------------------------------------------------------------------
+
+
+def test_static_policy_broker_grants_within_policy_and_clamps_ttl():
+    broker = policy_broker(max_ttl_seconds=600)
+    decision = resolve_grant(broker, good_request(ttl_seconds=1800))
+
+    assert decision.granted is True
+    assert decision.code == "granted"
+    grant = decision.grant
+    assert grant is not None
+    # TTL clamped to policy max (600), not the requested 1800.
+    assert grant.expires_at_epoch == FIXED_NOW + 600
+    assert grant.handle.work_context_id == "work-context-abc"
+    assert grant.handle.handle_ref and "inproc:" in grant.handle.handle_ref
+    # The issued grant must never carry a raw credential.
+    assert find_raw_credential(grant.to_dict()) is None
+
+
+def test_static_policy_broker_denies_out_of_scope_request():
+    broker = policy_broker(allowed_scope={"session.status"})
+    decision = resolve_grant(broker, good_request(scope=("session.launch",)))
+
+    assert decision.granted is False
+    assert decision.code == "denied_scope"
+    assert "session.launch" in decision.reason
+
+
+def test_static_policy_broker_denies_disallowed_side_effect_class():
+    broker = policy_broker(allowed_side_effect_classes={"read_only"})
+    decision = resolve_grant(broker, good_request())
+
+    assert decision.granted is False
+    assert decision.code == "denied_class"
+
+
+def test_static_policy_broker_rejects_string_policy_iterables():
+    with pytest.raises(GrantError):
+        StaticPolicyGrantBroker(allowed_scope="session.launch", max_ttl_seconds=60)
+    with pytest.raises(GrantError):
+        StaticPolicyGrantBroker(
+            allowed_scope={"session.launch"},
+            allowed_side_effect_classes="session_launch",
+            max_ttl_seconds=60,
+        )
+
+
+def test_resolve_grant_fails_closed_without_broker():
+    decision = resolve_grant(None, good_request())
+
+    assert decision.granted is False
+    assert decision.code == "no_broker"
+
+
+def test_resolve_grant_rejects_grant_that_widens_scope():
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=("session.launch", "session.delete_everything"),
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T23:13:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + 3600,
+            backend="rogue",
+            handle=GrantHandle(backend="rogue"),
+        )
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    decision = resolve_grant(rogue_broker, good_request(scope=("session.launch",)))
+
+    assert decision.granted is False
+    assert decision.code == "denied_scope"
+
+
+def test_resolve_grant_rejects_grant_that_widens_ttl():
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=request.scope,
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T23:13:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + request.ttl_seconds + 1,
+            backend="rogue",
+            handle=GrantHandle(backend="rogue"),
+        )
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    decision = resolve_grant(rogue_broker, good_request(ttl_seconds=60))
+
+    assert decision.granted is False
+    assert decision.code == "denied_ttl"
+
+
+def test_resolve_grant_rejects_revoked_grant_from_broker():
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=request.scope,
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T23:13:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + request.ttl_seconds,
+            backend="rogue",
+            handle=GrantHandle(backend="rogue"),
+            status="revoked",
+        )
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    decision = resolve_grant(rogue_broker, good_request(ttl_seconds=60))
+
+    assert decision.granted is False
+    assert decision.code == "revoked"
+
+
+def test_resolve_grant_fails_closed_when_store_rejects_grant():
+    class BrokenStore:
+        def save_grant(self, grant):
+            raise RuntimeError("disk full")
+
+        def get_grant(self, grant_id):  # pragma: no cover - protocol completeness only
+            return None
+
+    decision = resolve_grant(policy_broker(), good_request(), store=BrokenStore())
+
+    assert decision.granted is False
+    assert decision.code == "store_error"
+    assert "disk full" in decision.reason
+
+
+# ---------------------------------------------------------------------------
+# validate_grant fail-closed semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_grant_accepts_active_in_scope_grant():
+    grant = resolve_grant(policy_broker(), good_request()).grant
+    result = validate_grant(grant, action="session.status", now=FIXED_NOW + 10)
+
+    assert result.ok is True
+    assert result.code == "valid"
+
+
+def test_validate_grant_rejects_expired_grant():
+    grant = resolve_grant(policy_broker(), good_request(ttl_seconds=100)).grant
+    result = validate_grant(grant, action="session.status", now=FIXED_NOW + 101)
+
+    assert result.ok is False
+    assert result.code == "expired"
+
+
+def test_validate_grant_rejects_out_of_scope_action():
+    grant = resolve_grant(policy_broker(), good_request(scope=("session.status",))).grant
+    result = validate_grant(grant, action="session.launch", now=FIXED_NOW + 10)
+
+    assert result.ok is False
+    assert result.code == "out_of_scope"
+
+
+def test_validate_grant_rejects_revoked_grant():
+    grant = resolve_grant(policy_broker(), good_request()).grant
+    revoked = SessionGrant.from_dict({**grant.to_dict(), "status": "revoked"})
+    result = validate_grant(revoked, now=FIXED_NOW + 10)
+
+    assert result.ok is False
+    assert result.code == "revoked"
+
+
+def test_validate_grant_rejects_malformed_grant():
+    result = validate_grant({"grant_id": "x"})
+
+    assert result.ok is False
+    assert result.code == "malformed"
+
+
+# ---------------------------------------------------------------------------
+# Persistence + resume after restart (acceptance #3).
+# ---------------------------------------------------------------------------
+
+
+def test_grant_handle_survives_restart_and_revalidates_for_status_checks():
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = policy_broker()
+        store = FileGrantStore(tmp)
+        decision = resolve_grant(broker, good_request(ttl_seconds=1800), store=store)
+        grant_id = decision.grant.grant_id
+
+        # Simulate a process restart: a fresh store instance, no in-memory state.
+        reopened = FileGrantStore(tmp)
+        persisted = reopened.get_grant(grant_id)
+
+        assert persisted is not None
+        assert persisted["handle"]["work_context_id"] == "work-context-abc"
+        # No secret was ever persisted alongside the handle.
+        assert find_raw_credential(persisted) is None
+
+        live = validate_grant(persisted, action="session.status", now=FIXED_NOW + 60)
+        assert live.ok is True
+
+        expired = validate_grant(persisted, action="session.status", now=FIXED_NOW + 1801)
+        assert expired.ok is False
+        assert expired.code == "expired"
+
+
+def test_in_memory_grant_store_returns_isolated_copies():
+    store = InMemoryGrantStore()
+    grant = resolve_grant(policy_broker(), good_request(), store=store).grant
+    snapshot = store.get_grant(grant.grant_id)
+    snapshot["status"] = "mutated"
+
+    assert store.get_grant(grant.grant_id)["status"] == "granted"
+
+
+# ---------------------------------------------------------------------------
+# loop_run wiring.
+# ---------------------------------------------------------------------------
+
+
+def test_loop_run_issues_scoped_grant_then_uses_handle_to_converge():
+    broker = policy_broker()
+    seen_grants = {}
+
+    def sensor(context):
+        if context["iteration"] == 1:
+            return {"converged": False, "signal_key": "no-session", "summary": "no session yet"}
+        # Second pass: the issued grant is visible to the controller context.
+        seen_grants["grants"] = context["grants"]
+        return {"converged": True, "signal_key": "session-up", "summary": "session verified"}
+
+    def actuator(context):
+        return {
+            "summary": "requested session launch authority",
+            "grant_request": {
+                "scope": ["session.launch", "session.status"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-42",
+                "reason": "drive the issue in a managed session",
+                "ttl_seconds": 900,
+            },
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, grant_broker=broker)
+
+    assert status.state == "converged"
+    assert len(status.grants) == 1
+    assert status.grants[0]["subject"] == "wc-42"
+    assert status.grants[0]["side_effect_class"] == "session_launch"
+    assert seen_grants["grants"][0]["handle"]["work_context_id"] == "wc-42"
+    issued = [e for e in status.events if e["kind"] == "grant_issued"]
+    assert len(issued) == 1
+    assert issued[0]["grant_code"] == "granted"
+    assert "run_id" in issued[0]["grant"]["audit"]
+
+
+def test_loop_run_persists_grant_to_grant_store():
+    broker = policy_broker()
+    grant_store = InMemoryGrantStore()
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "no-session", "summary": "no session"}
+
+    def actuator(context):
+        return {
+            "summary": "request",
+            "grant_request": {
+                "scope": ["session.launch"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-7",
+                "reason": "launch",
+                "ttl_seconds": 600,
+            },
+        }
+
+    status = loop_run(
+        loop_spec(max_steps=1, max_repeated_signal=99),
+        sensor=sensor,
+        actuator=actuator,
+        grant_broker=broker,
+        grant_store=grant_store,
+    )
+
+    grant_id = status.grants[0]["grant_id"]
+    assert grant_store.get_grant(grant_id) is not None
+
+
+def test_loop_run_halts_grant_denied_on_out_of_scope_request():
+    broker = policy_broker(allowed_scope={"session.status"})
+    events = []
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-launch", "summary": "needs launch"}
+
+    def actuator(context):
+        return {
+            "summary": "request launch",
+            "grant_request": {
+                "scope": ["session.launch"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-1",
+                "reason": "launch",
+                "ttl_seconds": 600,
+            },
+        }
+
+    status = loop_run(
+        loop_spec(),
+        sensor=sensor,
+        actuator=actuator,
+        grant_broker=broker,
+        on_event=lambda event, status: events.append(event),
+    )
+
+    assert status.state == "halted_grant_denied"
+    assert status.halted_reason is not None
+    assert "denied_scope" in status.halted_reason
+    assert status.report["convergence_risk"] == "not_converged"
+    denied = [e for e in events if e["kind"] == "grant_denied"]
+    assert len(denied) == 1
+    assert denied[0]["grant_code"] == "denied_scope"
+    assert status.grants == []
+
+
+def test_loop_run_fails_closed_when_no_broker_configured():
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-grant", "summary": "needs grant"}
+
+    def actuator(context):
+        return {
+            "summary": "request",
+            "grant_request": {
+                "scope": ["session.launch"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-1",
+                "reason": "launch",
+                "ttl_seconds": 600,
+            },
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator)
+
+    assert status.state == "halted_grant_denied"
+    assert "no_broker" in status.halted_reason
+
+
+def test_loop_run_grant_denied_does_not_leak_smuggled_credential():
+    broker = policy_broker()
+    events = []
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-grant", "summary": "needs grant"}
+
+    def actuator(context):
+        return {
+            "summary": "request with smuggled cookie",
+            "grant_request": {
+                "scope": ["session.launch"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-1",
+                "reason": "launch",
+                "ttl_seconds": 600,
+                "cookie": "session=supersecretvalue",
+            },
+        }
+
+    status = loop_run(
+        loop_spec(),
+        sensor=sensor,
+        actuator=actuator,
+        grant_broker=broker,
+        on_event=lambda event, status: events.append(event),
+    )
+
+    assert status.state == "halted_grant_denied"
+    assert "cookie" in status.halted_reason  # names the offending key
+    # The secret VALUE must never be journaled anywhere in the run state.
+    blob = repr(status.as_dict()) + repr(events)
+    assert "supersecretvalue" not in blob
+    assert status.grants == []
+
+
+def test_loop_run_non_dict_grant_envelope_does_not_leak_secret_value():
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-grant", "summary": "needs grant"}
+
+    def actuator(context):
+        return {"summary": "bad grant", "grant_request": "cookie=supersecretvalue"}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, grant_broker=policy_broker())
+
+    assert status.state == "halted_grant_denied"
+    assert status.actuator_results[0]["grant_request"] == "[REDACTED]"
+    assert "supersecretvalue" not in repr(status.as_dict())
+
+
+def test_loop_run_rejects_grant_request_combined_with_wait():
+    broker = policy_broker()
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-grant", "summary": "needs grant"}
+
+    def actuator(context):
+        return {
+            "summary": "ambiguous envelope",
+            "grant_request": {
+                "scope": ["session.launch"],
+                "side_effect_class": "session_launch",
+                "subject": "wc-1",
+                "reason": "launch",
+                "ttl_seconds": 600,
+            },
+            "wait": {"token": "ci-1"},
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, grant_broker=broker)
+
+    assert status.state == "halted_grant_denied"
+    assert "cannot combine with wait" in status.halted_reason
+
+
+def test_loop_run_revalidates_supplied_grant_handle_and_halts_when_expired():
+    broker = policy_broker()
+    expired_grant = resolve_grant(broker, good_request(ttl_seconds=100)).grant.to_dict()
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "reuse", "summary": "reuse handle"}
+
+    def actuator(context):
+        # Reuse a grant minted long ago; wall-clock now is far past its expiry.
+        return {"summary": "reuse expired grant", "grant": expired_grant, "grant_action": "session.status"}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, grant_broker=broker)
+
+    assert status.state == "halted_grant_denied"
+    assert "expired" in status.halted_reason

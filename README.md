@@ -39,6 +39,7 @@ The current runtime supports:
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
 - a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`; not model-facing)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
+- backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
 
 ## Quick start as a Python package
 
@@ -382,6 +383,88 @@ inspectable after the function returns. `loop_run(..., on_event=...)` is the liv
 observer hook for ATH, gateway, CLI, notebook, or UI adapters; every event carries
 `run_id`, loop name, definition hash, event index, state, iteration, and a
 reply-safe summary.
+
+## Scoped actuator grants (issue #33)
+
+A loop actuator that needs to **launch or control a managed agent session** needs
+real authority. Handing the adapter a raw shell token or a reused browser cookie
+is the wrong primitive: those credentials are ambient, unscoped, non-expiring, and
+unauditable — anyone who reads the run state inherits them. Scoped grants replace
+that with an explicit, expiring, single-purpose authorization.
+
+An actuator asks for a grant instead of holding a secret. It returns a
+credential-free `grant_request`; the controller resolves it through an injected
+`GrantBroker` and records the issued grant in `status.grants`:
+
+```python
+from hermes_workflows import StaticPolicyGrantBroker, FileGrantStore, loop_run
+
+broker = StaticPolicyGrantBroker(
+    allowed_scope={"session.launch", "session.status"},
+    allowed_side_effect_classes={"session_launch"},
+    max_ttl_seconds=3600,
+)
+grant_store = FileGrantStore(".workflow-runs/grants")
+
+def actuator(ctx):
+    # No browser credential in sight; ask for exactly what's needed.
+    return {
+        "summary": "request session-launch authority",
+        "grant_request": {
+            "scope": ["session.launch", "session.status"],
+            "side_effect_class": "session_launch",
+            "subject": "work-context-abc",   # opaque target id, not a secret
+            "reason": "launch a managed session to drive the issue",
+            "ttl_seconds": 900,
+        },
+    }
+
+status = loop_run(spec, sensor=sensor, actuator=actuator,
+                  grant_broker=broker, grant_store=grant_store)
+grant = status.grants[0]          # explicit scope, expiry, side-effect class, audit
+handle = grant["handle"]          # {session_id, work_context_id, handle_ref} — no secret
+```
+
+Every grant carries **explicit scope** (the exact actions it permits), an explicit
+**side-effect class** (`read_only` / `session_launch` / `session_control` /
+`external_write`), an explicit **expiry** (issued/expires timestamps), and **audit
+metadata** (`requested_by`, `reason`, `run_id`, `def_hash`, iteration). The
+controller never trusts the actuator with a credential — only the broker mints the
+opaque, revocable `GrantHandle`.
+
+**Persist and resume.** The issued grant (and its handle) is written through the
+generic `GrantStore`. `FileGrantStore` writes `<root>/<grant_id>.json`, so a
+workflow can re-read the handle after a restart and resume status checks against
+the same session/work-context:
+
+```python
+from hermes_workflows import FileGrantStore, validate_grant
+
+reopened = FileGrantStore(".workflow-runs/grants")   # fresh process
+persisted = reopened.get_grant(grant_id)
+check = validate_grant(persisted, action="session.status")  # fail-closed re-check
+```
+
+**Fail closed.** A denied, expired, malformed, or credential-bearing grant — or a
+missing broker — halts the run in `halted_grant_denied` with a structured
+`grant_denied` event (stable `grant_code` such as `denied_scope`, `expired`,
+`no_broker`) and `convergence_risk: not_converged`. `resolve_grant` and
+`validate_grant` return structured negative decisions rather than raising, so the
+controller degrades deterministically instead of silently succeeding.
+
+**How this differs from raw shell tokens or browser-cookie reuse.** A shell token
+or a copied browser cookie is a *bearer* secret: ambient authority with no scope,
+no expiry, no audit trail, and full reuse by anyone who reads it. A scoped grant
+inverts every one of those properties — authority lives in the `scope` + expiry,
+not in a transferable secret; the `GrantHandle` is a revocable, scope-bound backend
+reference (`handle_ref`), never a cookie or `Authorization` header. A small guard
+(`find_raw_credential` / `redact_credentials`) rejects any grant payload whose keys
+look like a credential (`cookie`, `authorization`, `token`, `password`, …) and
+masks such values before they are ever journaled, so this primitive can never
+quietly decay into cookie reuse. `StaticPolicyGrantBroker` is a backend-neutral
+default with **no real authentication**; a future backend adapter (Relay is one
+such backend) implements `GrantBroker` to authenticate and mint real,
+backend-scoped session references behind the same seam.
 
 ## Saved workflow catalog
 

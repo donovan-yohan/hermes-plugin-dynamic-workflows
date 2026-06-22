@@ -85,6 +85,38 @@ Expected: `validate ok: True`, `run ok: True value: {"greeting": "hello, world",
 ids. Pass `agent_runner=` to `run_workflow_script` to swap in a real Hermes
 fan-out, or `limits=VMLimits(...)` to tighten budgets and caps.
 
+## `scoped_session_grant.json` — scoped actuator grants (issue #33)
+
+A documentation-only shape file for backend-neutral session-launch grants. It is
+**not** a workflow definition and is **not** loaded by the catalog. It shows the
+three credential-free shapes: a broker policy, the actuator's `grant_request`
+envelope, and the persistable handle inside the issued grant.
+
+```bash
+python -c '
+from hermes_workflows import (
+    StaticPolicyGrantBroker, request_grant, resolve_grant, validate_grant,
+)
+broker = StaticPolicyGrantBroker(
+    allowed_scope={"session.launch", "session.status"}, max_ttl_seconds=3600,
+)
+req = request_grant(
+    scope=("session.launch", "session.status"), side_effect_class="session_launch",
+    subject="work-context-abc", reason="launch a managed session",
+    requested_by="issue_controller", ttl_seconds=1800,
+)
+decision = resolve_grant(broker, req)
+print("granted:", decision.granted, "scope:", decision.grant.scope)
+print("handle:", decision.grant.handle.to_dict())
+print("reusable now:", validate_grant(decision.grant, action="session.status").ok)
+'
+```
+
+Expected: `granted: True`, a `handle` carrying only `session_id` /
+`work_context_id` / `handle_ref` (no secret), and `reusable now: True`. A denied,
+expired, or credential-bearing grant fails closed instead — see
+`DESIGN.md §1.5.1` and the README "Scoped actuator grants" section.
+
 ## Notes
 
 - Swap in a real Hermes fan-out by passing `agent_runner=` to `workflow_run`.
