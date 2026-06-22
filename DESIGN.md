@@ -218,9 +218,13 @@ or halts from fresh evidence. Runtime-enforced brakes cover action count,
 wall-time checks around synchronous calls, repeated `signal_key` stall detection,
 strict optional actuator-reported cost, and retry-once handling for noisy sensors.
 The handoff context includes remaining actions, remaining wall time/deadline, and
-remaining budget so adapters can enforce cooperative internal timeouts. This keeps
-Dynamic Workflows' product primitive generic while still making Relay/ATH handoffs
-possible through adapter configuration and run inputs.
+remaining budget so adapters can enforce cooperative internal timeouts. Actuator
+results may also suspend the controller with a backend-neutral envelope: `wait`
+transitions to `waiting_for_event`, and `approval_request` transitions to
+`waiting_for_approval`. The request object must identify itself with `id`, `token`,
+or `kind`, is recorded in status/events, and is intentionally not executed by the
+controller. This keeps Dynamic Workflows' product primitive generic while still
+making Relay/ATH handoffs possible through adapter configuration and run inputs.
 
 Persistence and visibility are generic boundaries, not ATH-specific code paths.
 `LoopRunStore.save_status(status)` is called at each lifecycle event and at final
