@@ -60,7 +60,7 @@ def test_register_exposes_workflow_tools():
     ctx = FakeContext()
     plugin.register(ctx)
 
-    assert set(ctx.tools) == {"workflow"}
+    assert set(ctx.tools) == {"workflow", "workflow_control"}
     for name, registered in ctx.tools.items():
         assert registered["toolset"] == "dynamic_workflows"
         assert registered["schema"]["name"] == name
