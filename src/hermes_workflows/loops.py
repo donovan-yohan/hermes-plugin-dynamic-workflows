@@ -31,7 +31,17 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from . import schema as _schema
-from .errors import WorkflowValidationError
+from .errors import GrantError, WorkflowValidationError
+from .grants import (
+    GrantBroker,
+    GrantStore,
+    REDACTED,
+    find_raw_credential,
+    redact_credentials,
+    request_grant,
+    resolve_grant,
+    validate_grant,
+)
 from .models import Diagnostic, ValidationResult
 
 __all__ = [
@@ -63,6 +73,7 @@ LoopState = Literal[
     "halted_stalled",
     "halted_sensor_error",
     "halted_actuator_error",
+    "halted_grant_denied",
 ]
 
 LoopEvent = dict[str, Any]
@@ -96,6 +107,7 @@ class LoopRunStatus:
     sensor_results: list[LoopSensorResult] = field(default_factory=list)
     actuator_results: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
+    grants: list[dict[str, Any]] = field(default_factory=list)
     halted_reason: Optional[str] = None
     report: dict[str, Any] = field(default_factory=dict)
 
@@ -110,6 +122,7 @@ class LoopRunStatus:
             "sensor_results": [r.as_dict() for r in self.sensor_results],
             "actuator_results": self.actuator_results,
             "events": self.events,
+            "grants": self.grants,
             "halted_reason": self.halted_reason,
             "report": self.report,
         }
@@ -218,6 +231,8 @@ def loop_run(
     run_id: Optional[str] = None,
     store: Optional[LoopRunStore] = None,
     on_event: Optional[LoopEventSink] = None,
+    grant_broker: Optional[GrantBroker] = None,
+    grant_store: Optional[GrantStore] = None,
 ) -> LoopRunStatus:
     """Run a bounded feedback-controller loop synchronously.
 
@@ -230,6 +245,17 @@ def loop_run(
     ``brakes.max_steps`` is an action cap. A run may perform one extra sensor
     read after the final action so the controller can verify the action before it
     converges or halts at the step cap with fresh evidence.
+
+    An actuator that needs authority to launch or control a managed session asks
+    for a scoped grant instead of holding a raw token: it returns
+    ``grant_request: {scope, side_effect_class, subject, reason, ttl_seconds}``.
+    The controller resolves it through ``grant_broker`` (see
+    :mod:`hermes_workflows.grants`), records the issued, credential-free grant in
+    ``status.grants`` (and ``grant_store`` when given), and exposes it back to
+    later steps via ``context["grants"]``. An actuator may instead return a
+    previously issued ``grant`` to re-validate before reuse. A denied, expired,
+    malformed, or credential-bearing grant — or a missing broker — halts the run
+    in ``halted_grant_denied`` with a structured ``grant_denied`` event.
     """
 
     validation = loop_validate(spec)
@@ -365,8 +391,9 @@ def loop_run(
             break
 
         action_count += 1
-        status.actuator_results.append(action)
-        _record_event(status, normalized, store, on_event, "actuator_result", "verifying", iteration, "actuator completed", result=action)
+        recorded_action = _redact_grant_envelopes(action)
+        status.actuator_results.append(recorded_action)
+        _record_event(status, normalized, store, on_event, "actuator_result", "verifying", iteration, "actuator completed", result=recorded_action)
 
         if _time_exceeded(started, brakes):
             halt("halted_time_cap", "max_wall_seconds exceeded during acting")
@@ -375,6 +402,21 @@ def loop_run(
         total_cost += action_cost
         if brakes.get("max_cost") is not None and total_cost > float(brakes["max_cost"]):
             halt("halted_budget_cap", f"cost {total_cost} exceeded max_cost {brakes['max_cost']}")
+            break
+
+        grant_denial = _handle_actuator_grant(
+            action,
+            status,
+            normalized,
+            store,
+            on_event,
+            iteration,
+            grant_broker=grant_broker,
+            grant_store=grant_store,
+            suspension=suspension,
+        )
+        if grant_denial is not None:
+            halt("halted_grant_denied", grant_denial)
             break
 
         if suspension is not None:
@@ -599,6 +641,7 @@ def _context(
             "actuator_results": list(status.actuator_results),
             "events": list(status.events),
         },
+        "grants": [copy.deepcopy(g) for g in status.grants],
         "handoff": {
             "prompt": latest.next_hint if latest else None,
             "expected_return": {
@@ -606,6 +649,8 @@ def _context(
                 "cost": "optional non-negative numeric cost for budget brakes",
                 "wait": "optional {id|token|kind, summary?, ...} to suspend in waiting_for_event",
                 "approval_request": "optional {id|token|kind, summary?, choices?, ...} to suspend in waiting_for_approval",
+                "grant_request": "optional {scope[], side_effect_class, subject, reason, ttl_seconds, requested_by?} to request a scoped session grant (no secrets)",
+                "grant": "optional previously-issued grant dict to re-validate before reuse; include grant_action to assert scope",
                 "summary": "bounded action summary; success still requires a later sensor result",
             },
         },
@@ -663,6 +708,150 @@ def _validate_request_identity(request: dict[str, Any], label: str) -> None:
     ident = request.get("id") or request.get("token") or request.get("kind")
     if not isinstance(ident, str) or not ident:
         raise ValueError(f"actuator {label} requires non-empty id, token, or kind")
+
+
+def _redact_grant_envelopes(action: dict[str, Any]) -> dict[str, Any]:
+    """Mask credential-shaped values inside grant envelopes before journaling.
+
+    Only the ``grant_request`` / ``grant`` sub-objects are touched, so legitimate
+    ``wait`` / ``approval_request`` identity tokens are left intact. The
+    controller still inspects the *original* action to fail closed on a smuggled
+    secret; this only governs what is persisted into run state and events.
+    """
+
+    if "grant_request" not in action and "grant" not in action:
+        return action
+    redacted = dict(action)
+    for key in ("grant_request", "grant"):
+        if key in action:
+            value = action[key]
+            redacted[key] = redact_credentials(value) if isinstance(value, dict) else REDACTED
+    return redacted
+
+
+def _handle_actuator_grant(
+    action: dict[str, Any],
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    store: Optional[LoopRunStore],
+    on_event: Optional[LoopEventSink],
+    iteration: int,
+    *,
+    grant_broker: Optional[GrantBroker],
+    grant_store: Optional[GrantStore],
+    suspension: Optional[tuple[LoopState, str, dict[str, Any]]],
+) -> Optional[str]:
+    """Resolve/validate a scoped grant envelope; fail closed by returning a reason.
+
+    Returns ``None`` when there is no grant work or the grant is granted/valid
+    (in which case the grant is recorded in ``status.grants`` and an event is
+    emitted). Returns a halt reason string for any denied, expired, malformed, or
+    credential-bearing grant so the controller can halt in ``halted_grant_denied``.
+
+    Denied events never echo the offending payload — only a credential-free code
+    and reason — so a smuggled secret is rejected without being journaled.
+    """
+
+    has_request = action.get("grant_request") is not None
+    has_handle = action.get("grant") is not None
+    if not has_request and not has_handle:
+        return None
+
+    def denied(code: str, reason: str) -> str:
+        _record_event(
+            status,
+            spec,
+            store,
+            on_event,
+            "grant_denied",
+            "halted_grant_denied",
+            iteration,
+            reason,
+            grant_code=code,
+        )
+        return reason
+
+    if has_request and has_handle:
+        return denied("malformed", "actuator result cannot combine grant_request and grant")
+    if suspension is not None:
+        return denied("malformed", "grant envelope cannot combine with wait/approval suspension")
+
+    if has_request:
+        envelope = action["grant_request"]
+        if not isinstance(envelope, dict):
+            return denied("malformed", "actuator grant_request must be an object")
+        offender = find_raw_credential(envelope)
+        if offender is not None:
+            return denied("malformed", f"grant_request must not carry a raw credential ({offender!r})")
+        try:
+            req = request_grant(
+                scope=envelope.get("scope"),
+                side_effect_class=envelope.get("side_effect_class"),
+                subject=envelope.get("subject"),
+                reason=envelope.get("reason"),
+                requested_by=envelope.get("requested_by") or spec.get("name") or "loop_actuator",
+                ttl_seconds=envelope.get("ttl_seconds"),
+                audit=_grant_audit(envelope.get("audit"), status, spec, iteration),
+                request_id=envelope.get("request_id"),
+            )
+        except GrantError as exc:
+            return denied("malformed", f"malformed grant_request: {exc}")
+        decision = resolve_grant(grant_broker, req, store=grant_store)
+        if not decision.granted or decision.grant is None:
+            return denied(decision.code, f"grant denied ({decision.code}): {decision.reason}")
+        grant_dict = decision.grant.to_dict()
+        status.grants.append(grant_dict)
+        _record_event(
+            status,
+            spec,
+            store,
+            on_event,
+            "grant_issued",
+            "acting",
+            iteration,
+            f"grant {decision.grant.grant_id} issued for {decision.grant.subject}",
+            grant=grant_dict,
+            grant_code=decision.code,
+        )
+        return None
+
+    handle = action["grant"]
+    grant_action = action.get("grant_action")
+    validation = validate_grant(handle, action=grant_action if isinstance(grant_action, str) else None)
+    if not validation.ok or validation.grant is None:
+        return denied(validation.code, f"grant invalid ({validation.code}): {validation.reason}")
+    grant_dict = validation.grant.to_dict()
+    status.grants.append(grant_dict)
+    _record_event(
+        status,
+        spec,
+        store,
+        on_event,
+        "grant_validated",
+        "acting",
+        iteration,
+        f"grant {validation.grant.grant_id} re-validated",
+        grant=grant_dict,
+        grant_code=validation.code,
+    )
+    return None
+
+
+def _grant_audit(
+    envelope_audit: Any,
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    iteration: int,
+) -> dict[str, Any]:
+    audit: dict[str, Any] = {
+        "run_id": status.run_id,
+        "def_hash": status.def_hash,
+        "loop_name": spec.get("name"),
+        "iteration": iteration,
+    }
+    if isinstance(envelope_audit, dict):
+        audit.update(envelope_audit)
+    return audit
 
 
 def _halt(

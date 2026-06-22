@@ -23,6 +23,8 @@ __all__ = [
     "ScriptRunStoreError",
     "ScriptRunNotFound",
     "CorruptScriptRunError",
+    "GrantError",
+    "GrantDenied",
     # Diagnostic codes.
     "E_PARSE",
     "E_SCHEMA_TOPLEVEL",
@@ -220,3 +222,27 @@ class CorruptScriptRunError(ScriptRunStoreError):
         self.run_id = run_id
         self.reason = reason
         super().__init__(message or f"corrupt script run {run_id!r}: {reason}")
+
+
+class GrantError(WorkflowError):
+    """Raised for a malformed scoped-grant request, handle, or store id (issue #33).
+
+    This covers *programming/shape* errors (bad scope, unknown side-effect class,
+    non-positive TTL, a payload smuggling a raw credential). A grant *denial* is
+    not an error: it is a structured :class:`~hermes_workflows.grants.GrantDecision`
+    returned by ``resolve_grant`` so the controller fails closed without raising.
+    """
+
+
+class GrantDenied(GrantError):
+    """Raised only when a caller opts into exception-style grant enforcement.
+
+    The loop runtime never raises this — it halts the run with a structured
+    ``halted_grant_denied`` signal instead. ``code`` mirrors the stable
+    :class:`~hermes_workflows.grants.GrantDecision` code (e.g. ``"denied_scope"``,
+    ``"expired"``, ``"no_broker"``) so callers can branch without parsing text.
+    """
+
+    def __init__(self, reason: str, *, code: str = "denied") -> None:
+        self.code = code
+        super().__init__(reason)

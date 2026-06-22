@@ -135,6 +135,7 @@ def workflow_status(
 | `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `FileRunStore` snapshots/journals; `KanbanRunStore` documented/stubbed. |
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
+| `grants.py` | Backend-neutral scoped actuator grants: `GrantRequest` / `SessionGrant` / `GrantHandle` models, in-memory/file `GrantStore`, `StaticPolicyGrantBroker`, `request_grant` / `resolve_grant` / `validate_grant`, and a credential-leak guard. Wired into `loop_run` for fail-closed session-launch authorization. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
 | `errors.py` | `WorkflowError` base, `WorkflowValidationError`, `RunNotFound`, `SandboxPolicyError`. |
 
@@ -236,6 +237,76 @@ observer seam for ATH, gateways, CLIs, notebooks, or dashboards. Event payloads
 include run id, loop name, definition hash, event index, controller state,
 iteration, summary, and event-specific evidence/handles. The controller still owns
 state transitions; adapters own delivery, redaction, retries, and auth.
+
+### 1.5.1 Scoped actuator grants (issue #33)
+
+A controller actuator that must *launch or control a managed agent session*
+needs real authority. The wrong way to give it that authority is the obvious
+one: hand the adapter a raw shell token or a reused browser cookie. Those are
+bearer secrets — ambient, unscoped, non-expiring, unauditable, and fully
+reusable by anyone who can read the run state. `grants.py` replaces them with a
+**scoped grant**: an explicit, expiring, single-purpose authorization resolved
+through an injected broker, never a credential held by the actuator.
+
+The flow rides the existing actuator envelope. An actuator returns a
+credential-free `grant_request`:
+
+```json
+{
+  "grant_request": {
+    "scope": ["session.launch", "session.status"],
+    "side_effect_class": "session_launch",
+    "subject": "work-context-abc",
+    "reason": "launch a managed session to drive the issue",
+    "ttl_seconds": 1800
+  }
+}
+```
+
+`loop_run(..., grant_broker=..., grant_store=...)` resolves it through a
+`GrantBroker`. Core ships `StaticPolicyGrantBroker`, a backend-neutral default
+with **no real authentication** — it exists so the controller, docs, and tests
+have a working broker. It clamps the requested TTL to a policy maximum, rejects
+out-of-policy scope and side-effect classes, and mints an opaque, revocable
+`GrantHandle` (`session_id` / `work_context_id` / `handle_ref`) that names the
+session without carrying a secret. A real backend (Relay being one future
+adapter) implements the same `GrantBroker` Protocol to authenticate and issue a
+backend-scoped reference. The primitive stays generic: no `relay_*` grant kinds,
+no hard-coded session semantics.
+
+Every issued `SessionGrant` carries the four properties the acceptance demands —
+explicit `scope`, explicit `side_effect_class` (`read_only` / `session_launch` /
+`session_control` / `external_write`), explicit expiry (`issued_at` /
+`expires_at` plus epoch fields so a persisted grant re-validates without
+re-deriving the clock), and `audit` metadata (`requested_by`, `reason`,
+`run_id`, `def_hash`, iteration). The controller records the grant in
+`status.grants` and re-exposes it to later steps via `context["grants"]`, so a
+launched session handle is available to the next sensor/actuator. Persistence is
+the same generic boundary as loops: `GrantStore.save_grant` / `get_grant`, with
+`InMemoryGrantStore` and `FileGrantStore` (`<root>/<grant_id>.json`) bundled. A
+workflow persists the handle, restarts, re-reads it, and calls `validate_grant`
+to resume status checks against the same session/work-context.
+
+Failure is always closed. `resolve_grant` and `validate_grant` return structured
+negative decisions (`GrantDecision` / `GrantValidation` with stable codes like
+`denied_scope`, `denied_class`, `expired`, `no_broker`, `malformed`) rather than
+raising, and the loop halts in `halted_grant_denied` with a `grant_denied`
+event. A missing broker, a malformed request, an expired reused handle, a
+broker that widens scope beyond the request, and a grant payload that smuggles a
+raw credential all converge on the same fail-closed signal. The credential guard
+(`find_raw_credential` / `redact_credentials`) is the line that keeps this from
+decaying into cookie reuse: any grant payload whose keys look credential-shaped
+(`cookie`, `authorization`, `token`, `password`, `secret`, …) is rejected, and
+such values are masked before they are journaled — the denied event names the
+offending *key*, never its value. Legitimate `wait` / `approval_request`
+identity tokens are untouched because redaction is scoped to the
+`grant_request` / `grant` sub-objects only.
+
+This is intentionally narrower than full launch-approval/session-policy
+governance (#11): it is the authorization *seam* — models, store, broker
+Protocol, fail-closed wiring — not a real auth backend. The bundled broker
+authenticates nothing; it makes the shape real, testable, and credential-free so
+a backend adapter can drop in behind `GrantBroker` later.
 
 ### 1.6 The sandboxed runtime (skeleton)
 

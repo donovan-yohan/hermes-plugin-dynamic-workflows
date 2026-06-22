@@ -49,6 +49,25 @@ from .loops import (
     loop_validate,
     loop_run,
 )
+from .grants import (
+    SIDE_EFFECT_CLASSES,
+    GrantHandle,
+    GrantRequest,
+    SessionGrant,
+    GrantDecision,
+    GrantValidation,
+    GrantBroker,
+    GrantStore,
+    StaticPolicyGrantBroker,
+    InMemoryGrantStore,
+    FileGrantStore,
+    request_grant,
+    resolve_grant,
+    validate_grant,
+    find_raw_credential,
+    redact_credentials,
+    REDACTED,
+)
 from .vm import (
     CapabilityBroker,
     ScriptRunResult,
@@ -134,6 +153,8 @@ from .errors import (
     ScriptRunStoreError,
     ScriptRunNotFound,
     CorruptScriptRunError,
+    GrantError,
+    GrantDenied,
 )
 
 __version__ = "0.1.0"
@@ -157,6 +178,24 @@ __all__ = [
     "LoopRunStore",
     "InMemoryLoopRunStore",
     "FileLoopRunStore",
+    # scoped actuator grants (issue #33)
+    "SIDE_EFFECT_CLASSES",
+    "GrantHandle",
+    "GrantRequest",
+    "SessionGrant",
+    "GrantDecision",
+    "GrantValidation",
+    "GrantBroker",
+    "GrantStore",
+    "StaticPolicyGrantBroker",
+    "InMemoryGrantStore",
+    "FileGrantStore",
+    "request_grant",
+    "resolve_grant",
+    "validate_grant",
+    "find_raw_credential",
+    "redact_credentials",
+    "REDACTED",
     "validate_script",
     "ScriptValidation",
     "WorkflowVM",
@@ -244,4 +283,6 @@ __all__ = [
     "ScriptRunStoreError",
     "ScriptRunNotFound",
     "CorruptScriptRunError",
+    "GrantError",
+    "GrantDenied",
 ]
