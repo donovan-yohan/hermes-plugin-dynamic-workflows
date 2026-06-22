@@ -356,11 +356,16 @@ print(status.state, status.report["convergence_risk"])  # converged converged_by
 ```
 
 The generic checked-in example lives at `examples/issue_controller.loop.json`.
+`brakes.max_steps` is an action cap, not a sensor-read cap: after the final
+allowed action, the controller runs one more sensor pass so the terminal state is
+based on fresh evidence. Wall-time is enforced before and after synchronous
+sensor/actuator calls, and the context exposes `limits.remaining_wall_seconds` /
+`deadline_monotonic` so adapters can enforce cooperative timeouts internally.
 Repo/tool specifics are intentionally inputs or adapter config, not new primitive
 kinds like `relay_*` or `github_*`. Actuator contexts include a small handoff
-contract (`prompt`, expected artifact/session/check handles, optional `cost`) so
-Relay, Kanban, ATH, or local process adapters can execute one bounded step and
-return evidence without becoming the workflow abstraction.
+contract (`prompt`, expected artifact/session/check handles, optional numeric
+`cost`) so Relay, Kanban, ATH, or local process adapters can execute one bounded
+step and return evidence without becoming the workflow abstraction.
 
 ## Saved workflow catalog
 

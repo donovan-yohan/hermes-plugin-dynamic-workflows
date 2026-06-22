@@ -212,11 +212,15 @@ The sensor contract is the source of truth:
 Actuators are backend adapters: inline code, `delegate_task`, managed processes,
 Kanban, Relay, or ATH-triggered execution can all fit behind the same callable
 shape. The controller does not trust an actuator's success claim; only a later
-sensor result can converge the run. Runtime-enforced brakes cover max steps,
-wall time, repeated `signal_key` stall detection, optional actuator-reported cost,
-and retry-once handling for noisy sensors. This keeps Dynamic Workflows' product
-primitive generic while still making Relay/ATH handoffs possible through adapter
-configuration and run inputs.
+sensor result can converge the run. `brakes.max_steps` caps actions; after the
+last allowed action, the controller performs a final sensor pass so it converges
+or halts from fresh evidence. Runtime-enforced brakes cover action count,
+wall-time checks around synchronous calls, repeated `signal_key` stall detection,
+strict optional actuator-reported cost, and retry-once handling for noisy sensors.
+The handoff context includes remaining actions, remaining wall time/deadline, and
+remaining budget so adapters can enforce cooperative internal timeouts. This keeps
+Dynamic Workflows' product primitive generic while still making Relay/ATH handoffs
+possible through adapter configuration and run inputs.
 
 ### 1.6 The sandboxed runtime (skeleton)
 
