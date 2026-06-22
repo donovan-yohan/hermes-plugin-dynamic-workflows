@@ -21,6 +21,7 @@ adapter responsibilities behind the injected actuator/sensor callables.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -157,6 +158,10 @@ def loop_run(
     history and may call a backend such as Relay, Kanban, ``delegate_task``, or a
     local process. The controller never trusts the actuator's self-report as
     success; only a later sensor result can converge the run.
+
+    ``brakes.max_steps`` is an action cap. A run may perform one extra sensor
+    read after the final action so the controller can verify the action before it
+    converges or halts at the step cap with fresh evidence.
     """
 
     validation = loop_validate(spec)
@@ -165,6 +170,7 @@ def loop_run(
 
     normalized = validation.normalized
     brakes = _brakes(normalized)
+    max_actions = int(brakes["max_steps"])
     now = _utc_now_iso()
     rid = run_id or f"loop_{validation.def_hash[:8]}_{uuid.uuid4().hex[:12]}"
     status = LoopRunStatus(
@@ -181,13 +187,15 @@ def loop_run(
     last_signal: Optional[str] = None
     repeated_signal_count = 0
     total_cost = 0.0
+    action_count = 0
 
-    for iteration in range(1, int(brakes["max_steps"]) + 1):
-        status.iterations = iteration
+    while True:
         if _time_exceeded(started, brakes):
             _halt(status, "halted_time_cap", "max_wall_seconds exceeded before sensing")
             break
 
+        status.iterations += 1
+        iteration = status.iterations
         status.state = "sensing"
         status.events.append(_event("sensing", "sensing", iteration, "sensor started"))
         sensor_result = _read_sensor_with_noise_retry(
@@ -197,6 +205,10 @@ def loop_run(
                 inputs,
                 status,
                 latest=status.sensor_results[-1] if status.sensor_results else None,
+                started=started,
+                brakes=brakes,
+                action_count=action_count,
+                total_cost=total_cost,
             ),
             max_retries=int(brakes["max_sensor_retries"]),
             status=status,
@@ -217,6 +229,10 @@ def loop_run(
                 converged=sensor_result.converged,
             )
         )
+
+        if _time_exceeded(started, brakes):
+            _halt(status, "halted_time_cap", "max_wall_seconds exceeded during sensing")
+            break
 
         if sensor_result.converged:
             status.state = "converged"
@@ -243,6 +259,10 @@ def loop_run(
             _halt(status, "halted_actuator_error", "non-converged loop has no actuator")
             break
 
+        if action_count >= max_actions:
+            _halt(status, "halted_step_cap", f"max_steps {max_actions} exhausted without convergence")
+            break
+
         if _time_exceeded(started, brakes):
             _halt(status, "halted_time_cap", "max_wall_seconds exceeded before acting")
             break
@@ -250,21 +270,37 @@ def loop_run(
         status.state = "acting"
         status.events.append(_event("acting", "acting", iteration, "actuator started"))
         try:
-            action = actuator(_context(normalized, inputs, status, latest=sensor_result))
+            action = actuator(
+                _context(
+                    normalized,
+                    inputs,
+                    status,
+                    latest=sensor_result,
+                    started=started,
+                    brakes=brakes,
+                    action_count=action_count,
+                    total_cost=total_cost,
+                )
+            )
             if not isinstance(action, dict):
                 raise TypeError(f"actuator returned {type(action).__name__}, expected dict")
+            action_cost = _action_cost(action)
         except Exception as exc:  # pragma: no cover - exact exception type is caller-owned
             _halt(status, "halted_actuator_error", f"{type(exc).__name__}: {exc}")
             break
 
+        action_count += 1
         status.actuator_results.append(action)
         status.events.append(_event("actuator_result", "verifying", iteration, "actuator completed", result=action))
-        total_cost += _numeric(action.get("cost"))
+
+        if _time_exceeded(started, brakes):
+            _halt(status, "halted_time_cap", "max_wall_seconds exceeded during acting")
+            break
+
+        total_cost += action_cost
         if brakes.get("max_cost") is not None and total_cost > float(brakes["max_cost"]):
             _halt(status, "halted_budget_cap", f"cost {total_cost} exceeded max_cost {brakes['max_cost']}")
             break
-    else:
-        _halt(status, "halted_step_cap", f"max_steps {brakes['max_steps']} exhausted without convergence")
 
     status.updated_at = _utc_now_iso()
     if not status.report:
@@ -346,7 +382,7 @@ def _nonnegative_number(obj: dict[str, Any], key: str, ptr: str, diags: list[Dia
     if key not in obj:
         return
     value = obj[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
         diags.append(_e("E_LOOP_SCHEMA", f"brakes.{key} must be a non-negative number", ptr))
 
 
@@ -396,6 +432,7 @@ def _read_sensor_with_noise_retry(
 
 def _normalize_sensor_result(value: LoopSensorResult | dict[str, Any]) -> LoopSensorResult:
     if isinstance(value, LoopSensorResult):
+        _validate_sensor_result(value)
         return value
     if not isinstance(value, dict):
         raise TypeError(f"sensor returned {type(value).__name__}, expected dict")
@@ -405,14 +442,33 @@ def _normalize_sensor_result(value: LoopSensorResult | dict[str, Any]) -> LoopSe
     evidence = value.get("evidence", [])
     if not isinstance(evidence, list):
         raise ValueError("sensor result evidence must be a list")
+    converged = value.get("converged", False)
+    if not isinstance(converged, bool):
+        raise ValueError("sensor result converged must be a boolean")
+    retryable_noise = value.get("retryable_noise", False)
+    if not isinstance(retryable_noise, bool):
+        raise ValueError("sensor result retryable_noise must be a boolean")
     return LoopSensorResult(
-        converged=bool(value.get("converged", False)),
+        converged=converged,
         signal_key=signal_key,
         summary=str(value["summary"]) if value.get("summary") is not None else signal_key,
         evidence=[e for e in evidence if isinstance(e, dict)],
-        retryable_noise=bool(value.get("retryable_noise", False)),
+        retryable_noise=retryable_noise,
         next_hint=str(value["next_hint"]) if value.get("next_hint") is not None else None,
     )
+
+
+def _validate_sensor_result(value: LoopSensorResult) -> None:
+    if not isinstance(value.converged, bool):
+        raise ValueError("sensor result converged must be a boolean")
+    if not isinstance(value.retryable_noise, bool):
+        raise ValueError("sensor result retryable_noise must be a boolean")
+    if not isinstance(value.signal_key, str) or not value.signal_key:
+        raise ValueError("sensor result requires non-empty signal_key")
+    if not isinstance(value.evidence, list):
+        raise ValueError("sensor result evidence must be a list")
+    if not all(isinstance(item, dict) for item in value.evidence):
+        raise ValueError("sensor result evidence entries must be objects")
 
 
 def _context(
@@ -421,7 +477,14 @@ def _context(
     status: LoopRunStatus,
     *,
     latest: Optional[LoopSensorResult],
+    started: float,
+    brakes: dict[str, Any],
+    action_count: int,
+    total_cost: float,
 ) -> dict[str, Any]:
+    max_actions = int(brakes["max_steps"])
+    max_cost = brakes.get("max_cost")
+    remaining_cost = None if max_cost is None else max(0.0, float(max_cost) - total_cost)
     return {
         "run_id": status.run_id,
         "loop_name": spec.get("name"),
@@ -429,6 +492,17 @@ def _context(
         "inputs": dict(inputs or {}),
         "iteration": status.iterations,
         "latest_sensor": latest.as_dict() if latest else None,
+        "limits": {
+            "max_actions": max_actions,
+            "action_count": action_count,
+            "remaining_actions": max(0, max_actions - action_count),
+            "max_wall_seconds": brakes.get("max_wall_seconds"),
+            "remaining_wall_seconds": _remaining_wall_seconds(started, brakes),
+            "deadline_monotonic": _deadline_monotonic(started, brakes),
+            "max_cost": max_cost,
+            "total_cost": total_cost,
+            "remaining_cost": remaining_cost,
+        },
         "history": {
             "sensor_results": [r.as_dict() for r in status.sensor_results],
             "actuator_results": list(status.actuator_results),
@@ -438,7 +512,7 @@ def _context(
             "prompt": latest.next_hint if latest else None,
             "expected_return": {
                 "artifacts": "list of changed files, PR/check/session handles, or other evidence",
-                "cost": "optional numeric cost for budget brakes",
+                "cost": "optional non-negative numeric cost for budget brakes",
                 "summary": "bounded action summary; success still requires a later sensor result",
             },
         },
@@ -446,8 +520,32 @@ def _context(
 
 
 def _time_exceeded(started: float, brakes: dict[str, Any]) -> bool:
+    remaining = _remaining_wall_seconds(started, brakes)
+    return remaining is not None and remaining <= 0
+
+
+def _deadline_monotonic(started: float, brakes: dict[str, Any]) -> Optional[float]:
     max_wall = brakes.get("max_wall_seconds")
-    return max_wall is not None and (time.monotonic() - started) > float(max_wall)
+    return None if max_wall is None else started + float(max_wall)
+
+
+def _remaining_wall_seconds(started: float, brakes: dict[str, Any]) -> Optional[float]:
+    deadline = _deadline_monotonic(started, brakes)
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _action_cost(action: dict[str, Any]) -> float:
+    if "cost" not in action or action["cost"] is None:
+        return 0.0
+    value = action["cost"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("actuator cost must be a non-negative number")
+    cost = float(value)
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError("actuator cost must be a non-negative number")
+    return cost
 
 
 def _halt(status: LoopRunStatus, state: LoopState, reason: str) -> None:
@@ -478,14 +576,6 @@ def _event(kind: str, state: LoopState, iteration: int, summary: str, **extra: A
     }
     payload.update(extra)
     return payload
-
-
-def _numeric(value: Any) -> float:
-    if isinstance(value, bool):
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    return 0.0
 
 
 def _identifier_safe(value: str) -> bool:
