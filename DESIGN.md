@@ -98,6 +98,15 @@ def workflow_status(
   pollers do not need exception handling. `include_steps=False` omits the
   per-step list for cheap polling.
 
+- **`workflow_control`** (issue #9) is the operator surface: a second registered
+  Hermes tool whose `action` selects `overview` (list active/recent runs and
+  blocked waits), `status` (one run's compact control state, current phase,
+  waits, child task refs, links), or one of the append-only control verbs
+  `pause` / `resume` / `stop` / `task_stop` / `retry`. It is backed by the
+  generic `controls` module (§1.5.2) and a durable `FileControlStore`, so an
+  operator can pause, stop, or retry a run without touching the authoring
+  `workflow` tool and without deleting any audit history.
+
 ### 1.2 Component map
 
 ```
@@ -307,6 +316,65 @@ governance (#11): it is the authorization *seam* — models, store, broker
 Protocol, fail-closed wiring — not a real auth backend. The bundled broker
 authenticates nothing; it makes the shape real, testable, and credential-free so
 a backend adapter can drop in behind `GrantBroker` later.
+
+### 1.5.2 Operator controls, status & wait inspection (issue #9)
+
+A run that is *authored* through `workflow` eventually needs an *operator*
+surface: pause it, resume it, stop it, retry a failed call/task, and answer "what
+is it blocked on?" — without re-decoding raw journal/snapshot JSON. `controls.py`
+is that surface, and it is deliberately generic: no Relay, ATH, or Kanban
+behaviour, only run ids and three boring-but-load-bearing pieces.
+
+**Append-only control records.** Every pause/resume/stop/`task_stop`/retry is a
+`WorkflowControl` — an immutable audit record persisted by a `ControlStore`
+(`InMemoryControlStore`, or `FileControlStore` writing
+`<root>/<run_id>/controls.jsonl`). Recording an intent never mutates or deletes a
+run's history: a stop *adds* a stop record. Idempotency and cross-restart
+durability come from the same place — `FileControlStore.append` re-reads the
+run's existing control ids from disk before writing, so a re-issued (e.g.
+deterministic retry) id is deduped even by a fresh process, and a torn/forged
+line is skipped rather than failing the whole read.
+
+**A control-state projection.** `project_control_state(run_id, controls)` folds
+the records into a compact `RunControlState`: `desired_state` (`running` /
+`paused` / `stopped`), the per-task `stopped_tasks`, and the retry lineage.
+Crucially this is *desired* state, not enforcement — actually preventing new
+child work or reattaching to pending work is the backend adapter's job; core only
+records and projects intent. **Stop is terminal**: a `resume` recorded after a
+`stop` stays in the audit trail but never un-stops the run. A `task_stop` halts
+one named child without stopping the whole run.
+
+**Idempotent retry lineage.** `retry(store, run_id, target_ref)` is idempotent
+per `(run_id, target_ref)` — it returns the existing retry record instead of
+forking a duplicate; `force=True` mints the next `attempt`. Each retry carries
+`attempt` (1-based) and a `replacement_ref` (the new call/task id — passed
+explicitly when the backend has minted it, else a deterministic
+`<target_ref>#retry<N>` placeholder). The control id is derived from
+`(run_id, target_ref, attempt)`, so even a forced re-retry is deduped across a
+restart. The *replacement execution* stays adapter-owned; core makes the lineage
+shape explicit and durable.
+
+**Wait inspection from data the other slices already persist.**
+`waits_from_loop_status` turns a loop's `waiting_for_event` / `waiting_for_approval`
+state and its suspension event into a uniform `WaitSummary` (§1.5);
+`waits_from_kanban_states` does the same for a `ScriptRunStore`'s non-terminal
+Kanban card states (§5.7). No new backend or store is introduced — the inspectors
+read plain dicts, so they compose with whatever a caller already has.
+
+**Compact projections, no JSON spelunking.** `inspect_run(...)` composes a single
+run's lifecycle status, control state, current phase, waits, child task refs,
+retry lineage, last events, result/error, and dashboard `links` (`run_links`
+bundles script/journal/snapshot/transcript/result/tasks paths the caller knows)
+into one stable shape. `list_runs(records, control_store, waits=...)` is the
+`/workflows` overview: registry-shaped run records summarised newest-first and
+capped, merged with control state, with blocked waits folded in both per-run and
+as a flat list, plus aggregate counts. Both take plain data so they stay
+backend-neutral and trivially testable.
+
+This is the operator *seam*, narrower than a live scheduler: core records and
+projects control intent durably and exposes inspectable status; enforcing pause,
+killing in-flight child work, and executing retries are backend-adapter
+responsibilities that ride these records.
 
 ### 1.6 The sandboxed runtime (skeleton)
 
@@ -997,7 +1065,11 @@ Near-term and future work, roughly in priority order:
 2. **True asynchronous execution.** Move from the deterministic synchronous
    scheduler to real concurrent fan-out honoring `max_parallel` and the per-
    definition `policy.max_parallel`, with backpressure and cancellation
-   (`status='cancelled'`).
+   (`status='cancelled'`). The operator-control seam now ships the durable intent
+   half of this: pause/resume/stop/`task_stop`/retry records, a control-state
+   projection, and wait inspection (§1.5.2, issue #9). Remaining: an executor that
+   *enforces* those intents — pausing fan-out, killing in-flight child work, and
+   running retries — rather than only recording and projecting them.
 
 3. **Resume / journal engine.** Build on the existing append-style run records and
    `def_hash` correlation to support resuming an interrupted run from the last

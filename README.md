@@ -22,6 +22,7 @@ journal events.
 | Surface | Purpose |
 | --- | --- |
 | `workflow` tool | Single model-facing entry point: dry-run validate, run a definition, or inspect an existing run id. |
+| `workflow_control` tool | Operator surface: list active/recent runs and blocked waits (`overview`), inspect one run's compact control state/waits/links (`status`), or record an append-only pause/resume/stop/task_stop/retry intent. |
 | `workflow_validate` function | Parse and statically validate a workflow definition without side effects. |
 | `workflow_run` function | Execute a validated workflow in the deterministic skeleton runtime. |
 | `workflow_status` function | Query status/progress/result for a workflow run id. |
@@ -40,6 +41,7 @@ The current runtime supports:
 - a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`; not model-facing)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
+- backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
 
 ## Quick start as a Python package
 
@@ -466,6 +468,70 @@ default with **no real authentication**; a future backend adapter (Relay is one
 such backend) implements `GrantBroker` to authenticate and mint real,
 backend-scoped session references behind the same seam.
 
+## Operator controls, status & wait inspection (issue #9)
+
+Authoring a run is one surface; *operating* it is another. `controls.py` is the
+backend-neutral operator surface — pause, resume, stop, retry, and "what is this
+blocked on?" — over plain run ids, with no Relay/ATH/Kanban behaviour baked in.
+
+Controls are **append-only audit records**. Recording a stop *adds* a stop record;
+nothing is ever deleted. A durable `FileControlStore` re-reads the log from disk,
+so controls survive a restart and a re-issued retry id is deduped even by a fresh
+process:
+
+```python
+from hermes_workflows import (
+    FileControlStore, pause_run, stop_run, retry, project_control_state,
+)
+
+controls = FileControlStore(".workflow-runs/controls")
+pause_run(controls, run_id, actor="op", reason="cooling off")
+stop_run(controls, run_id, reason="superseded")     # terminal; resume won't un-stop
+
+state = project_control_state(run_id, controls.list_for(run_id))
+state.desired_state    # "stopped"  (running | paused | stopped)
+state.stopped_tasks    # per-task task_stop records
+state.retries          # retry lineage
+```
+
+**Retry is idempotent with explicit lineage.** `retry(store, run_id, target_ref)`
+returns the existing retry for that target instead of forking a duplicate;
+`force=True` mints the next `attempt`. Each retry carries `attempt` and a
+`replacement_ref` (pass the backend-minted id, or get a deterministic
+`<target_ref>#retry<N>` placeholder). The *replacement execution* stays
+adapter-owned — core makes the lineage durable and idempotent:
+
+```python
+first = retry(controls, run_id, "call-3")            # attempt 1
+again = retry(controls, run_id, "call-3")            # same record (idempotent)
+forced = retry(controls, run_id, "call-3", force=True)  # attempt 2, new replacement_ref
+```
+
+**Inspect waits without spelunking.** The inspectors read data the other slices
+already persist — a loop's `waiting_for_*` suspension and a `ScriptRunStore`'s
+non-terminal Kanban card states — into uniform `WaitSummary` rows:
+
+```python
+from hermes_workflows import waits_from_loop_status, waits_from_kanban_states
+
+waits = waits_from_loop_status(loop_status)            # event/approval waits
+waits += waits_from_kanban_states(script_store.kanban_waits())  # blocked cards
+```
+
+**Compact projections.** `inspect_run(...)` composes one run's lifecycle, control
+state, current phase, waits, child task refs, retry lineage, last events,
+result/error, and dashboard `links` (`run_links` bundles script/journal/snapshot/
+transcript/result paths) into one stable shape. `list_runs(records, control_store,
+waits=...)` is the `/workflows` overview: runs newest-first and capped, merged with
+control state, with blocked waits folded in and aggregate counts.
+
+The plugin registers a second **`workflow_control`** tool over a durable
+`FileControlStore` (sibling of the runs dir): `action=overview` / `status` /
+`pause` / `resume` / `stop` / `task_stop` / `retry`. It is the operator surface —
+distinct from the model-facing `workflow` authoring tool — and never deletes audit
+history. Enforcing the intent (pausing fan-out, killing in-flight child work,
+executing the retry) is a backend-adapter responsibility that rides these records.
+
 ## Saved workflow catalog
 
 Templates are JSON workflow files named `<template>.workflow.json`. The default catalog searches the
@@ -489,6 +555,7 @@ the release decision to succeed when QA/review evidence matches the same head.
 ```mermaid
 flowchart LR
   LLM[Hermes agent / user] --> W[workflow\nmodel-facing tool]
+  OP[Operator] --> WC[workflow_control\noperator tool]
 
   W --> V[workflow_validate\nlibrary primitive]
   W --> R[workflow_run\nlibrary primitive]
@@ -504,6 +571,9 @@ flowchart LR
   RT --> STORE[RunStore\nInMemory library, FileRunStore plugin]
 
   S --> STORE
+  WC --> CTL[controls.py\nproject_control_state / inspect_run / list_runs]
+  CTL --> CS[ControlStore\nappend-only FileControlStore]
+  CTL --> STORE
 ```
 
 ## What we learned from Claude Dynamic Workflows

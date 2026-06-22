@@ -22,7 +22,7 @@ if _SRC.exists():
     if src_text not in sys.path:
         sys.path.insert(0, src_text)
 
-from hermes_workflows.errors import WorkflowError  # noqa: E402
+from hermes_workflows.errors import ControlError, WorkflowError  # noqa: E402
 from hermes_workflows.primitives import (  # noqa: E402
     workflow as _workflow,
     workflow_run as _workflow_run,
@@ -31,6 +31,9 @@ from hermes_workflows.primitives import (  # noqa: E402
 )
 from hermes_workflows.registry import FileRunStore  # noqa: E402
 from hermes_workflows.catalog import FileWorkflowCatalog  # noqa: E402
+from hermes_workflows import controls as _controls  # noqa: E402
+from hermes_workflows.controls import FileControlStore  # noqa: E402
+from hermes_workflows.script_store import ScriptRunStore  # noqa: E402
 
 TOOLSET = "dynamic_workflows"
 
@@ -60,12 +63,46 @@ def _error(exc: Exception) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _plugin_store(session_id: Optional[str] = None) -> FileRunStore:
+def _runs_root() -> Path:
+    """Directory holding per-run snapshots/journals (the FileRunStore root).
+
+    ``HERMES_WORKFLOWS_STATE_DIR`` keeps its existing meaning — the runs dir —
+    so this slice is backward compatible. Controls and script runs live as
+    siblings of it (see :func:`_state_root`).
+    """
     root = os.getenv("HERMES_WORKFLOWS_STATE_DIR")
-    if not root:
-        hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
-        root = str(hermes_home / "dynamic-workflows" / "runs")
-    return FileRunStore(root, session_id=session_id)
+    if root:
+        return Path(root).expanduser()
+    hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+    return hermes_home / "dynamic-workflows" / "runs"
+
+
+def _state_root() -> Path:
+    """Parent of the runs dir, under which sibling stores (controls, script-runs) live."""
+    return _runs_root().parent
+
+
+def _plugin_store(session_id: Optional[str] = None) -> FileRunStore:
+    return FileRunStore(str(_runs_root()), session_id=session_id)
+
+
+def _plugin_control_store(session_id: Optional[str] = None) -> FileControlStore:
+    root = _state_root() / "controls"
+    if session_id:
+        root = root / session_id
+    return FileControlStore(str(root))
+
+
+def _plugin_script_store() -> Optional[ScriptRunStore]:
+    """Return the script-run store iff its directory already exists (best-effort).
+
+    Used only to surface durable Kanban waits in the operator overview; absent a
+    script-runs dir there is simply nothing to inspect, never an error.
+    """
+    path = _state_root() / "script-runs"
+    if not path.exists():
+        return None
+    return ScriptRunStore(str(path))
 
 
 def _plugin_catalog() -> FileWorkflowCatalog:
@@ -230,6 +267,170 @@ WORKFLOW_STATUS_SCHEMA = {
 }
 
 
+WORKFLOW_CONTROL_SCHEMA = {
+    "name": "workflow_control",
+    "description": (
+        "Operator controls and status for dynamic workflow runs. action=overview "
+        "lists active/recent runs and blocked waits; action=status returns one "
+        "run's compact control state, current phase, waits, child task refs, and "
+        "links; pause/resume/stop/task_stop/retry record an append-only control "
+        "intent (the audit trail is never deleted). Retry is idempotent per "
+        "target_ref with explicit replacement lineage."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["overview", "status", "pause", "resume", "stop", "task_stop", "retry"],
+                "description": "Operator operation to perform.",
+            },
+            "run_id": {
+                "type": ["string", "null"],
+                "description": "Target run id (required for everything except overview).",
+                "default": None,
+            },
+            "target_ref": {
+                "type": ["string", "null"],
+                "description": "Child call/task id for task_stop and retry.",
+                "default": None,
+            },
+            "replacement_ref": {
+                "type": ["string", "null"],
+                "description": "Optional caller-minted replacement id for retry lineage.",
+                "default": None,
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Force a new retry attempt instead of returning the existing one.",
+                "default": False,
+            },
+            "actor": {
+                "type": ["string", "null"],
+                "description": "Who is issuing the control (recorded for audit).",
+                "default": None,
+            },
+            "reason": {
+                "type": ["string", "null"],
+                "description": "Why the control is being issued (recorded for audit).",
+                "default": None,
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Max runs returned by overview.",
+                "default": 20,
+            },
+            "events_limit": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200,
+                "description": "Max recent journal events included in status.",
+                "default": 10,
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _control_link_resolver(store: FileRunStore):
+    def resolve(record: Any) -> dict[str, Any]:
+        run_dir = store.root / record.run_id
+        return _controls.run_links(
+            run_id=record.run_id,
+            snapshot_path=str(run_dir / "snapshot.json"),
+            journal_path=str(run_dir / "journal.jsonl"),
+        )
+
+    return resolve
+
+
+def _kanban_waits(script_store: Optional[ScriptRunStore]) -> list:
+    if script_store is None:
+        return []
+    try:
+        states = script_store.kanban_waits()
+    except Exception:  # pragma: no cover - defensive; durable read is best-effort
+        return []
+    return _controls.waits_from_kanban_states(states)
+
+
+def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
+    try:
+        session_id = _session_id_from_kwargs(kwargs)
+        action = params.get("action")
+        control_store = _plugin_control_store(session_id=session_id)
+        run_id = params.get("run_id")
+
+        if action == "overview":
+            run_store = _plugin_store(session_id=session_id)
+            waits = _kanban_waits(_plugin_script_store())
+            overview = _controls.list_runs(
+                run_store.list(),
+                control_store,
+                waits=waits,
+                link_resolver=_control_link_resolver(run_store),
+                limit=params.get("limit", 20),
+            )
+            return _ok({"operation": "overview", **overview})
+
+        if not run_id:
+            raise ControlError(f"workflow_control action={action!r} requires 'run_id'")
+
+        if action == "status":
+            run_store = _plugin_store(session_id=session_id)
+            record = run_store.get(run_id)
+            state = _controls.project_control_state(run_id, control_store.list_for(run_id))
+            waits = [w for w in _kanban_waits(_plugin_script_store()) if w.run_id == run_id]
+            links = _control_link_resolver(run_store)(record) if record is not None else {"run_id": run_id}
+            report = _controls.inspect_run(
+                run_id,
+                lifecycle=record.status if record is not None else "unknown",
+                control_state=state,
+                current_phase=_controls.current_phase(record.steps) if record is not None else None,
+                progress=record.to_status().progress.as_dict() if record is not None else None,
+                waits=waits,
+                result=record.result if record is not None else None,
+                error=record.error if record is not None else None,
+                last_events=run_store.journal(run_id, limit=params.get("events_limit", 10))
+                if record is not None
+                else [],
+                links=links,
+                events_limit=params.get("events_limit", 10),
+            )
+            return _ok({"operation": "status", **report})
+
+        verbs = {
+            "pause": lambda: _controls.pause_run(control_store, run_id, actor=params.get("actor"), reason=params.get("reason")),
+            "resume": lambda: _controls.resume_run(control_store, run_id, actor=params.get("actor"), reason=params.get("reason")),
+            "stop": lambda: _controls.stop_run(control_store, run_id, actor=params.get("actor"), reason=params.get("reason")),
+            "task_stop": lambda: _controls.stop_task(
+                control_store, run_id, params.get("target_ref") or "", actor=params.get("actor"), reason=params.get("reason")
+            ),
+            "retry": lambda: _controls.retry(
+                control_store,
+                run_id,
+                params.get("target_ref") or "",
+                replacement_ref=params.get("replacement_ref"),
+                force=params.get("force", False),
+                actor=params.get("actor"),
+                reason=params.get("reason"),
+            ),
+        }
+        if action not in verbs:
+            raise ControlError(f"unknown workflow_control action: {action!r}")
+        control = verbs[action]()
+        state = _controls.project_control_state(run_id, control_store.list_for(run_id))
+        return _ok({"operation": action, "control": control.to_dict(), "control_state": state.to_dict()})
+    except WorkflowError as exc:
+        return _error(exc)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        return _error(exc)
+
+
 def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
     try:
         session_id = _session_id_from_kwargs(kwargs)
@@ -313,4 +514,11 @@ def register(ctx: Any) -> None:
         schema=WORKFLOW_SCHEMA,
         handler=_handle_workflow,
         description="Validate, run, or inspect a dynamic workflow via one model-facing entry point.",
+    )
+    ctx.register_tool(
+        name="workflow_control",
+        toolset=TOOLSET,
+        schema=WORKFLOW_CONTROL_SCHEMA,
+        handler=_handle_control,
+        description="Operator controls, status, and blocked-wait inspection for dynamic workflow runs.",
     )

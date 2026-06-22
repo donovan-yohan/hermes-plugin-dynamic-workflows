@@ -25,6 +25,7 @@ __all__ = [
     "CorruptScriptRunError",
     "GrantError",
     "GrantDenied",
+    "ControlError",
     # Diagnostic codes.
     "E_PARSE",
     "E_SCHEMA_TOPLEVEL",
@@ -246,3 +247,15 @@ class GrantDenied(GrantError):
     def __init__(self, reason: str, *, code: str = "denied") -> None:
         self.code = code
         super().__init__(reason)
+
+
+class ControlError(WorkflowError):
+    """Raised for a malformed operator-control record or argument (issue #9).
+
+    Covers a missing run/control id, an unknown control action, a non-integer
+    retry attempt, an unsafe path-segment id, or a ``task_stop``/``retry`` missing
+    its ``target_ref``. A control *store* read tolerates a corrupt persisted line
+    by skipping it (the audit trail stays append-only and fail-safe); this error
+    is for shape problems at record/mint time, surfaced rather than silently
+    accepted.
+    """
