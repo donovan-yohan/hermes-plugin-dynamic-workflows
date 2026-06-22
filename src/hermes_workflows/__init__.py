@@ -39,6 +39,11 @@ from .models import (
 )
 from .script_validator import ScriptValidation, validate_script
 from .loops import (
+    LoopEvent,
+    FileLoopRunStore,
+    InMemoryLoopRunStore,
+    LoopEventSink,
+    LoopRunStore,
     LoopSensorResult,
     LoopRunStatus,
     loop_validate,
@@ -147,6 +152,11 @@ __all__ = [
     "loop_run",
     "LoopSensorResult",
     "LoopRunStatus",
+    "LoopEvent",
+    "LoopEventSink",
+    "LoopRunStore",
+    "InMemoryLoopRunStore",
+    "FileLoopRunStore",
     "validate_script",
     "ScriptValidation",
     "WorkflowVM",
