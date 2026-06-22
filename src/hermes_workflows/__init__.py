@@ -38,6 +38,12 @@ from .models import (
     Progress,
 )
 from .script_validator import ScriptValidation, validate_script
+from .loops import (
+    LoopSensorResult,
+    LoopRunStatus,
+    loop_validate,
+    loop_run,
+)
 from .vm import (
     CapabilityBroker,
     ScriptRunResult,
@@ -137,6 +143,10 @@ __all__ = [
     "workflow_validate_script",
     "run_workflow_script",
     # subprocess workflow VM (issue #2)
+    "loop_validate",
+    "loop_run",
+    "LoopSensorResult",
+    "LoopRunStatus",
     "validate_script",
     "ScriptValidation",
     "WorkflowVM",
