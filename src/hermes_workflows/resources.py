@@ -24,6 +24,9 @@ __all__ = [
     "ResourceFinalizer",
     "FinalizerResult",
     "ResourceFinalizerCallable",
+    "ResourceFinalizerHandler",
+    "ResourceFinalizerRegistry",
+    "UnknownResourceFinalizerAction",
     "normalize_resource_envelopes",
     "run_resource_finalizers",
     "has_required_finalizer_failure",
@@ -200,6 +203,69 @@ class ResourceFinalizerCallable(Protocol):
 
     def __call__(self, context: dict[str, Any]) -> dict[str, Any]:
         ...
+
+
+@runtime_checkable
+class ResourceFinalizerHandler(Protocol):
+    """Handler for one concrete finalizer action, e.g. an ATH/Relay adapter."""
+
+    def __call__(self, context: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+
+class UnknownResourceFinalizerAction(LookupError):
+    """Raised when no adapter is registered for a declared finalizer action."""
+
+
+class ResourceFinalizerRegistry:
+    """Action-string dispatch for backend-specific resource finalizer adapters.
+
+    The workflow core stays backend-neutral: resources declare dotted action
+    strings such as ``ath.listener.retire`` or ``relay.session.close`` and a
+    host/application registers handlers for the actions it supports. The
+    registry is itself a ``ResourceFinalizerCallable`` and can be passed as
+    ``loop_run(..., finalizer=registry)``.
+    """
+
+    def __init__(self, handlers: Optional[dict[str, ResourceFinalizerHandler]] = None) -> None:
+        self._handlers: dict[str, ResourceFinalizerHandler] = {}
+        for action, handler in (handlers or {}).items():
+            self.register(action, handler)
+
+    def register(
+        self,
+        action: str,
+        handler: ResourceFinalizerHandler,
+        *,
+        replace: bool = False,
+    ) -> "ResourceFinalizerRegistry":
+        if not isinstance(action, str) or not _dotted_identifier_safe(action):
+            raise ValueError("resource finalizer action must be identifier-safe")
+        if not callable(handler):
+            raise TypeError("resource finalizer handler must be callable")
+        if action in self._handlers and not replace:
+            raise ValueError(f"resource finalizer action already registered: {action}")
+        self._handlers[action] = handler
+        return self
+
+    def unregister(self, action: str) -> None:
+        self._handlers.pop(action, None)
+
+    def actions(self) -> tuple[str, ...]:
+        return tuple(sorted(self._handlers))
+
+    def handler_for(self, action: str) -> Optional[ResourceFinalizerHandler]:
+        return self._handlers.get(action)
+
+    def __call__(self, context: dict[str, Any]) -> dict[str, Any]:
+        finalizer = context.get("finalizer")
+        action = finalizer.get("action") if isinstance(finalizer, dict) else None
+        if not isinstance(action, str):
+            raise UnknownResourceFinalizerAction("resource finalizer context missing action")
+        handler = self._handlers.get(action)
+        if handler is None:
+            raise UnknownResourceFinalizerAction(f"no resource finalizer adapter registered for action {action!r}")
+        return handler(context)
 
 
 def normalize_resource_envelopes(

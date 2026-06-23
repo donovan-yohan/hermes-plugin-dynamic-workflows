@@ -149,7 +149,7 @@ def workflow_status(
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
 | `grants.py` | Backend-neutral scoped actuator grants: `GrantRequest` / `SessionGrant` / `GrantHandle` models, in-memory/file `GrantStore`, `StaticPolicyGrantBroker`, `request_grant` / `resolve_grant` / `validate_grant`, and a credential-leak guard. Wired into `loop_run` for fail-closed session-launch authorization. |
-| `resources.py` | Backend-neutral workflow resource/finalizer models: credential-free resource declarations, cleanup trigger/policy vocabulary, finalizer runner Protocol, idempotent closeout result helpers, and credential-leak rejection. Wired into `loop_run` for terminal resource cleanup. |
+| `resources.py` | Backend-neutral workflow resource/finalizer models: credential-free resource declarations, cleanup trigger/policy vocabulary, finalizer runner Protocol, action-string adapter registry, idempotent closeout result helpers, and credential-leak rejection. Wired into `loop_run` for terminal resource cleanup. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
 | `errors.py` | `WorkflowError` base, `WorkflowValidationError`, `RunNotFound`, `SandboxPolicyError`. |
 
@@ -363,6 +363,14 @@ process group, or delete a worktree. It only decides *when* finalizers are due a
 calls the injected `ResourceFinalizerCallable` with `{run_id, loop_name, trigger,
 resource, finalizer}`. Backend adapters own the actual cleanup and return bounded
 `{ok, summary, evidence}` results.
+
+`ResourceFinalizerRegistry` is the optional host-side dispatch helper for that
+callable seam. It maps dotted action strings (`ath.listener.retire`,
+`relay.session.close`, `process.group.terminate`, etc.) to registered handlers and
+is itself a valid `ResourceFinalizerCallable`. Unknown actions fail closed through
+normal finalizer-result handling, and duplicate action registration requires
+`replace=True`. This keeps ATH/Relay/process integrations first-class as adapters
+without making them imports or branches inside Dynamic Workflows core.
 
 Closeout runs on terminal success, failure, and timeout paths. Waiting states do
 not close resources because those resources may be needed by the resumed run.
