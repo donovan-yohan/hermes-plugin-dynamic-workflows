@@ -30,7 +30,28 @@ from .models import StepStatus
 from .registry import RunStore, utc_now_iso
 from .sandbox import parse_ref
 
-__all__ = ["RunContext", "execute"]
+__all__ = ["GovernancePolicy", "RunContext", "execute"]
+
+
+@dataclass(frozen=True)
+class GovernancePolicy:
+    """Runtime-enforced fanout/backpressure policy for one workflow run."""
+
+    max_agent_calls: Optional[int] = None
+    max_kanban_cards: Optional[int] = None
+    max_active_awaits: Optional[int] = None
+    allowed_profiles: Optional[frozenset[str]] = None
+
+    @classmethod
+    def from_definition(cls, definition: dict[str, Any]) -> "GovernancePolicy":
+        raw_policy = definition.get("policy")
+        policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+        return cls(
+            max_agent_calls=_policy_limit(policy, "max_agent_calls"),
+            max_kanban_cards=_policy_limit(policy, "max_kanban_cards"),
+            max_active_awaits=_policy_limit(policy, "max_active_awaits"),
+            allowed_profiles=_policy_profiles(policy),
+        )
 
 
 @dataclass
@@ -55,11 +76,90 @@ class RunContext:
     agent_runner: AgentRunner
     inputs: dict[str, Any]
     max_parallel: int = 8
+    governance: GovernancePolicy = field(default_factory=GovernancePolicy)
+    agent_calls: int = 0
+    kanban_cards: int = 0
     outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_output: Optional[dict[str, Any]] = None
     workflow_id: Optional[str] = None
     phase_id: Optional[str] = None
     phase_title: Optional[str] = None
+
+
+def _optional_nonnegative_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _policy_limit(policy: dict[str, Any], key: str) -> Optional[int]:
+    if key not in policy:
+        return None
+    limit = _optional_nonnegative_int(policy.get(key))
+    if limit is None:
+        raise SandboxPolicyError(f"policy.{key} must be a non-negative integer")
+    return limit
+
+
+def _policy_profiles(policy: dict[str, Any]) -> Optional[frozenset[str]]:
+    if "allowed_profiles" not in policy:
+        return None
+    value = policy.get("allowed_profiles")
+    if not isinstance(value, list) or any(not isinstance(item, str) or not _safe_profile(item) for item in value):
+        raise SandboxPolicyError("policy.allowed_profiles must be a list of identifier-safe profile strings")
+    return frozenset(value)
+
+
+def _safe_profile(value: str) -> bool:
+    return bool(value) and all(c.isalnum() or c in "._-" for c in value)
+
+
+def _check_effect_budget(ctx: RunContext, *, kind: str, profile: Optional[str] = None) -> None:
+    policy = ctx.governance
+    if profile is not None and policy.allowed_profiles is not None and profile not in policy.allowed_profiles:
+        raise SandboxPolicyError(f"kanban profile {profile!r} is not allowed by workflow policy")
+    if policy.max_agent_calls is not None and ctx.agent_calls >= policy.max_agent_calls:
+        raise SandboxPolicyError(
+            f"agent call budget exceeded: max_agent_calls={policy.max_agent_calls}"
+        )
+    if kind == "kanban_agent" and policy.max_kanban_cards is not None and ctx.kanban_cards >= policy.max_kanban_cards:
+        raise SandboxPolicyError(
+            f"kanban card budget exceeded: max_kanban_cards={policy.max_kanban_cards}"
+        )
+    ctx.agent_calls += 1
+    if kind == "kanban_agent":
+        ctx.kanban_cards += 1
+
+
+def _waiting_kanban_count(step: dict[str, Any]) -> int:
+    if not isinstance(step, dict):
+        return 0
+    kind = step.get("kind")
+    if kind == "kanban_agent":
+        return 1 if step.get("wait", True) is True else 0
+    if kind == "parallel":
+        branches = step.get("branches")
+        if not isinstance(branches, list):
+            return 0
+        return sum(_waiting_kanban_count(branch) for branch in branches if isinstance(branch, dict))
+    if kind in {"pipeline", "phase"}:
+        steps = step.get("steps")
+        if not isinstance(steps, list):
+            return 0
+        return max((_waiting_kanban_count(child) for child in steps if isinstance(child, dict)), default=0)
+    if kind == "if":
+        then_steps = step.get("then")
+        else_steps = step.get("else")
+        then_count = max(
+            (_waiting_kanban_count(child) for child in then_steps if isinstance(child, dict)),
+            default=0,
+        ) if isinstance(then_steps, list) else 0
+        else_count = max(
+            (_waiting_kanban_count(child) for child in else_steps if isinstance(child, dict)),
+            default=0,
+        ) if isinstance(else_steps, list) else 0
+        return max(then_count, else_count)
+    return 0
 
 
 def _step_metadata(step: dict[str, Any], ctx: RunContext, *, phase_id: Optional[str] = None, phase_title: Optional[str] = None) -> dict[str, Any]:
@@ -130,6 +230,7 @@ def _check_depends_on(step: dict[str, Any], ctx: RunContext) -> None:
 def _exec_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute an ``agent`` step through the injected runner and record it."""
     agent_id = step["agent"]
+    _check_effect_budget(ctx, kind="agent")
     return _exec_effect_step(
         step,
         ctx,
@@ -149,6 +250,7 @@ def _exec_kanban_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     deterministic with :class:`StubAgentRunner`.
     """
     profile = step["profile"]
+    _check_effect_budget(ctx, kind="kanban_agent", profile=profile)
     agent_id = kanban_runner_id(profile)
     return _exec_effect_step(
         step,
@@ -226,6 +328,11 @@ def _exec_parallel(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """
     step_id = step["id"]
     branches = step["branches"]
+    active_awaits = sum(_waiting_kanban_count(branch) for branch in branches if isinstance(branch, dict))
+    if ctx.governance.max_active_awaits is not None and active_awaits > ctx.governance.max_active_awaits:
+        raise SandboxPolicyError(
+            f"active await budget exceeded: {active_awaits} waits exceeds max_active_awaits={ctx.governance.max_active_awaits}"
+        )
     if len(branches) > ctx.max_parallel:
         raise SandboxPolicyError(
             f"parallel step {step_id!r} fan-out {len(branches)} exceeds max_parallel={ctx.max_parallel}"

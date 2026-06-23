@@ -261,16 +261,17 @@ def workflow_run(
     record = store.create(rid, h)
 
     store.set_status(rid, "running")
-    ctx = _runtime.RunContext(
-        run_id=rid,
-        store=store,
-        agent_runner=runner,
-        inputs=dict(inputs or {}),
-        max_parallel=_effective_max_parallel(normalized, max_parallel),
-        workflow_id=rid,
-    )
 
     try:
+        ctx = _runtime.RunContext(
+            run_id=rid,
+            store=store,
+            agent_runner=runner,
+            inputs=dict(inputs or {}),
+            max_parallel=_effective_max_parallel(normalized, max_parallel),
+            governance=_runtime.GovernancePolicy.from_definition(normalized),
+            workflow_id=rid,
+        )
         final = _runtime.execute(list(normalized.get("steps", [])), ctx)
     except Exception as exc:
         store.set_status(

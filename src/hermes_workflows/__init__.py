@@ -38,6 +38,7 @@ from .models import (
     Progress,
 )
 from .script_validator import ScriptValidation, validate_script
+from .runtime import GovernancePolicy
 from .loops import (
     LoopEvent,
     FileLoopRunStore,
@@ -201,6 +202,7 @@ __all__ = [
     "workflow_status",
     "workflow_validate_script",
     "run_workflow_script",
+    "GovernancePolicy",
     # subprocess workflow VM (issue #2)
     "loop_validate",
     "loop_run",
