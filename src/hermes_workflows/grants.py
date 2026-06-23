@@ -438,9 +438,15 @@ class StaticPolicyGrantBroker:
         if ttl <= 0:
             return GrantDecision(False, "denied_ttl", "effective ttl is not positive")
 
-        now = float(self._clock())
+        try:
+            now = _require_number(self._clock(), "broker clock")
+        except GrantError as exc:
+            return GrantDecision(False, "malformed", str(exc))
         self._counter += 1
-        grant_id = self._mint_id(request)
+        try:
+            grant_id = self._mint_id(request)
+        except GrantError as exc:
+            return GrantDecision(False, "malformed", str(exc))
         handle = GrantHandle(
             backend=self.backend,
             session_id=f"sess-{grant_id}",
@@ -470,8 +476,8 @@ class StaticPolicyGrantBroker:
 
     def _mint_id(self, request: GrantRequest) -> str:
         if self._id_factory is not None:
-            return self._id_factory(request)
-        return f"grant-{self._counter}-{uuid.uuid4().hex[:8]}"
+            return _safe_grant_id(self._id_factory(request))
+        return _safe_grant_id(f"grant-{self._counter}-{uuid.uuid4().hex[:8]}")
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +835,7 @@ def _require_number(value: Any, label: str) -> float:
     return number
 
 
-def _safe_identifier_segment(value: str) -> bool:
+def _safe_identifier_segment(value: Any) -> bool:
     return (
         isinstance(value, str)
         and 1 <= len(value) <= 128
@@ -838,7 +844,7 @@ def _safe_identifier_segment(value: str) -> bool:
     )
 
 
-def _safe_grant_id(grant_id: str) -> str:
+def _safe_grant_id(grant_id: Any) -> str:
     if not _safe_identifier_segment(grant_id):
         raise GrantError("grant_id must be identifier-safe")
     return grant_id
