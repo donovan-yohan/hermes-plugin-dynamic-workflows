@@ -147,6 +147,9 @@ class GrantHandle:
     handle_ref: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "backend", _safe_backend(self.backend))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
@@ -220,6 +223,9 @@ class SessionGrant:
     handle: Optional[GrantHandle] = None
     audit: dict[str, Any] = field(default_factory=dict)
     status: Literal["granted", "revoked"] = "granted"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "backend", _safe_backend(self.backend))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -553,6 +559,8 @@ def resolve_grant(
         return GrantDecision(False, "no_broker", "no grant broker configured; failing closed")
     try:
         decision = broker(request)
+    except GrantError as exc:
+        return GrantDecision(False, "malformed", str(exc))
     except Exception as exc:  # pragma: no cover - broker exception type is adapter-owned
         return GrantDecision(False, "broker_error", f"{type(exc).__name__}: {exc}")
     if not isinstance(decision, GrantDecision):
