@@ -43,6 +43,7 @@ The current runtime supports:
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
 - backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
 - backend-neutral **control enforcement decisions**: a pure `evaluate_control_state(state, operation, target_ref?)` seam (plus `may_start_work` / `may_continue_task` / `may_retry` / `may_check_run`) that turns control state + an operation into an `allowed`/`code` `ControlDecision` an adapter consults before starting child work, continuing a task, or retrying — stop blocks everything, pause holds only new work, `task_stop` blocks only its target, and an existing retry surfaces its replacement to avoid silent duplicates; core decides, the adapter still owns the actual cancel/replay
+- **event-driven trigger migration docs/templates**: cron is documented as a workflow starter or visibility heartbeat only, not the owner of goal-directed phase advancement; `event_driven_pr_validation_lane` rewrites a PR watchdog as a trigger-started workflow with durable QA/review awaits
 
 ## Quick start as a Python package
 
@@ -199,6 +200,64 @@ id to a Hermes Kanban board/profile, persist the task id, and wake the workflow 
 This is the first replacement seam for timer watchdog orchestration: workflows await a durable task
 result instead of polling status just to decide the next step. The current stub runner returns a
 deterministic `kb_<hash>` task id for tests.
+
+## Event-driven trigger migration (#10)
+
+The big rule: **cron may start a workflow, but cron must not own workflow phase control**.
+The bad pattern is a timer watchdog that wakes every N minutes, polls GitHub/Kanban,
+reconstructs "what phase are we in?", and asks an agent to rediscover the next step.
+That creates duplicate work, stale context, and expensive re-planning. The replacement
+is one workflow run per goal: the trigger payload seeds the run, `kanban_agent` or
+loop waits park between phases, and the workflow resumes from durable terminal events.
+
+Use cron only for:
+
+- calendar starts (for example, "start the weekly release workflow Monday 09:00");
+- external heartbeat/visibility checks that emit a notification and stop;
+- simple script-only no-agent pings where no orchestration state is owned by cron.
+
+Do **not** use cron for:
+
+- polling GitHub/Kanban every 30 minutes to decide the next implementation/review/fix phase;
+- re-fetching a whole issue/PR context just to rediscover where a goal left off;
+- launching duplicate repair agents because a prior phase has not reported yet.
+
+Mapping common watchdogs to workflow starts:
+
+| Timer watchdog pattern | Event-driven workflow replacement |
+| --- | --- |
+| Issue lifecycle poller | Start `github_issue_lifecycle_hygiene` once for the issue; Kanban task events advance plan → implement → verify → closeout. |
+| PR validation poller | Start `event_driven_pr_validation_lane` from `pull_request.opened` / `synchronize`; QA/review cards are durable waits; summary emits one update. |
+| Board unblocker/fixer loop | Run a loop-controller workflow whose sensor observes the blocker and whose actuator emits one Kanban/Relay fix request; it waits on the fix event instead of re-polling the board. |
+| WIP synthesis/status notification | Use a calendar-triggered workflow or script-only notifier to produce one digest; do not let it mutate implementation phase state. |
+
+`workflow_control overview/status` is the operator visibility layer for these runs:
+it reports durable blocked waits and projected pause/stop/retry intent without a
+cron job rediscovering state.
+
+### Event-driven PR validation template
+
+`examples/event_driven_pr_validation_lane.workflow.json` rewrites the common "PR
+watchdog" as a saved workflow template. A webhook or calendar start supplies the
+PR number and trigger payload; the workflow normalizes the event once, fans out QA
+and review through durable Kanban awaits, then emits a single validation summary.
+There is no timer-owned phase polling.
+
+```python
+from hermes_workflows.primitives import workflow
+
+result = workflow(
+    template_name="event_driven_pr_validation_lane",
+    inputs={
+        "repo": "donovan-yohan/hermes-plugin-dynamic-workflows",
+        "pr_number": 42,
+        "base_branch": "main",
+        "workspace": "/repo",
+        "trigger_event": {"kind": "pull_request.synchronize", "head_sha": "abc123"},
+        "profile_bindings": {"qa": "relayqa", "reviewer": "relayreview"},
+    },
+)
+```
 
 ### GitHub issue lifecycle hygiene template
 
