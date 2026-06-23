@@ -415,7 +415,7 @@ class StaticPolicyGrantBroker:
         if isinstance(allowed_side_effect_classes, str):
             raise GrantError("allowed_side_effect_classes must be an iterable of strings, not a single string")
         self.allowed_side_effect_classes = frozenset(allowed_side_effect_classes)
-        self.backend = backend
+        self.backend = _safe_backend(backend)
         self._clock = clock or time.time
         self._id_factory = id_factory
         self._counter = 0
@@ -847,7 +847,17 @@ def _safe_identifier_segment(value: Any) -> bool:
 def _safe_grant_id(grant_id: Any) -> str:
     if not _safe_identifier_segment(grant_id):
         raise GrantError("grant_id must be identifier-safe")
+    if _looks_like_credential_value(grant_id):
+        raise GrantError("grant_id must not look like a credential")
     return grant_id
+
+
+def _safe_backend(backend: Any) -> str:
+    if not isinstance(backend, str) or not backend.strip():
+        raise GrantError("grant backend must be a non-empty string")
+    if _looks_like_credential_value(backend):
+        raise GrantError("grant backend must not look like a credential")
+    return backend
 
 
 def _epoch_to_iso(epoch: float) -> str:

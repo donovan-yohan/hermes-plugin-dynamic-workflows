@@ -436,6 +436,9 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
         agent_runner=ctx.agent_runner,
         inputs=ctx.inputs,
         max_parallel=ctx.max_parallel,
+        governance=ctx.governance,
+        agent_calls=ctx.agent_calls,
+        kanban_cards=ctx.kanban_cards,
         outputs=ctx.outputs,
         last_output=ctx.last_output,
         workflow_id=ctx.workflow_id,
@@ -460,6 +463,8 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
 
     ctx.outputs[step_id] = result
     ctx.last_output = result
+    ctx.agent_calls = child_ctx.agent_calls
+    ctx.kanban_cards = child_ctx.kanban_cards
     ctx.phase_id = child_ctx.phase_id
     ctx.phase_title = child_ctx.phase_title
     return result
