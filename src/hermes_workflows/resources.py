@@ -258,14 +258,15 @@ class ResourceFinalizerRegistry:
         return self._handlers.get(action)
 
     def __call__(self, context: dict[str, Any]) -> dict[str, Any]:
-        finalizer = context.get("finalizer")
+        safe_context = context if isinstance(context, dict) else {}
+        finalizer = safe_context.get("finalizer")
         action = finalizer.get("action") if isinstance(finalizer, dict) else None
         if not isinstance(action, str):
             raise UnknownResourceFinalizerAction("resource finalizer context missing action")
         handler = self._handlers.get(action)
         if handler is None:
             raise UnknownResourceFinalizerAction(f"no resource finalizer adapter registered for action {action!r}")
-        return handler(context)
+        return handler(safe_context)
 
 
 def normalize_resource_envelopes(
