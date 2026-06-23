@@ -46,6 +46,7 @@ from .kanban import (
     KanbanTimeout,
     KanbanUnknownProfile,
     _resolution_to_state,
+    _run_id_from_idempotency_key,
     _state_to_resolution,
     is_accepted_resolution,
     kanban_card_id,
@@ -358,7 +359,13 @@ class EventLogKanbanBackend:
             try:
                 self._store.record_kanban_card_state(
                     card_id,
-                    {"card_id": card_id, "status": "waiting", "profile": spec.profile, "version": 0},
+                    {
+                        "card_id": card_id,
+                        "status": "waiting",
+                        "profile": spec.profile,
+                        "version": 0,
+                        "run_id": _run_id_from_idempotency_key(idempotency_key),
+                    },
                 )
             except OSError:  # the waiting marker is a best-effort operator view.
                 pass

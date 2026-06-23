@@ -23,14 +23,22 @@ from typing import Any
 import pytest
 
 from hermes_workflows.controls import (
+    CONTROL_DECISION_CODES,
+    CONTROL_OPERATIONS,
+    ControlDecision,
     FileControlStore,
     InMemoryControlStore,
     RunControlState,
     WaitSummary,
     WorkflowControl,
     current_phase,
+    evaluate_control_state,
     inspect_run,
     list_runs,
+    may_check_run,
+    may_continue_task,
+    may_retry,
+    may_start_work,
     pause_run,
     project_control_state,
     record_control,
@@ -44,6 +52,7 @@ from hermes_workflows.controls import (
     waits_from_loop_status,
 )
 from hermes_workflows.errors import ControlError
+from hermes_workflows.kanban import _run_id_from_idempotency_key
 from hermes_workflows.loops import FileLoopRunStore, LoopSensorResult, loop_run
 from hermes_workflows.primitives import workflow_run
 from hermes_workflows.registry import InMemoryRunStore
@@ -152,6 +161,114 @@ def test_retry_records_explicit_replacement_ref():
 
 
 # --------------------------------------------------------------------------- #
+# Enforcement decisions — the seam adapters consult before acting
+# --------------------------------------------------------------------------- #
+
+def test_decision_clean_run_allows_every_operation():
+    state = project_control_state("wf_a", [])
+    assert isinstance(may_start_work(state), ControlDecision)
+    assert may_start_work(state).allowed is True
+    assert may_start_work(state).code == "allowed"
+    assert may_check_run(state).allowed is True
+    assert may_continue_task(state, "call-1").allowed is True
+    d = may_retry(state, "call-1")
+    assert d.allowed is True and d.code == "allowed"
+    assert d.replacement_ref is None and d.attempt is None
+    assert d.desired_state == "running" and d.run_id == "wf_a"
+
+
+def test_decision_stopped_blocks_all_operations_with_stable_code():
+    store = InMemoryControlStore()
+    stop_control = stop_run(store, "wf_a", reason="abort")
+    state = project_control_state("wf_a", store.list_for("wf_a"))
+    for op in CONTROL_OPERATIONS:
+        target = "call-1" if op in ("continue_task", "retry") else None
+        d = evaluate_control_state(state, op, target)
+        assert d.allowed is False
+        assert d.code == "run_stopped"
+        assert d.desired_state == "stopped"
+        assert "abort" in d.reason
+        assert d.control_id == stop_control.control_id  # the causal stop record.
+
+
+def test_decision_paused_blocks_new_work_but_not_continue_or_check():
+    store = InMemoryControlStore()
+    pause_run(store, "wf_a", reason="hold")
+    state = project_control_state("wf_a", store.list_for("wf_a"))
+    assert may_start_work(state).code == "run_paused"
+    assert may_retry(state, "call-1").code == "run_paused"
+    # pausing never claims to kill in-flight work.
+    assert may_continue_task(state, "call-1").allowed is True
+    assert may_check_run(state).allowed is True
+
+
+def test_decision_task_stop_blocks_only_matching_target():
+    store = InMemoryControlStore()
+    stop_task(store, "wf_a", "call-7", reason="hung")
+    state = project_control_state("wf_a", store.list_for("wf_a"))
+    blocked = may_continue_task(state, "call-7")
+    assert blocked.allowed is False and blocked.code == "task_stopped"
+    assert "hung" in blocked.reason
+    assert blocked.control_id == state.stopped_tasks[0]["control_id"]
+    # a different target is unaffected, and new run-level work is still allowed.
+    assert may_continue_task(state, "call-8").allowed is True
+    assert may_start_work(state).allowed is True
+    # retrying the explicitly stopped task is also blocked as task_stopped.
+    assert may_retry(state, "call-7").code == "task_stopped"
+
+
+def test_decision_retry_exists_surfaces_lineage_for_dedup():
+    store = InMemoryControlStore()
+    rec = retry(store, "wf_a", "call-3", replacement_ref="repl-3")
+    state = project_control_state("wf_a", store.list_for("wf_a"))
+    d = may_retry(state, "call-3")
+    assert d.allowed is False
+    assert d.code == "retry_exists"
+    assert d.replacement_ref == "repl-3"
+    assert d.attempt == 1
+    assert d.control_id == rec.control_id
+    # a never-retried target on the same run is still allowed.
+    assert may_retry(state, "call-9").allowed is True
+
+
+def test_evaluate_rejects_unknown_operation_and_missing_target():
+    state = project_control_state("wf_a", [])
+    with pytest.raises(ControlError):
+        evaluate_control_state(state, "nope")  # type: ignore[arg-type]
+    with pytest.raises(ControlError):
+        evaluate_control_state(state, "continue_task")  # target_ref required
+    with pytest.raises(ControlError):
+        evaluate_control_state(state, "retry")  # target_ref required
+
+
+def test_decision_codes_are_a_closed_set():
+    store = InMemoryControlStore()
+    pause_run(store, "wf_a")
+    stop_task(store, "wf_a", "t")
+    retry(store, "wf_a", "t2")
+    state = project_control_state("wf_a", store.list_for("wf_a"))
+    for op in CONTROL_OPERATIONS:
+        target = "t" if op in ("continue_task", "retry") else None
+        assert evaluate_control_state(state, op, target).code in CONTROL_DECISION_CODES
+    # ControlDecision round-trips through a plain dict for transport.
+    d = may_start_work(state)
+    assert d.to_dict()["code"] == "run_paused"
+
+
+def test_decision_survives_filecontrolstore_restart():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = FileControlStore(tmp)
+        pause_run(store, "wf_a", reason="hold")
+        stop_task(store, "wf_a", "call-2", reason="stuck")
+        # A fresh process reads the same root and decides identically.
+        reopened = FileControlStore(tmp)
+        state = project_control_state("wf_a", reopened.list_for("wf_a"))
+        assert may_start_work(state).code == "run_paused"
+        assert may_continue_task(state, "call-2").code == "task_stopped"
+        assert may_continue_task(state, "call-3").allowed is True
+
+
+# --------------------------------------------------------------------------- #
 # Durable FileControlStore — survives restart, idempotent across processes
 # --------------------------------------------------------------------------- #
 
@@ -194,6 +311,20 @@ def test_file_control_store_skips_corrupt_line():
         controls = FileControlStore(tmp).list_for("wf_a")
         assert len(controls) == 2  # the corrupt line is skipped, not fatal.
         assert project_control_state("wf_a", controls).stopped is True
+
+
+def test_file_control_store_skips_mismatched_run_and_keeps_first_duplicate_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = FileControlStore(tmp)
+        first = record_control(store, "wf_a", "pause", control_id="ctl_fixed", reason="first")
+        log = Path(tmp) / "wf_a" / "controls.jsonl"
+        with log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(WorkflowControl(control_id="ctl_other", run_id="wf_b", action="stop").to_dict()) + "\n")
+            f.write(json.dumps(WorkflowControl(control_id="ctl_fixed", run_id="wf_a", action="stop").to_dict()) + "\n")
+        controls = FileControlStore(tmp).list_for("wf_a")
+        assert controls == [first]
+        state = project_control_state("wf_a", controls)
+        assert state.desired_state == "paused"
 
 
 def test_file_control_store_rejects_unsafe_ids():
@@ -266,10 +397,21 @@ def test_waits_from_kanban_states_filters_terminal():
 def test_waits_from_real_script_store_kanban_waits():
     with tempfile.TemporaryDirectory() as tmp:
         store = ScriptRunStore(tmp)
-        store.record_kanban_card_state("cardA", {"status": "waiting", "profile": "impl"})
+        store.record_kanban_card_state("cardA", {"status": "waiting", "profile": "impl", "run_id": "wf_script"})
+        # Later backend writes that omit run_id preserve the original run association.
+        store.record_kanban_card_state("cardA", {"status": "blocked", "reason": "needs review"})
         store.record_kanban_card_state("cardB", {"status": "completed"})
         waits = waits_from_kanban_states(store.kanban_waits())
         assert [w.wait_id for w in waits] == ["cardA"]
+        assert waits[0].run_id == "wf_script"
+        assert waits[0].state == "blocked"
+
+
+def test_kanban_run_id_extraction_matches_safe_segment_rules():
+    assert _run_id_from_idempotency_key("wf_a.1-call:step-1") == "wf_a.1-call"
+    assert _run_id_from_idempotency_key("_bad:step-1") == ""
+    assert _run_id_from_idempotency_key("a" * 129 + ":step-1") == ""
+    assert _run_id_from_idempotency_key("bad/slash:step-1") == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +468,26 @@ def test_inspect_run_compact_shape_and_child_refs():
     assert report["retries"][0]["replacement_ref"] == "repl-3"
     assert len(report["last_events"]) == 5  # capped
     assert report["result"] == {"ok": True}
+    # run-level enforcement decisions are surfaced honestly (running run here).
+    assert report["decisions"]["start_child"]["allowed"] is True
+    assert report["decisions"]["check_run"]["allowed"] is True
+
+
+def test_inspect_run_decisions_reflect_paused_and_stopped():
+    paused = inspect_run(
+        "wf_p", control_state=project_control_state(
+            "wf_p", [WorkflowControl(control_id="c1", run_id="wf_p", action="pause")]),
+    )
+    assert paused["decisions"]["start_child"]["code"] == "run_paused"
+    assert paused["decisions"]["start_child"]["allowed"] is False
+    assert paused["decisions"]["check_run"]["allowed"] is True  # paused run still alive.
+
+    stopped = inspect_run(
+        "wf_s", control_state=project_control_state(
+            "wf_s", [WorkflowControl(control_id="c1", run_id="wf_s", action="stop")]),
+    )
+    assert stopped["decisions"]["check_run"]["code"] == "run_stopped"
+    assert stopped["decisions"]["start_child"]["allowed"] is False
 
 
 def test_list_runs_overview_orders_counts_and_folds_waits():
@@ -421,6 +583,10 @@ def test_plugin_workflow_control_end_to_end(monkeypatch):
         assert status["data"]["lifecycle"] == "succeeded"
         assert status["data"]["control_state"]["paused"] is True
         assert status["data"]["links"]["journal"].endswith("journal.jsonl")
+        # status exposes the enforcement decisions honestly: paused holds new work
+        # but the run is still alive (check_run allowed).
+        assert status["data"]["decisions"]["start_child"]["code"] == "run_paused"
+        assert status["data"]["decisions"]["check_run"]["allowed"] is True
 
         # idempotent retry lineage.
         r1 = json.loads(ctl({"action": "retry", "run_id": run_id, "target_ref": "greet"}))
@@ -435,6 +601,75 @@ def test_plugin_workflow_control_end_to_end(monkeypatch):
         status2 = json.loads(ctx2.tools["workflow_control"]["handler"]({"action": "status", "run_id": run_id}))
         assert status2["data"]["control_state"]["stopped"] is True
         assert status2["data"]["control_state"]["desired_state"] == "stopped"
+
+
+def test_plugin_status_surfaces_persisted_kanban_wait_without_run_id(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp)
+        monkeypatch.setenv("HERMES_WORKFLOWS_STATE_DIR", str(state_dir / "runs"))
+        plugin = _load_plugin_root()
+        ctx = _FakeContext()
+        plugin.register(ctx)
+        wf = ctx.tools["workflow"]["handler"]
+        ctl = ctx.tools["workflow_control"]["handler"]
+
+        run = json.loads(wf({"definition": _hello_definition(), "inputs": {"name": "world"}}))
+        run_id = run["data"]["handle"]["run_id"]
+        ScriptRunStore(state_dir / "script-runs").record_kanban_card_state(
+            "cardA", {"status": "waiting", "profile": "impl"}
+        )
+
+        status = json.loads(ctl({"action": "status", "run_id": run_id}))
+
+        assert status["success"] is True
+        assert status["data"]["waits"] == [
+            {
+                "run_id": run_id,
+                "wait_id": "cardA",
+                "kind": "kanban",
+                "state": "waiting",
+                "summary": "impl",
+                "source": "kanban",
+                "ref": {"card_id": "cardA", "profile": "impl", "status": "waiting"},
+            }
+        ]
+
+
+def test_plugin_status_and_overview_surface_loop_waits(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp)
+        monkeypatch.setenv("HERMES_WORKFLOWS_STATE_DIR", str(state_dir / "runs"))
+        plugin = _load_plugin_root()
+        ctx = _FakeContext()
+        plugin.register(ctx)
+        wf = ctx.tools["workflow"]["handler"]
+        ctl = ctx.tools["workflow_control"]["handler"]
+
+        run = json.loads(wf({"definition": _hello_definition(), "inputs": {"name": "world"}}))
+        run_id = run["data"]["handle"]["run_id"]
+
+        def sensor(context: dict[str, Any]) -> LoopSensorResult:
+            return LoopSensorResult(converged=False, signal_key="todo", summary="not done")
+
+        def actuator(context: dict[str, Any]) -> dict[str, Any]:
+            return {"wait": {"id": "evt-42", "summary": "waiting on external PR"}, "summary": "dispatched"}
+
+        loop_run(
+            _loop_spec(),
+            sensor=sensor,
+            actuator=actuator,
+            run_id=run_id,
+            store=FileLoopRunStore(state_dir / "loop-runs"),
+        )
+
+        status = json.loads(ctl({"action": "status", "run_id": run_id}))
+        overview = json.loads(ctl({"action": "overview"}))
+
+        assert status["data"]["waits"][0]["wait_id"] == "evt-42"
+        assert status["data"]["waits"][0]["source"] == "loop"
+        assert any(w["wait_id"] == "evt-42" for w in overview["data"]["blocked_waits"])
+        by_id = {r["run_id"]: r for r in overview["data"]["runs"]}
+        assert by_id[run_id]["wait_count"] == 1
 
 
 def test_plugin_workflow_control_requires_run_id(monkeypatch):

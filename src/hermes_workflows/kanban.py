@@ -582,6 +582,20 @@ def _resolution_to_state(resolution: KanbanResolution) -> dict[str, Any]:
     }
 
 
+def _run_id_from_idempotency_key(idempotency_key: str) -> str:
+    """Best-effort extraction of the workflow/script run id from a durable Kanban key.
+
+    VM durable Kanban calls use ``<logical_run_id>:<stable_call_id>``. Other
+    embedders may choose a different idempotency key shape, so this only returns
+    the prefix when it is present and path-segment safe; otherwise the wait remains
+    intentionally unassociated instead of inventing a run.
+    """
+    prefix = idempotency_key.split(":", 1)[0] if isinstance(idempotency_key, str) else ""
+    if prefix and len(prefix) <= 128 and prefix[0].isalnum() and all(c.isalnum() or c in "._-" for c in prefix):
+        return prefix
+    return ""
+
+
 def _state_to_resolution(state: Optional[dict[str, Any]]) -> Optional[KanbanResolution]:
     """Rebuild a resolution from durable state, or ``None`` if not a resolution.
 
@@ -664,7 +678,13 @@ class DurableKanbanBackend:
             return replace(card, reattached=True)
         self._record_card_state(
             card.card_id,
-            {"card_id": card.card_id, "status": "waiting", "profile": card.profile, "version": 0},
+            {
+                "card_id": card.card_id,
+                "status": "waiting",
+                "profile": card.profile,
+                "version": 0,
+                "run_id": _run_id_from_idempotency_key(idempotency_key),
+            },
         )
         return card
 

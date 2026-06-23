@@ -58,6 +58,7 @@ from .kanban import (
     KanbanCardSpec,
     KanbanResolution,
     KanbanUnknownProfile,
+    _run_id_from_idempotency_key,
     kanban_card_id,
     result_contract_instruction,
 )
@@ -632,7 +633,13 @@ class HermesKanbanBackend:
         # First sight of this logical call: open the real card (one CLI invocation).
         create_result = self._client.create(card_id, idempotency_key, spec)
         real_task_id = _extract_real_task_id(create_result, card_id)
-        state = {"card_id": card_id, "status": "waiting", "profile": spec.profile, "version": 0}
+        state = {
+            "card_id": card_id,
+            "status": "waiting",
+            "profile": spec.profile,
+            "version": 0,
+            "run_id": _run_id_from_idempotency_key(idempotency_key),
+        }
         if real_task_id is not None:
             state["real_task_id"] = real_task_id
         try:

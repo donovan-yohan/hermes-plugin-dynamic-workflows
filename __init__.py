@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -36,6 +37,11 @@ from hermes_workflows.controls import FileControlStore  # noqa: E402
 from hermes_workflows.script_store import ScriptRunStore  # noqa: E402
 
 TOOLSET = "dynamic_workflows"
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _is_safe_segment(value: Any) -> bool:
+    return isinstance(value, str) and _SAFE_SEGMENT_RE.fullmatch(value) is not None
 
 
 def _jsonable(value: Any) -> Any:
@@ -272,10 +278,13 @@ WORKFLOW_CONTROL_SCHEMA = {
     "description": (
         "Operator controls and status for dynamic workflow runs. action=overview "
         "lists active/recent runs and blocked waits; action=status returns one "
-        "run's compact control state, current phase, waits, child task refs, and "
-        "links; pause/resume/stop/task_stop/retry record an append-only control "
-        "intent (the audit trail is never deleted). Retry is idempotent per "
-        "target_ref with explicit replacement lineage."
+        "run's compact control state, current phase, waits, child task refs, "
+        "links, and the run-level enforcement decisions (may new work start / may "
+        "the run continue) an adapter would consult; pause/resume/stop/task_stop/"
+        "retry record an append-only control intent (the audit trail is never "
+        "deleted). Retry is idempotent per target_ref with explicit replacement "
+        "lineage. This surface records and decides intent; it does not itself kill "
+        "processes or replay tasks — a backend adapter enforces the decisions."
     ),
     "parameters": {
         "type": "object",
@@ -348,14 +357,49 @@ def _control_link_resolver(store: FileRunStore):
     return resolve
 
 
-def _kanban_waits(script_store: Optional[ScriptRunStore]) -> list:
+def _kanban_waits(script_store: Optional[ScriptRunStore], *, run_id: Optional[str] = None) -> list:
     if script_store is None:
         return []
     try:
         states = script_store.kanban_waits()
     except Exception:  # pragma: no cover - defensive; durable read is best-effort
         return []
-    return _controls.waits_from_kanban_states(states)
+    return _controls.waits_from_kanban_states(states, run_id=run_id or "")
+
+
+def _loop_waits(*, run_id: Optional[str] = None) -> list:
+    root = _state_root() / "loop-runs"
+    if not root.exists():
+        return []
+    snapshots: list[dict[str, Any]] = []
+    if run_id:
+        if not _is_safe_segment(run_id):
+            return []
+        paths = [root / run_id / "snapshot.json"]
+    else:
+        paths = sorted(root.glob("*/snapshot.json"))
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            snapshots.append(data)
+    waits = []
+    for snapshot in snapshots:
+        waits.extend(_controls.waits_from_loop_status(snapshot))
+    return waits
+
+
+def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
+    if not _is_safe_segment(run_id):
+        return False
+    try:
+        if _plugin_store(session_id=session_id).get(run_id) is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
+        return False
+    return bool(_loop_waits(run_id=run_id))
 
 
 def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
@@ -367,7 +411,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
 
         if action == "overview":
             run_store = _plugin_store(session_id=session_id)
-            waits = _kanban_waits(_plugin_script_store())
+            waits = _kanban_waits(_plugin_script_store()) + _loop_waits()
             overview = _controls.list_runs(
                 run_store.list(),
                 control_store,
@@ -379,12 +423,18 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
 
         if not run_id:
             raise ControlError(f"workflow_control action={action!r} requires 'run_id'")
+        if not _is_safe_segment(run_id):
+            raise ControlError(f"unsafe run_id: {run_id!r}")
 
         if action == "status":
             run_store = _plugin_store(session_id=session_id)
             record = run_store.get(run_id)
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
-            waits = [w for w in _kanban_waits(_plugin_script_store()) if w.run_id == run_id]
+            waits = [
+                w
+                for w in _kanban_waits(_plugin_script_store(), run_id=run_id) + _loop_waits(run_id=run_id)
+                if w.run_id == run_id
+            ]
             links = _control_link_resolver(run_store)(record) if record is not None else {"run_id": run_id}
             report = _controls.inspect_run(
                 run_id,
@@ -422,6 +472,8 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         }
         if action not in verbs:
             raise ControlError(f"unknown workflow_control action: {action!r}")
+        if not _known_run(run_id, session_id=session_id):
+            raise ControlError(f"unknown workflow run: {run_id!r}")
         control = verbs[action]()
         state = _controls.project_control_state(run_id, control_store.list_for(run_id))
         return _ok({"operation": action, "control": control.to_dict(), "control_state": state.to_dict()})
