@@ -370,6 +370,46 @@ def test_static_policy_broker_rejects_malformed_id_factory_values():
         assert resolved_decision.code == "malformed"
 
 
+
+def test_grant_value_object_constructors_reject_malformed_backends():
+    for bad_backend in (123, None, "", "   ", "\t", "../x", "a:b", ".hidden", "sk-backend"):
+        with pytest.raises(GrantError):
+            GrantHandle(backend=bad_backend)  # type: ignore[arg-type]
+
+        with pytest.raises(GrantError):
+            SessionGrant(
+                grant_id="grant-constructor-backend",
+                request_id="greq-constructor-backend",
+                scope=("session.launch",),
+                side_effect_class="session_launch",
+                subject="work-context-abc",
+                issued_at="2023-11-14T22:13:20Z",
+                expires_at="2023-11-14T22:14:20Z",
+                issued_at_epoch=FIXED_NOW,
+                expires_at_epoch=FIXED_NOW + 60,
+                backend=bad_backend,  # type: ignore[arg-type]
+            )
+
+
+def test_grant_value_object_constructors_accept_valid_backends():
+    handle = GrantHandle(backend="relay.v1-prod", handle_ref="relay.v1-prod:grant-ok")
+    grant = SessionGrant(
+        grant_id="grant-constructor-valid",
+        request_id="greq-constructor-valid",
+        scope=("session.launch",),
+        side_effect_class="session_launch",
+        subject="work-context-abc",
+        issued_at="2023-11-14T22:13:20Z",
+        expires_at="2023-11-14T22:14:20Z",
+        issued_at_epoch=FIXED_NOW,
+        expires_at_epoch=FIXED_NOW + 60,
+        backend="relay.v1-prod",
+        handle=handle,
+    )
+
+    assert handle.backend == "relay.v1-prod"
+    assert grant.backend == "relay.v1-prod"
+
 def test_static_policy_broker_rejects_malformed_backend_before_minting_grants():
     for bad_backend in (123, "", "   ", "\t", "../x", "a:b", ".hidden", None, "sk-backend"):
         with pytest.raises(GrantError):
