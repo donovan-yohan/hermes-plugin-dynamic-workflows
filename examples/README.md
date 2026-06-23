@@ -117,6 +117,39 @@ Expected: `granted: True`, a `handle` carrying only `session_id` /
 expired, or credential-bearing grant fails closed instead — see
 `DESIGN.md §1.5.1` and the README "Scoped actuator grants" section.
 
+## `release_ops_resource_closeout.py` — ATH + Relay resource finalizers
+
+A runnable release-ops closeout example for issue #52 / #31. It uses the real
+Dynamic Workflows loop controller and `ResourceFinalizerRegistry`, declares both
+ATH and Relay resources, and dispatches production action names:
+
+- `ath.listener.retire`
+- `relay.automation_run.retire`
+
+The file intentionally uses local stand-in handlers so this package stays
+backend-neutral and dependency-free. In production, the host process registers the
+real adapters in their owning repos instead:
+
+```python
+from hermes_workflows import ResourceFinalizerRegistry
+from async_threads.finalizers import register_ath_finalizers
+
+finalizers = ResourceFinalizerRegistry()
+register_ath_finalizers(finalizers, registry=async_thread_registry, secret_root=secret_root)
+# Relay registers `relay.automation_run.retire` from its own runtime/adapter
+# boundary; Dynamic Workflows core should not import Relay internals.
+```
+
+Run the zero-dependency smoke:
+
+```bash
+PYTHONPATH=src python examples/release_ops_resource_closeout.py
+```
+
+Expected: terminal `converged` state and two succeeded finalizer results. The
+example retires the Relay automation/watchdog record only; artifact-preserving
+child-session/process termination remains Relay-owned follow-up work.
+
 ## Notes
 
 - Swap in a real Hermes fan-out by passing `agent_runner=` to `workflow_run`.
