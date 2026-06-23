@@ -71,6 +71,33 @@ def test_step_status_includes_workflow_metadata():
     assert shout["workflow_task_title"] == "shout"
 
 
+
+def test_phase_metadata_does_not_leak_to_later_sibling_steps():
+    definition = {
+        "version": "1",
+        "name": "phase_sibling_metadata",
+        "policy": {"network": False, "filesystem": False, "max_parallel": 2},
+        "steps": [
+            {
+                "kind": "phase",
+                "id": "phase_1",
+                "label": "Phase One",
+                "steps": [
+                    {"kind": "agent", "id": "inside", "agent": "hermes.noop", "input": {}, "output_schema": {}}
+                ],
+            },
+            {"kind": "agent", "id": "after", "agent": "hermes.noop", "input": {}, "output_schema": {}},
+        ],
+    }
+
+    result = workflow(definition=definition)
+    by_id = {s["step_id"]: s for s in result["status"]["steps"]}
+
+    assert by_id["inside"]["workflow_phase_id"] == "phase_1"
+    assert by_id["inside"]["workflow_phase_title"] == "Phase One"
+    assert by_id["after"]["workflow_phase_id"] is None
+    assert by_id["after"]["workflow_phase_title"] is None
+
 def test_container_steps_carry_workflow_identity():
     definition = {
         "version": "1",

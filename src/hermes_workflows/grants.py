@@ -160,9 +160,7 @@ class GrantHandle:
     def from_dict(cls, data: dict[str, Any]) -> "GrantHandle":
         if not isinstance(data, dict):
             raise GrantError("grant handle must be an object")
-        backend = data.get("backend")
-        if not isinstance(backend, str) or not backend:
-            raise GrantError("grant handle requires non-empty 'backend'")
+        backend = _safe_backend(data.get("backend"))
         extra = data.get("extra", {})
         if not isinstance(extra, dict):
             raise GrantError("grant handle 'extra' must be an object")
@@ -244,9 +242,10 @@ class SessionGrant:
     def from_dict(cls, data: dict[str, Any]) -> "SessionGrant":
         if not isinstance(data, dict):
             raise GrantError("grant must be an object")
-        for key in ("grant_id", "request_id", "side_effect_class", "subject", "backend"):
+        for key in ("grant_id", "request_id", "side_effect_class", "subject"):
             if not isinstance(data.get(key), str) or not data.get(key):
                 raise GrantError(f"grant requires non-empty string {key!r}")
+        backend = _safe_backend(data.get("backend"))
         grant_id = _safe_grant_id(data["grant_id"])
         request_id = _normalize_request_id(data["request_id"])
         side_effect_class = data["side_effect_class"]
@@ -275,7 +274,7 @@ class SessionGrant:
             expires_at=str(data.get("expires_at", "")),
             issued_at_epoch=issued_epoch,
             expires_at_epoch=expires_epoch,
-            backend=data["backend"],
+            backend=backend,
             handle=handle,
             audit=dict(audit),
             status=status,
@@ -853,8 +852,8 @@ def _safe_grant_id(grant_id: Any) -> str:
 
 
 def _safe_backend(backend: Any) -> str:
-    if not isinstance(backend, str) or not backend.strip():
-        raise GrantError("grant backend must be a non-empty string")
+    if not _safe_identifier_segment(backend):
+        raise GrantError("grant backend must be identifier-safe")
     if _looks_like_credential_value(backend):
         raise GrantError("grant backend must not look like a credential")
     return backend

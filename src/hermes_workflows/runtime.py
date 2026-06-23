@@ -465,8 +465,6 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     ctx.last_output = result
     ctx.agent_calls = child_ctx.agent_calls
     ctx.kanban_cards = child_ctx.kanban_cards
-    ctx.phase_id = child_ctx.phase_id
-    ctx.phase_title = child_ctx.phase_title
     return result
 def _exec_if(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute a deterministic conditional step without leaking branch-local ids."""

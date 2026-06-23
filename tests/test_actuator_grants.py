@@ -371,10 +371,59 @@ def test_static_policy_broker_rejects_malformed_id_factory_values():
 
 
 def test_static_policy_broker_rejects_malformed_backend_before_minting_grants():
-    for bad_backend in (123, "", "   ", None, "sk-backend"):
+    for bad_backend in (123, "", "   ", "\t", "../x", "a:b", ".hidden", None, "sk-backend"):
         with pytest.raises(GrantError):
             policy_broker(backend=bad_backend)  # type: ignore[arg-type]
 
+
+
+def test_validate_grant_rejects_malformed_backend_fields():
+    request = good_request(request_id="greq-backend-fields", ttl_seconds=60)
+    valid = policy_broker(id_factory=lambda _request: "grant-backend-fields")(request).grant
+    assert valid is not None
+
+    for bad_backend in ("   ", "\t", "../x", "a:b", ".hidden", "sk-backend"):
+        poisoned = valid.to_dict()
+        poisoned["backend"] = bad_backend
+        poisoned["handle"]["backend"] = bad_backend
+
+        validation = validate_grant(poisoned, now=FIXED_NOW + 1)
+
+        assert validation.ok is False
+        assert validation.code == "malformed"
+
+    for bad_handle_backend in ("a:b", "sk-backend"):
+        poisoned_handle = valid.to_dict()
+        poisoned_handle["handle"]["backend"] = bad_handle_backend
+        validation = validate_grant(poisoned_handle, now=FIXED_NOW + 1)
+        assert validation.ok is False
+        assert validation.code == "malformed"
+
+
+def test_resolve_grant_rejects_rogue_broker_whitespace_backend():
+    request = good_request(request_id="greq-rogue-backend", ttl_seconds=60)
+
+    def rogue_broker(req):
+        grant = SessionGrant(
+            grant_id="grant-rogue-backend",
+            request_id=req.request_id,
+            scope=req.scope,
+            side_effect_class=req.side_effect_class,
+            subject=req.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T22:14:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + 60,
+            backend="   ",
+            handle=GrantHandle(backend="   ", handle_ref="   :grant-rogue-backend"),
+            audit=req.audit,
+        )
+        return GrantDecision(True, "granted", "rogue", grant=grant)
+
+    decision = resolve_grant(rogue_broker, request)
+
+    assert decision.granted is False
+    assert decision.code == "malformed"
 
 def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
     req = good_request(requested_by="real-requester", reason="real reason", audit={"run_id": "real-run", "operator_note": "kept"})
