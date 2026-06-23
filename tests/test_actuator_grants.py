@@ -98,10 +98,9 @@ def test_request_grant_rejects_non_positive_ttl():
 
 
 def test_request_grant_rejects_malformed_request_id():
-    with pytest.raises(GrantError):
-        good_request(request_id=123)
-    with pytest.raises(GrantError):
-        good_request(request_id="")
+    for bad_request_id in (123, "", "   ", "../x", "with/slash", "ghp_secretlike"):
+        with pytest.raises(GrantError):
+            good_request(request_id=bad_request_id)
 
 
 def test_request_grant_rejects_raw_credential_in_audit():
@@ -179,7 +178,7 @@ def test_static_policy_broker_audit_fields_cannot_be_spoofed():
     audit = decision.grant.audit
     assert audit["requested_by"] == "real-requester"
     assert audit["reason"] == "real reason"
-    assert audit["policy_max_ttl_seconds"] == 60
+    assert "policy_max_ttl_seconds" not in audit
     assert audit["operator_note"] == "kept"
 
 
@@ -278,6 +277,54 @@ def test_resolve_grant_rejects_non_finite_broker_timestamps():
     assert decision.code == "malformed"
 
 
+def test_resolve_grant_rejects_non_numeric_or_bool_broker_timestamps():
+    def string_timestamp_broker(request):
+        return GrantDecision(
+            True,
+            "granted",
+            "rogue",
+            SessionGrant(
+                grant_id="g1",
+                request_id=request.request_id,
+                scope=request.scope,
+                side_effect_class=request.side_effect_class,
+                subject=request.subject,
+                issued_at="2023-11-14T22:13:20Z",
+                expires_at="2023-11-14T22:14:20Z",
+                issued_at_epoch="not-a-number",  # type: ignore[arg-type]
+                expires_at_epoch=FIXED_NOW + 60,
+                backend="rogue",
+            ),
+        )
+
+    def bool_timestamp_broker(request):
+        return GrantDecision(
+            True,
+            "granted",
+            "rogue",
+            SessionGrant(
+                grant_id="g2",
+                request_id=request.request_id,
+                scope=request.scope,
+                side_effect_class=request.side_effect_class,
+                subject=request.subject,
+                issued_at="2023-11-14T22:13:20Z",
+                expires_at="2023-11-14T22:14:20Z",
+                issued_at_epoch=False,  # type: ignore[arg-type]
+                expires_at_epoch=True,  # type: ignore[arg-type]
+                backend="rogue",
+            ),
+        )
+
+    string_decision = resolve_grant(string_timestamp_broker, good_request(ttl_seconds=60))
+    bool_decision = resolve_grant(bool_timestamp_broker, good_request(ttl_seconds=60))
+
+    assert string_decision.granted is False
+    assert string_decision.code == "malformed"
+    assert bool_decision.granted is False
+    assert bool_decision.code == "malformed"
+
+
 def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
     req = good_request(requested_by="real-requester", reason="real reason", audit={"run_id": "real-run", "operator_note": "kept"})
 
@@ -294,7 +341,14 @@ def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
             expires_at_epoch=FIXED_NOW + 60,
             backend="rogue",
             handle=GrantHandle(backend="rogue"),
-            audit={"run_id": "fake", "requested_by": "evil", "reason": "lie", "operator_note": "overwritten", "custom": "kept"},
+            audit={
+                "run_id": "fake",
+                "requested_by": "evil",
+                "reason": "lie",
+                "policy_max_ttl_seconds": 999,
+                "operator_note": "overwritten",
+                "custom": "kept",
+            },
         )
         return GrantDecision(True, "granted", "rogue", grant)
 
@@ -307,11 +361,39 @@ def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
     assert audit["run_id"] == "real-run"
     assert audit["requested_by"] == "real-requester"
     assert audit["reason"] == "real reason"
+    assert "policy_max_ttl_seconds" not in audit
     assert audit["operator_note"] == "kept"
     assert audit["custom"] == "kept"
     persisted = store.get_grant(decision.grant.grant_id)
     assert persisted is not None
     assert persisted["audit"] == audit
+
+
+def test_resolve_grant_drops_broker_only_reserved_audit_fields():
+    req = good_request(requested_by="real-requester", reason="real reason")
+
+    def rogue_broker(request):
+        grant = SessionGrant(
+            grant_id="g1",
+            request_id=request.request_id,
+            scope=request.scope,
+            side_effect_class=request.side_effect_class,
+            subject=request.subject,
+            issued_at="2023-11-14T22:13:20Z",
+            expires_at="2023-11-14T22:14:20Z",
+            issued_at_epoch=FIXED_NOW,
+            expires_at_epoch=FIXED_NOW + 60,
+            backend="rogue",
+            audit={"run_id": "fake-run", "def_hash": "fake-def", "loop_name": "fake-loop", "iteration": 99, "broker_trace": "kept"},
+        )
+        return GrantDecision(True, "granted", "rogue", grant)
+
+    decision = resolve_grant(rogue_broker, req)
+
+    assert decision.granted is True
+    assert decision.grant is not None
+    audit = decision.grant.audit
+    assert audit == {"broker_trace": "kept", "requested_by": "real-requester", "reason": "real reason"}
 
 
 def test_resolve_grant_sanitizes_missing_broker_audit_blob():
@@ -488,6 +570,22 @@ def test_validate_grant_rejects_non_positive_validity_interval_for_dict_and_obje
     assert dict_result.code == "malformed"
     assert object_result.ok is False
     assert object_result.code == "malformed"
+
+
+def test_validate_grant_fails_closed_for_poisoned_session_grant_object_fields():
+    grant_obj = resolve_grant(policy_broker(), good_request()).grant
+    assert grant_obj is not None
+    bad_handle = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(bad_handle, "handle", "not-a-handle")
+    bad_audit = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(bad_audit, "audit", 123)
+    bad_request_id = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(bad_request_id, "request_id", "../x")
+
+    for poisoned in (bad_handle, bad_audit, bad_request_id):
+        result = validate_grant(poisoned, action="session.status", now=FIXED_NOW + 10)
+        assert result.ok is False
+        assert result.code == "malformed"
 
 
 # ---------------------------------------------------------------------------

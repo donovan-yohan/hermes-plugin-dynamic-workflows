@@ -110,6 +110,21 @@ _FORBIDDEN_CRED_SUBSTRINGS: tuple[str, ...] = (
     "private_key",
 )
 
+# Controller/request-owned audit metadata must not be supplied by broker output.
+# If present in request.audit it is copied back by _sanitize_issued_grant;
+# otherwise broker-spoofed values are dropped before persistence/journaling.
+_RESERVED_AUDIT_KEYS: frozenset[str] = frozenset(
+    {
+        "requested_by",
+        "reason",
+        "policy_max_ttl_seconds",
+        "run_id",
+        "def_hash",
+        "loop_name",
+        "iteration",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Value objects.
@@ -231,6 +246,7 @@ class SessionGrant:
         for key in ("grant_id", "request_id", "side_effect_class", "subject", "backend"):
             if not isinstance(data.get(key), str) or not data.get(key):
                 raise GrantError(f"grant requires non-empty string {key!r}")
+        request_id = _normalize_request_id(data["request_id"])
         scope = _normalize_scope(data.get("scope"))
         issued_epoch = _require_number(data.get("issued_at_epoch"), "issued_at_epoch")
         expires_epoch = _require_number(data.get("expires_at_epoch"), "expires_at_epoch")
@@ -244,7 +260,7 @@ class SessionGrant:
             raise GrantError("grant 'status' must be 'granted' or 'revoked'")
         return cls(
             grant_id=data["grant_id"],
-            request_id=data["request_id"],
+            request_id=request_id,
             scope=scope,
             side_effect_class=data["side_effect_class"],
             subject=data["subject"],
@@ -491,13 +507,12 @@ def request_grant(
     if ttl <= 0 or not math.isfinite(ttl):
         raise GrantError("grant request 'ttl_seconds' must be a positive, finite number")
     audit_blob = dict(audit or {})
-    if request_id is not None and (not isinstance(request_id, str) or not request_id):
-        raise GrantError("grant request 'request_id' must be a non-empty string when provided")
+    normalized_request_id = _normalize_request_id(request_id) if request_id is not None else None
     offender = find_raw_credential(audit_blob)
     if offender is not None:
         raise GrantError(f"grant request audit must not carry a raw credential ({offender!r})")
     return GrantRequest(
-        request_id=request_id or f"greq-{uuid.uuid4().hex[:12]}",
+        request_id=normalized_request_id or f"greq-{uuid.uuid4().hex[:12]}",
         scope=normalized_scope,
         side_effect_class=side_effect_class,
         subject=subject,
@@ -536,6 +551,11 @@ def resolve_grant(
         )
     if not decision.granted:
         return decision
+    try:
+        normalized_grant = _normalize_session_grant(decision.grant)
+    except GrantError as exc:
+        return GrantDecision(False, "malformed", str(exc))
+    decision = replace(decision, grant=normalized_grant)
 
     problem = _audit_issued_grant(decision.grant, request)
     if problem is not None:
@@ -565,7 +585,7 @@ def validate_grant(
     """
 
     try:
-        parsed = SessionGrant.from_dict(grant.to_dict() if isinstance(grant, SessionGrant) else grant)
+        parsed = _normalize_session_grant(grant)
     except GrantError as exc:
         return GrantValidation(False, "malformed", str(exc))
 
@@ -646,6 +666,18 @@ def redact_credentials(payload: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_session_grant(grant: Any) -> SessionGrant:
+    if grant is None:
+        raise GrantError("broker granted without a grant object")
+    try:
+        payload = grant.to_dict() if isinstance(grant, SessionGrant) else grant
+        return SessionGrant.from_dict(payload)
+    except GrantError:
+        raise
+    except Exception as exc:
+        raise GrantError(f"malformed grant object: {type(exc).__name__}: {exc}") from exc
+
+
 def _audit_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) -> Optional[GrantDecision]:
     """Defense in depth: a granted decision must carry a clean, in-policy grant."""
 
@@ -683,8 +715,13 @@ def _audit_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) ->
 
 
 def _grant_time_problem(grant: SessionGrant) -> Optional[str]:
-    ttl = grant.expires_at_epoch - grant.issued_at_epoch
-    if not math.isfinite(grant.issued_at_epoch) or not math.isfinite(grant.expires_at_epoch) or not math.isfinite(ttl):
+    try:
+        issued_epoch = _require_number(grant.issued_at_epoch, "issued_at_epoch")
+        expires_epoch = _require_number(grant.expires_at_epoch, "expires_at_epoch")
+    except GrantError as exc:
+        return str(exc)
+    ttl = expires_epoch - issued_epoch
+    if not math.isfinite(issued_epoch) or not math.isfinite(expires_epoch) or not math.isfinite(ttl):
         return "timestamps must be finite"
     if ttl <= 0:
         return "validity interval must be positive"
@@ -694,7 +731,7 @@ def _grant_time_problem(grant: SessionGrant) -> Optional[str]:
 def _sanitize_issued_grant(grant: Optional[SessionGrant], request: GrantRequest) -> SessionGrant:
     if grant is None:  # guarded by _audit_issued_grant; defensive for type checkers
         raise GrantError("broker granted without a grant object")
-    audit = dict(grant.audit or {})
+    audit = {key: value for key, value in dict(grant.audit or {}).items() if key not in _RESERVED_AUDIT_KEYS}
     for key, value in request.audit.items():
         if key not in {"requested_by", "reason", "policy_max_ttl_seconds"}:
             audit[key] = value
@@ -731,6 +768,16 @@ def _looks_like_credential_value(value: str) -> bool:
         "xoxa-",
     )
     return any(lowered.startswith(prefix) for prefix in token_prefixes)
+
+
+def _normalize_request_id(request_id: Any) -> str:
+    if not isinstance(request_id, str):
+        raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
+    if request_id.strip() != request_id or not request_id:
+        raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
+    if not _action_safe(request_id) or _looks_like_credential_value(request_id):
+        raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
+    return request_id
 
 
 def _normalize_scope(scope: Any) -> tuple[str, ...]:
