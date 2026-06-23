@@ -111,8 +111,9 @@ _FORBIDDEN_CRED_SUBSTRINGS: tuple[str, ...] = (
 )
 
 # Controller/request-owned audit metadata must not be supplied by broker output.
-# If present in request.audit it is copied back by _sanitize_issued_grant;
-# otherwise broker-spoofed values are dropped before persistence/journaling.
+# Request-owned loop/run metadata is copied back by _sanitize_issued_grant;
+# canonical requested_by/reason are restored from the GrantRequest, while
+# policy_max_ttl_seconds is treated as broker policy metadata and not persisted.
 _RESERVED_AUDIT_KEYS: frozenset[str] = frozenset(
     {
         "requested_by",
@@ -246,7 +247,13 @@ class SessionGrant:
         for key in ("grant_id", "request_id", "side_effect_class", "subject", "backend"):
             if not isinstance(data.get(key), str) or not data.get(key):
                 raise GrantError(f"grant requires non-empty string {key!r}")
+        grant_id = _safe_grant_id(data["grant_id"])
         request_id = _normalize_request_id(data["request_id"])
+        side_effect_class = data["side_effect_class"]
+        if side_effect_class not in SIDE_EFFECT_CLASSES:
+            raise GrantError(
+                f"unknown side_effect_class {side_effect_class!r}; expected one of {', '.join(SIDE_EFFECT_CLASSES)}"
+            )
         scope = _normalize_scope(data.get("scope"))
         issued_epoch = _require_number(data.get("issued_at_epoch"), "issued_at_epoch")
         expires_epoch = _require_number(data.get("expires_at_epoch"), "expires_at_epoch")
@@ -259,10 +266,10 @@ class SessionGrant:
         if status not in ("granted", "revoked"):
             raise GrantError("grant 'status' must be 'granted' or 'revoked'")
         return cls(
-            grant_id=data["grant_id"],
+            grant_id=grant_id,
             request_id=request_id,
             scope=scope,
-            side_effect_class=data["side_effect_class"],
+            side_effect_class=side_effect_class,
             subject=data["subject"],
             issued_at=str(data.get("issued_at", "")),
             expires_at=str(data.get("expires_at", "")),
@@ -574,7 +581,7 @@ def validate_grant(
     grant: Any,
     *,
     action: Optional[str] = None,
-    now: Optional[float] = None,
+    now: Any = None,
 ) -> GrantValidation:
     """Fail-closed check that a grant authorizes ``action`` right now.
 
@@ -599,9 +606,10 @@ def validate_grant(
     if parsed.status != "granted":
         return GrantValidation(False, "revoked", f"grant status is {parsed.status!r}", parsed)
 
-    clock = float(now) if now is not None else time.time()
-    if not math.isfinite(clock):
-        return GrantValidation(False, "malformed", "validation clock must be finite", parsed)
+    try:
+        clock = _require_number(now, "validation clock") if now is not None else time.time()
+    except GrantError as exc:
+        return GrantValidation(False, "malformed", str(exc), parsed)
     if clock >= parsed.expires_at_epoch:
         return GrantValidation(False, "expired", f"grant expired at {parsed.expires_at}", parsed)
     if action is not None and action not in parsed.scope:
@@ -775,7 +783,7 @@ def _normalize_request_id(request_id: Any) -> str:
         raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
     if request_id.strip() != request_id or not request_id:
         raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
-    if not _action_safe(request_id) or _looks_like_credential_value(request_id):
+    if not _safe_identifier_segment(request_id) or _looks_like_credential_value(request_id):
         raise GrantError("grant request 'request_id' must be a non-empty identifier-safe string when provided")
     return request_id
 
@@ -821,8 +829,17 @@ def _require_number(value: Any, label: str) -> float:
     return number
 
 
+def _safe_identifier_segment(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and value[0].isalnum()
+        and all(c.isalnum() or c in "._-" for c in value)
+    )
+
+
 def _safe_grant_id(grant_id: str) -> str:
-    if not grant_id or not isinstance(grant_id, str) or not all(c.isalnum() or c in "._-" for c in grant_id):
+    if not _safe_identifier_segment(grant_id):
         raise GrantError("grant_id must be identifier-safe")
     return grant_id
 
