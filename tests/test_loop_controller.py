@@ -6,6 +6,7 @@ import time
 
 from hermes_workflows.errors import WorkflowValidationError
 from hermes_workflows.loops import FileLoopRunStore, InMemoryLoopRunStore, LoopSensorResult, loop_run, loop_validate
+from hermes_workflows.resources import WorkflowResource, run_resource_finalizers
 
 
 def loop_spec(**brake_overrides):
@@ -477,3 +478,187 @@ def test_loop_run_raises_validation_error_before_calling_sensor():
         raise AssertionError("expected WorkflowValidationError")
 
     assert called is False
+
+
+def _resource(resource_id="ath-listener-1", *, policy="required", when=None):
+    return {
+        "id": resource_id,
+        "kind": "ath.listener",
+        "handle": {"thread_key": "ath_safe_123"},
+        "metadata": {"purpose": "release slice"},
+        "finalizers": [
+            {
+                "id": "retire-listener",
+                "action": "ath.listener.retire",
+                "policy": policy,
+                "when": when or ["success", "failure", "timeout"],
+                "verification": {"event": "listener_disabled"},
+            }
+        ],
+    }
+
+
+def test_loop_run_runs_success_resource_finalizer_and_persists_result():
+    store = InMemoryLoopRunStore()
+    calls = {"sensor": 0, "cleanup": []}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] == 1:
+            return {"converged": False, "signal_key": "needs-cleanup-owned-resource", "summary": "needs work"}
+        assert context["resources"][0]["id"] == "ath-listener-1"
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "provisioned listener", "resources": [_resource()]}
+
+    def finalizer(context):
+        calls["cleanup"].append(context)
+        assert context["trigger"] == "success"
+        assert context["resource"]["kind"] == "ath.listener"
+        assert context["finalizer"]["action"] == "ath.listener.retire"
+        return {"ok": True, "summary": "listener retired", "evidence": [{"kind": "ath", "status": "disabled"}]}
+
+    status = loop_run(
+        loop_spec(),
+        sensor=sensor,
+        actuator=actuator,
+        finalizer=finalizer,
+        run_id="loop.cleanup.success",
+        store=store,
+    )
+    stored = store.get_status("loop.cleanup.success")
+
+    assert status.state == "converged"
+    assert len(calls["cleanup"]) == 1
+    assert status.resources[0]["owner"]["run_id"] == "loop.cleanup.success"
+    assert status.finalizer_results[0]["status"] == "succeeded"
+    assert status.finalizer_results[0]["trigger"] == "success"
+    assert status.report["resource_count"] == 1
+    assert status.report["finalizer_count"] == 1
+    assert stored is not None
+    assert stored["finalizer_results"] == status.finalizer_results
+    assert any(event["kind"] == "resources_registered" for event in status.events)
+    assert any(event["kind"] == "finalizer_result" for event in status.events)
+
+
+def test_loop_run_required_finalizer_failure_blocks_success():
+    calls = {"sensor": 0}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] == 1:
+            return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "provisioned relay session", "resources": [_resource("relay-session-1")]}
+
+    def finalizer(context):
+        return {"ok": False, "summary": "relay session still active", "error": "still_running"}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, finalizer=finalizer)
+
+    assert status.state == "halted_finalizer_error"
+    assert status.halted_reason == "required resource finalizer failed"
+    assert status.finalizer_results[0]["status"] == "failed"
+    assert status.finalizer_results[0]["policy"] == "required"
+    assert status.report["final_state"] == "halted_finalizer_error"
+    assert status.report["required_finalizer_failed"] is True
+    assert status.events[-1]["kind"] == "halted"
+    assert status.events[-1]["prior_state"] == "converged"
+
+
+def test_loop_run_runs_timeout_resource_finalizer():
+    calls = {"cleanup": []}
+
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+
+    def actuator(context):
+        time.sleep(0.03)
+        return {"summary": "slow provisioned process", "resources": [_resource("process-1", when=["timeout"])]}
+
+    def finalizer(context):
+        calls["cleanup"].append(context["trigger"])
+        return {"ok": True, "summary": "process stopped"}
+
+    status = loop_run(loop_spec(max_wall_seconds=0.01), sensor=sensor, actuator=actuator, finalizer=finalizer)
+
+    assert status.state == "halted_time_cap"
+    assert calls["cleanup"] == ["timeout"]
+    assert status.finalizer_results[0]["trigger"] == "timeout"
+    assert status.finalizer_results[0]["status"] == "succeeded"
+
+
+def test_loop_run_dedupes_repeated_resource_finalizer_registration():
+    calls = {"sensor": 0, "cleanup": 0}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] < 3:
+            return {"converged": False, "signal_key": f"needs-work-{calls['sensor']}", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "same listener still owned", "resources": [_resource("ath-listener-repeat")]}
+
+    def finalizer(context):
+        calls["cleanup"] += 1
+        return {"ok": True, "summary": "cleanup once"}
+
+    status = loop_run(loop_spec(max_repeated_signal=99), sensor=sensor, actuator=actuator, finalizer=finalizer)
+
+    assert status.state == "converged"
+    assert len(status.resources) == 1
+    assert len(status.finalizer_results) == 1
+    assert calls["cleanup"] == 1
+
+
+def test_loop_run_rejects_resource_envelope_with_raw_credential_before_journaling():
+    def sensor(context):
+        return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+
+    def actuator(context):
+        resource = _resource()
+        resource["handle"]["token"] = "ghp_should_not_be_journaled"
+        return {"summary": "bad resource", "resources": [resource]}
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator)
+
+    assert status.state == "halted_actuator_error"
+    assert status.resources == []
+    assert status.actuator_results == []
+    assert status.halted_reason is not None
+    assert "raw credential" in status.halted_reason
+    dumped = json.dumps(status.as_dict())
+    assert "ghp_should_not_be_journaled" not in dumped
+
+
+def test_resource_finalizer_helper_runs_host_owned_cancelled_trigger_once():
+    resource = WorkflowResource.from_dict(_resource("relay-session-cancel", when=["cancelled"]))
+    calls = []
+
+    def finalizer(context):
+        calls.append((context["trigger"], context["resource"]["id"]))
+        return {"ok": True, "summary": "cancel cleanup done"}
+
+    first = run_resource_finalizers(
+        [resource],
+        trigger="cancelled",
+        runner=finalizer,
+        run_id="loop.cancel.host",
+        loop_name="ticket_loop",
+    )
+    second = run_resource_finalizers(
+        [resource],
+        trigger="cancelled",
+        runner=finalizer,
+        run_id="loop.cancel.host",
+        loop_name="ticket_loop",
+        existing_results=[item.to_dict() for item in first],
+    )
+
+    assert [item.status for item in first] == ["succeeded"]
+    assert second == []
+    assert calls == [("cancelled", "relay-session-cancel")]

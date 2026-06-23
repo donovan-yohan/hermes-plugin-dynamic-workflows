@@ -73,6 +73,18 @@ from .grants import (
     redact_credentials,
     REDACTED,
 )
+from .resources import (
+    FINALIZER_POLICIES,
+    FINALIZER_TRIGGERS,
+    FINALIZER_RESULT_STATUSES,
+    WorkflowResource,
+    ResourceFinalizer,
+    FinalizerResult,
+    ResourceFinalizerCallable,
+    normalize_resource_envelopes,
+    run_resource_finalizers,
+    has_required_finalizer_failure,
+)
 from .vm import (
     CapabilityBroker,
     ScriptRunResult,
@@ -245,6 +257,17 @@ __all__ = [
     "find_raw_credential",
     "redact_credentials",
     "REDACTED",
+    # workflow resources/finalizers (issue #52)
+    "FINALIZER_POLICIES",
+    "FINALIZER_TRIGGERS",
+    "FINALIZER_RESULT_STATUSES",
+    "WorkflowResource",
+    "ResourceFinalizer",
+    "FinalizerResult",
+    "ResourceFinalizerCallable",
+    "normalize_resource_envelopes",
+    "run_resource_finalizers",
+    "has_required_finalizer_failure",
     "validate_script",
     "ScriptValidation",
     "WorkflowVM",

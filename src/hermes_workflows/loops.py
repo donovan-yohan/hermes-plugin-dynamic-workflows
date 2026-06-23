@@ -43,6 +43,13 @@ from .grants import (
     validate_grant,
 )
 from .models import Diagnostic, ValidationResult
+from .resources import (
+    ResourceFinalizerCallable,
+    WorkflowResource,
+    has_required_finalizer_failure,
+    normalize_resource_envelopes,
+    run_resource_finalizers,
+)
 
 __all__ = [
     "LoopState",
@@ -53,6 +60,7 @@ __all__ = [
     "ActuatorCallable",
     "LoopEventSink",
     "LoopRunStore",
+    "ResourceFinalizerCallable",
     "InMemoryLoopRunStore",
     "FileLoopRunStore",
     "loop_validate",
@@ -74,6 +82,7 @@ LoopState = Literal[
     "halted_sensor_error",
     "halted_actuator_error",
     "halted_grant_denied",
+    "halted_finalizer_error",
 ]
 
 LoopEvent = dict[str, Any]
@@ -108,6 +117,8 @@ class LoopRunStatus:
     actuator_results: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     grants: list[dict[str, Any]] = field(default_factory=list)
+    resources: list[dict[str, Any]] = field(default_factory=list)
+    finalizer_results: list[dict[str, Any]] = field(default_factory=list)
     halted_reason: Optional[str] = None
     report: dict[str, Any] = field(default_factory=dict)
 
@@ -123,6 +134,8 @@ class LoopRunStatus:
             "actuator_results": self.actuator_results,
             "events": self.events,
             "grants": self.grants,
+            "resources": self.resources,
+            "finalizer_results": self.finalizer_results,
             "halted_reason": self.halted_reason,
             "report": self.report,
         }
@@ -233,6 +246,7 @@ def loop_run(
     on_event: Optional[LoopEventSink] = None,
     grant_broker: Optional[GrantBroker] = None,
     grant_store: Optional[GrantStore] = None,
+    finalizer: Optional[ResourceFinalizerCallable] = None,
 ) -> LoopRunStatus:
     """Run a bounded feedback-controller loop synchronously.
 
@@ -256,6 +270,14 @@ def loop_run(
     previously issued ``grant`` to re-validate before reuse. A denied, expired,
     malformed, or credential-bearing grant — or a missing broker — halts the run
     in ``halted_grant_denied`` with a structured ``grant_denied`` event.
+
+    An actuator may also return ``resource`` or ``resources`` envelopes with
+    credential-free handles and declared finalizers. On terminal success,
+    timeout, or failure paths the controller runs matching finalizers through the
+    injected ``finalizer`` adapter, records auditable results, and treats failed
+    ``required`` cleanup as ``halted_finalizer_error`` instead of reporting a
+    false success. Waiting-for-event/approval states intentionally preserve
+    resources for the resumed run.
     """
 
     validation = loop_validate(spec)
@@ -386,6 +408,12 @@ def loop_run(
                 raise TypeError(f"actuator returned {type(action).__name__}, expected dict")
             action_cost = _action_cost(action)
             suspension = _actuator_suspension(action)
+            resources = normalize_resource_envelopes(
+                action,
+                run_id=status.run_id,
+                loop_name=normalized.get("name"),
+                iteration=iteration,
+            )
         except Exception as exc:  # pragma: no cover - exact exception type is caller-owned
             halt("halted_actuator_error", f"{type(exc).__name__}: {exc}")
             break
@@ -394,6 +422,9 @@ def loop_run(
         recorded_action = _redact_grant_envelopes(action)
         status.actuator_results.append(recorded_action)
         _record_event(status, normalized, store, on_event, "actuator_result", "verifying", iteration, "actuator completed", result=recorded_action)
+
+        if resources:
+            _register_resources(status, normalized, store, on_event, iteration, resources)
 
         if _time_exceeded(started, brakes):
             halt("halted_time_cap", "max_wall_seconds exceeded during acting")
@@ -437,9 +468,10 @@ def loop_run(
             )
             break
 
+    report_risk = status.report.get("convergence_risk") if status.report else "not_converged"
+    _closeout_resources(status, normalized, store, on_event, finalizer)
     status.updated_at = _utc_now_iso()
-    if not status.report:
-        status.report = _report(status, "not_converged")
+    status.report = _report(status, str(report_risk or "not_converged"))
     _persist_status(store, status)
     return status
 
@@ -642,6 +674,8 @@ def _context(
             "events": list(status.events),
         },
         "grants": [copy.deepcopy(g) for g in status.grants],
+        "resources": [copy.deepcopy(r) for r in status.resources],
+        "finalizer_results": [copy.deepcopy(r) for r in status.finalizer_results],
         "handoff": {
             "prompt": latest.next_hint if latest else None,
             "expected_return": {
@@ -651,6 +685,7 @@ def _context(
                 "approval_request": "optional {id|token|kind, summary?, choices?, ...} to suspend in waiting_for_approval",
                 "grant_request": "optional {scope[], side_effect_class, subject, reason, ttl_seconds, requested_by?} to request a scoped session grant (no secrets)",
                 "grant": "optional previously-issued grant dict to re-validate before reuse; include grant_action to assert scope",
+                "resources": "optional list of credential-free {id, kind, handle, owner?, finalizers[]} declarations to clean up on terminal paths",
                 "summary": "bounded action summary; success still requires a later sensor result",
             },
         },
@@ -855,6 +890,101 @@ def _grant_audit(
     return audit
 
 
+def _register_resources(
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    store: Optional[LoopRunStore],
+    on_event: Optional[LoopEventSink],
+    iteration: int,
+    resources: list[WorkflowResource],
+) -> None:
+    existing_ids = {item.get("id") for item in status.resources if isinstance(item, dict)}
+    registered: list[dict[str, Any]] = []
+    for resource in resources:
+        if resource.resource_id in existing_ids:
+            continue
+        existing_ids.add(resource.resource_id)
+        resource_dict = resource.to_dict()
+        status.resources.append(resource_dict)
+        registered.append(resource_dict)
+    if registered:
+        _record_event(
+            status,
+            spec,
+            store,
+            on_event,
+            "resources_registered",
+            "acting",
+            iteration,
+            f"registered {len(registered)} workflow resource(s)",
+            resources=registered,
+        )
+
+
+def _closeout_resources(
+    status: LoopRunStatus,
+    spec: dict[str, Any],
+    store: Optional[LoopRunStore],
+    on_event: Optional[LoopEventSink],
+    finalizer: Optional[ResourceFinalizerCallable],
+) -> None:
+    trigger = _finalizer_trigger(status.state)
+    if trigger is None or not status.resources:
+        return
+    resources = [WorkflowResource.from_dict(item) for item in status.resources]
+    results = run_resource_finalizers(
+        resources,
+        trigger=trigger,
+        runner=finalizer,
+        run_id=status.run_id,
+        loop_name=spec.get("name"),
+        existing_results=status.finalizer_results,
+    )
+    if not results:
+        return
+    for result in results:
+        result_dict = result.to_dict()
+        status.finalizer_results.append(result_dict)
+        _record_event(
+            status,
+            spec,
+            store,
+            on_event,
+            "finalizer_result",
+            status.state,
+            status.iterations,
+            result.summary,
+            result=result_dict,
+        )
+    if has_required_finalizer_failure(status.finalizer_results):
+        prior_state = status.state
+        prior_reason = status.halted_reason
+        status.state = "halted_finalizer_error"
+        status.halted_reason = "required resource finalizer failed"
+        _record_event(
+            status,
+            spec,
+            store,
+            on_event,
+            "halted",
+            "halted_finalizer_error",
+            status.iterations,
+            status.halted_reason,
+            prior_state=prior_state,
+            prior_halted_reason=prior_reason,
+        )
+
+
+def _finalizer_trigger(state: LoopState) -> Optional[str]:
+    if state == "converged":
+        return "success"
+    if state == "halted_time_cap":
+        return "timeout"
+    if state.startswith("halted_") and state != "halted_finalizer_error":
+        return "failure"
+    return None
+
+
 def _halt(
     status: LoopRunStatus,
     spec: dict[str, Any],
@@ -875,6 +1005,9 @@ def _report(status: LoopRunStatus, convergence_risk: str) -> dict[str, Any]:
         "iterations": status.iterations,
         "latest_sensor": latest,
         "actuator_count": len(status.actuator_results),
+        "resource_count": len(status.resources),
+        "finalizer_count": len(status.finalizer_results),
+        "required_finalizer_failed": has_required_finalizer_failure(status.finalizer_results),
         "halted_reason": status.halted_reason,
         "convergence_risk": convergence_risk,
     }
