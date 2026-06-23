@@ -1109,7 +1109,46 @@ payload so the live adapter can map the default lanes (`planner`, `implementer`,
 The closeout stage is nevertheless part of the contract: shipping is incomplete
 until issue hygiene and docs hygiene have explicit evidence.
 
-## 7. Roadmap
+## 7. Event-driven trigger migration (#10)
+
+Dynamic Workflows replace timer watchdog orchestration by making the workflow run,
+not cron, own phase state. A cron job may still *start* a workflow on a calendar,
+and a script-only no-agent job may still send a simple visibility heartbeat, but a
+goal-directed workflow must not rely on "wake every N minutes, poll GitHub/Kanban,
+reconstruct the phase, and ask an agent what to do next." That pattern is
+expensive and unsafe: it duplicates work, loses exact-head context, and turns
+stale polls into orchestration decisions.
+
+The migration shape is:
+
+1. **Start from an event or calendar edge.** A webhook, queue message, manual
+   operator action, or calendar tick creates one workflow run with the trigger
+   payload in `inputs`.
+2. **Advance through durable awaits.** `kanban_agent` steps, loop waits, and
+   adapter-specific event subscriptions park between phases. The terminal task or
+   event record resumes the workflow; a timer does not rediscover the phase.
+3. **Expose state through operator status.** `workflow_control overview/status`
+   shows blocked waits and projected pause/stop/retry intent, so humans and
+   dashboards inspect state without owning it.
+4. **Notify and stop.** Status/WIP digests are outputs of a workflow or simple
+   notifiers. They do not mutate implementation/review/release phase state.
+
+Existing watchdog migrations:
+
+| Old watchdog | New workflow shape |
+| --- | --- |
+| Issue lifecycle poller | Start `github_issue_lifecycle_hygiene` once; Kanban task events advance inventory → plan → implementation → verification → closeout. |
+| PR validation poller | Start `event_driven_pr_validation_lane` from `pull_request.opened` / `synchronize`; QA and review are durable waits, and the summary emits one update. |
+| Board unblocker/fixer loop | Run a loop-controller sensor/actuator pair; the actuator emits one fix card/session and waits for its event instead of polling the board. |
+| WIP synthesis/status notification | Use a calendar-started workflow or script-only notifier for one digest; keep orchestration decisions in the workflow state machine. |
+
+`examples/event_driven_pr_validation_lane.workflow.json` is the first concrete #10
+fixture. It accepts `trigger_event`, normalizes the PR head once, fans out QA and
+review through `kanban_agent` awaits, then produces a validation summary. In the
+bundled tests this runs under `StubAgentRunner`; in production the same shape is
+backed by real Kanban/Hermes profiles and webhook delivery.
+
+## 8. Roadmap
 
 Near-term and future work, roughly in priority order:
 

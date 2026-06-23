@@ -187,3 +187,33 @@ def test_bundled_github_issue_lifecycle_hygiene_template_validates_and_runs():
     assert closeout["profile"] == "ops"
     assert "issue hygiene" in str(closeout["result"]["echo"]).lower()
     assert "docs" in str(outputs["docs_gate"]["result"]["echo"]).lower()
+
+
+def test_bundled_event_driven_pr_validation_template_validates_and_runs():
+    catalog = FileWorkflowCatalog()
+
+    templates = {entry["name"]: entry for entry in catalog.list_templates()}
+    assert templates["event_driven_pr_validation_lane"]["ok"] is True
+    assert "trigger_event" in templates["event_driven_pr_validation_lane"]["required_inputs"]
+
+    result = workflow(
+        template_name="event_driven_pr_validation_lane",
+        inputs={
+            "repo": "donovan-yohan/hermes-plugin-dynamic-workflows",
+            "pr_number": 42,
+            "base_branch": "main",
+            "workspace": "/repo",
+            "trigger_event": {"kind": "pull_request.synchronize", "head_sha": "abc123"},
+            "profile_bindings": {"qa": "relayqa", "reviewer": "relayreview"},
+        },
+        catalog=catalog,
+        registry=InMemoryRunStore(),
+    )
+
+    assert result["operation"] == "run_template"
+    assert result["status"]["status"] == "succeeded"
+    outputs = result["status"]["result"]["outputs"]
+    assert "event_context" in outputs
+    assert "validation_summary" in outputs
+    assert outputs["qa_gate"]["profile"] == "qa"
+    assert "watchdog" in str(outputs["validation_summary"]["echo"]).lower()

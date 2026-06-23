@@ -1,0 +1,121 @@
+{
+  "version": "1",
+  "name": "event_driven_pr_validation_lane",
+  "description": "Webhook/event-started PR validation workflow that replaces periodic PR watchdog polling with durable QA/review awaits.",
+  "inputs": {
+    "repo": "string",
+    "pr_number": "int",
+    "base_branch": "string",
+    "workspace": "string",
+    "trigger_event": "object",
+    "profile_bindings": "object"
+  },
+  "policy": {
+    "network": false,
+    "filesystem": false,
+    "max_parallel": 2
+  },
+  "steps": [
+    {
+      "kind": "agent",
+      "id": "event_context",
+      "agent": "hermes.github.pr_event_context",
+      "input": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number",
+        "base_branch": "$ref:inputs.base_branch",
+        "trigger_event": "$ref:inputs.trigger_event",
+        "purpose": "Normalize the webhook/calendar-start payload into one exact PR head, current labels, and validation requirements. Do not poll GitHub to rediscover the next phase."
+      },
+      "output_schema": {
+        "echo": "object",
+        "digest": "string"
+      }
+    },
+    {
+      "kind": "parallel",
+      "id": "validation_gates",
+      "depends_on": [
+        "event_context"
+      ],
+      "branches": [
+        {
+          "kind": "kanban_agent",
+          "id": "qa_gate",
+          "profile": "qa",
+          "task": {
+            "repo": "$ref:inputs.repo",
+            "pr_number": "$ref:inputs.pr_number",
+            "event_context": "$ref:event_context.output.echo",
+            "requirements": [
+              "check out the exact head from the trigger event",
+              "run targeted tests first, then the agreed full gate for this repo",
+              "return exact commands and results",
+              "do not advance by polling for the next phase; the workflow resumes from this card's terminal event"
+            ],
+            "profile_bindings": "$ref:inputs.profile_bindings"
+          },
+          "input": {
+            "workspace": "$ref:inputs.workspace",
+            "base_branch": "$ref:inputs.base_branch"
+          },
+          "output_schema": {
+            "task_id": "string",
+            "status": "string",
+            "result": "object"
+          }
+        },
+        {
+          "kind": "kanban_agent",
+          "id": "review_gate",
+          "profile": "reviewer",
+          "task": {
+            "repo": "$ref:inputs.repo",
+            "pr_number": "$ref:inputs.pr_number",
+            "event_context": "$ref:event_context.output.echo",
+            "requirements": [
+              "review the exact head from the trigger event",
+              "block on correctness/security/docs overclaims, not style nits",
+              "return blockers first with file/line evidence",
+              "do not poll or infer phase transitions outside the workflow"
+            ],
+            "profile_bindings": "$ref:inputs.profile_bindings"
+          },
+          "input": {
+            "workspace": "$ref:inputs.workspace",
+            "base_branch": "$ref:inputs.base_branch"
+          },
+          "output_schema": {
+            "task_id": "string",
+            "status": "string",
+            "result": "object"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "agent",
+      "id": "validation_summary",
+      "agent": "hermes.github.pr_validation_summary",
+      "input": {
+        "repo": "$ref:inputs.repo",
+        "pr_number": "$ref:inputs.pr_number",
+        "trigger_event": "$ref:inputs.trigger_event",
+        "qa": "$ref:qa_gate.output.result",
+        "review": "$ref:review_gate.output.result",
+        "instructions": [
+          "summarize exact-head validation evidence",
+          "state whether this PR can be merged or needs fixes",
+          "emit one notification/update payload; do not schedule a watchdog loop"
+        ]
+      },
+      "output_schema": {
+        "echo": "object",
+        "digest": "string"
+      },
+      "depends_on": [
+        "validation_gates"
+      ]
+    }
+  ]
+}
