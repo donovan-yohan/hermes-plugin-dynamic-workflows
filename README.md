@@ -42,6 +42,7 @@ The current runtime supports:
 - a versioned **saved script harness catalog**: validate, save, list, inspect, and run reusable Python workflow-script harnesses by name/version via `FileWorkflowScriptCatalog` and `workflow` actions (`script_catalog`, `script_save`, `script_inspect`, `run_script`)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
+- backend-neutral **resource lifecycle finalizers**: loop actuators can register credential-free resources (ATH listener, Relay session/work context, process, temp workspace, etc.) plus cleanup finalizers; terminal success/failure/timeout paths run matching finalizers through an injected adapter, persist auditable cleanup results, and fail success closed when a `required` finalizer fails
 - backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
 - backend-neutral **control enforcement decisions**: a pure `evaluate_control_state(state, operation, target_ref?)` seam (plus `may_start_work` / `may_continue_task` / `may_retry` / `may_check_run`) that turns control state + an operation into an `allowed`/`code` `ControlDecision` an adapter consults before starting child work, continuing a task, or retrying — stop blocks everything, pause holds only new work, `task_stop` blocks only its target, and an existing retry surfaces its replacement to avoid silent duplicates; core decides, the adapter still owns the actual cancel/replay
 - **event-driven trigger migration docs/templates**: cron is documented as a workflow starter or visibility heartbeat only, not the owner of goal-directed phase advancement; `event_driven_pr_validation_lane` rewrites a PR watchdog as a trigger-started workflow with durable QA/review awaits
@@ -505,12 +506,66 @@ sensor/actuator calls, and the context exposes `limits.remaining_wall_seconds` /
 Repo/tool specifics are intentionally inputs or adapter config, not new primitive
 kinds like `relay_*` or `github_*`. Actuator contexts include a small handoff
 contract (`prompt`, expected artifact/session/check handles, optional numeric
-`cost`, optional `wait`, and optional `approval_request`) so Relay, Kanban, ATH,
-or local process adapters can execute one bounded step and return evidence without
-becoming the workflow abstraction. An actuator can return `wait: {"token": "..."}`
+`cost`, optional `wait`, optional `approval_request`, and optional credential-free
+`resources`) so Relay, Kanban, ATH, or local process adapters can execute one
+bounded step and return evidence without becoming the workflow abstraction. An
+actuator can return `wait: {"token": "..."}`
 to suspend the run in `waiting_for_event`, or `approval_request: {"id": "..."}` to
 suspend in `waiting_for_approval`; the controller records the request and stops
 until a future adapter/resume slice advances it.
+
+### Resource lifecycle finalizers (issue #52)
+
+A loop actuator that provisions or reuses runtime resources can declare those
+resources directly in its result. Resources are generic, credential-free handles:
+ATH listeners/producers, Relay sessions/work contexts, local processes, temp
+worktrees, containers, or other backend-owned things. Dynamic Workflows records
+ownership and decides *when* cleanup should run; ATH/Relay/process adapters still
+own the actual cleanup action.
+
+```python
+def actuator(ctx):
+    return {
+        "summary": "started release slice lane",
+        "resources": [
+            {
+                "id": "ath-listener-pr51",
+                "kind": "ath.listener",
+                "handle": {"thread_key": "ath_safe_ref"},  # opaque id, not a secret
+                "owner": {"issue": 52, "pr": 51},
+                "finalizers": [
+                    {
+                        "id": "retire-listener",
+                        "action": "ath.listener.retire",
+                        "when": ["success", "failure", "timeout"],
+                        "policy": "required",
+                        "verification": {"event": "listener_disabled"},
+                    }
+                ],
+            }
+        ],
+    }
+
+def finalizer(ctx):
+    # Adapter-owned: call ATH/Relay/process cleanup using ctx["resource"] and
+    # ctx["finalizer"], then return bounded evidence.
+    return {"ok": True, "summary": "listener retired", "evidence": [{"kind": "ath", "status": "disabled"}]}
+
+status = loop_run(spec, sensor=sensor, actuator=actuator, finalizer=finalizer)
+```
+
+Eligible finalizers run once on terminal `success`, `failure`, or `timeout` paths
+(and the model also understands future `cancelled` / `superseded` triggers for
+host adapters). `preserve_only` resources are recorded as intentionally preserved;
+`manual_approval_required` finalizers record an approval-needed result; failed
+`best_effort` cleanup is visible but does not change the run state. A failed
+`required` finalizer changes the run to `halted_finalizer_error`, so a workflow
+cannot claim success while leaking a resource. Waiting states deliberately do not
+run finalizers yet because those resources may be needed by the resumed run.
+
+Resource/finalizer envelopes reject credential-shaped keys or values before they
+are journaled. Handles should be opaque ids or backend refs, not bearer tokens,
+cookies, passwords, or API keys.
 
 `loop_run(..., store=...)` persists each lifecycle transition through the generic
 `LoopRunStore` protocol. `InMemoryLoopRunStore` is useful for embedders/tests;

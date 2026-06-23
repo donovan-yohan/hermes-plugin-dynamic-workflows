@@ -105,7 +105,7 @@ def workflow_status(
   blocked waits), `status` (one run's compact control state, current phase,
   waits, child task refs, links, and the run-level enforcement decisions), or one
   of the append-only control verbs `pause` / `resume` / `stop` / `task_stop` /
-  `retry`. It is backed by the generic `controls` module (§1.5.2–§1.5.3) and a
+  `retry`. It is backed by the generic `controls` module (§1.5.3–§1.5.4) and a
   durable `FileControlStore`, so an operator can pause, stop, or retry a run
   without touching the authoring `workflow` tool and without deleting any audit
   history.
@@ -149,6 +149,7 @@ def workflow_status(
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
 | `grants.py` | Backend-neutral scoped actuator grants: `GrantRequest` / `SessionGrant` / `GrantHandle` models, in-memory/file `GrantStore`, `StaticPolicyGrantBroker`, `request_grant` / `resolve_grant` / `validate_grant`, and a credential-leak guard. Wired into `loop_run` for fail-closed session-launch authorization. |
+| `resources.py` | Backend-neutral workflow resource/finalizer models: credential-free resource declarations, cleanup trigger/policy vocabulary, finalizer runner Protocol, idempotent closeout result helpers, and credential-leak rejection. Wired into `loop_run` for terminal resource cleanup. |
 | `models.py` | All dataclasses: `ValidationResult`, `Diagnostic`, `RunHandle`, `RunStatus`, `Progress`, `StepStatus`. |
 | `errors.py` | `WorkflowError` base, `WorkflowValidationError`, `RunNotFound`, `SandboxPolicyError`. |
 
@@ -237,8 +238,11 @@ results may also suspend the controller with a backend-neutral envelope: `wait`
 transitions to `waiting_for_event`, and `approval_request` transitions to
 `waiting_for_approval`. The request object must identify itself with `id`, `token`,
 or `kind`, is recorded in status/events, and is intentionally not executed by the
-controller. This keeps Dynamic Workflows' product primitive generic while still
-making Relay/ATH handoffs possible through adapter configuration and run inputs.
+controller. Actuator results may also register credential-free `resources` with
+declared cleanup `finalizers`; terminal success/failure/timeout paths run matching
+finalizers through an injected adapter and persist auditable cleanup results. This
+keeps Dynamic Workflows' product primitive generic while still making Relay/ATH
+handoffs possible through adapter configuration and run inputs.
 
 Persistence and visibility are generic boundaries, not ATH-specific code paths.
 `LoopRunStore.save_status(status)` is called at each lifecycle event and at final
@@ -321,7 +325,63 @@ Protocol, fail-closed wiring — not a real auth backend. The bundled broker
 authenticates nothing; it makes the shape real, testable, and credential-free so
 a backend adapter can drop in behind `GrantBroker` later.
 
-### 1.5.2 Operator controls, status & wait inspection (issue #9)
+### 1.5.2 Resource lifecycle finalizers (issue #52)
+
+A loop actuator that starts or reuses runtime resources needs a closeout contract
+just as much as it needs a launch contract. `resources.py` is that generic model:
+`WorkflowResource` names a credential-free resource handle, `ResourceFinalizer`
+declares a cleanup action and trigger policy, and `FinalizerResult` records the
+auditable outcome. The controller stores resource declarations on
+`LoopRunStatus.resources` and finalizer outcomes on `LoopRunStatus.finalizer_results`.
+
+The actuator envelope is deliberately backend-neutral:
+
+```json
+{
+  "resources": [
+    {
+      "id": "ath-listener-pr51",
+      "kind": "ath.listener",
+      "handle": {"thread_key": "ath_safe_ref"},
+      "owner": {"issue": 52, "pr": 51},
+      "finalizers": [
+        {
+          "id": "retire-listener",
+          "action": "ath.listener.retire",
+          "when": ["success", "failure", "timeout"],
+          "policy": "required",
+          "verification": {"event": "listener_disabled"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+Core does not know how to retire an ATH listener, stop a Relay session, kill a
+process group, or delete a worktree. It only decides *when* finalizers are due and
+calls the injected `ResourceFinalizerCallable` with `{run_id, loop_name, trigger,
+resource, finalizer}`. Backend adapters own the actual cleanup and return bounded
+`{ok, summary, evidence}` results.
+
+Closeout runs on terminal success, failure, and timeout paths. Waiting states do
+not close resources because those resources may be needed by the resumed run.
+The trigger vocabulary also includes future host-owned `cancelled` and
+`superseded` paths so gateway/ATH/Relay adapters can reuse the same model outside
+the synchronous `loop_run` happy path. Finalizers are idempotent at the controller
+surface: `(resource_id, finalizer_id, trigger)` is executed once even if a resource
+is registered repeatedly or a status snapshot is re-processed.
+
+Policies are explicit. `best_effort` failures are visible but do not change the
+terminal state; `preserve_only` records that a resource is intentionally kept;
+`manual_approval_required` records an approval-needed closeout result; failed
+`required` cleanup changes the run to `halted_finalizer_error`, because a run that
+claims success while leaking a required resource is lying. Resource and finalizer
+envelopes reject credential-shaped keys/values before journaling, so handles must
+be opaque ids or scoped backend refs, not cookies, bearer tokens, passwords, or
+API keys.
+
+### 1.5.3 Operator controls, status & wait inspection (issue #9)
 
 A run that is *authored* through `workflow` eventually needs an *operator*
 surface: pause it, resume it, stop it, retry a failed call/task, and answer "what
@@ -392,9 +452,9 @@ operator-only registration mode. A deployment that makes the tool model-callable
 must scope it to trusted operator sessions/toolsets or add a host-level approval
 policy around destructive verbs.
 
-### 1.5.3 The enforcement-decision seam (issue #9)
+### 1.5.4 The enforcement-decision seam (issue #9)
 
-Recording and projecting intent (§1.5.2) is only half a control surface — an
+Recording and projecting intent (§1.5.3) is only half a control surface — an
 adapter still has to *decide*, at each branch point, whether it may act on that
 intent. `evaluate_control_state(control_state, operation, target_ref=None)` is
 that decision: it folds a `RunControlState` plus one operation into a
