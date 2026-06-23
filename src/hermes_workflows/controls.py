@@ -21,6 +21,16 @@ about Relay, ATH, or Kanban. It models three boring-but-load-bearing things:
   un-stop it (it is still recorded for audit). This is *desired* state — actually
   preventing new child work or reattaching to pending work is the backend
   adapter's job; core only records and projects the intent.
+* **Enforcement decisions.** :func:`evaluate_control_state` (and the ``may_*``
+  wrappers) fold a :class:`RunControlState` plus an *operation* into a
+  :class:`ControlDecision` — a yes/no with a stable ``code`` — that an adapter or
+  runtime consults *before* it starts child work, continues a task, or retries.
+  Core decides; the adapter enforces (it owns the actual decline/cancel/replay).
+  A stopped run blocks every operation; a paused run blocks only *new* work and
+  never claims to kill in-flight waits; a ``task_stop`` blocks only its matching
+  ``target_ref``; a retry decision surfaces any recorded ``replacement_ref`` /
+  ``attempt`` so the adapter reuses the replacement instead of silently
+  duplicating it. The decision is pure — it reads the projection, never a store.
 * **Wait inspection.** :func:`waits_from_loop_status` and
   :func:`waits_from_kanban_states` turn data the other slices already persist
   (a loop's ``waiting_for_*`` state + suspension event, or a script store's
@@ -53,10 +63,14 @@ from .registry import utc_now_iso
 
 __all__ = [
     "CONTROL_ACTIONS",
+    "CONTROL_OPERATIONS",
+    "CONTROL_DECISION_CODES",
     "ControlAction",
+    "ControlOperation",
     "DesiredRunState",
     "WorkflowControl",
     "RunControlState",
+    "ControlDecision",
     "WaitSummary",
     "RunSummary",
     "ControlStore",
@@ -69,6 +83,11 @@ __all__ = [
     "retry",
     "record_control",
     "project_control_state",
+    "evaluate_control_state",
+    "may_start_work",
+    "may_continue_task",
+    "may_retry",
+    "may_check_run",
     "waits_from_loop_status",
     "waits_from_kanban_states",
     "summarize_run",
@@ -86,6 +105,19 @@ CONTROL_ACTIONS: tuple[str, ...] = ("pause", "resume", "stop", "task_stop", "ret
 
 # Projected desired control state of a run. This is intent, not enforcement.
 DesiredRunState = Literal["running", "paused", "stopped"]
+
+# The closed set of enforcement operations an adapter can ask about, and the
+# closed set of stable codes :func:`evaluate_control_state` returns. ``code`` is
+# the machine-branchable contract; a decision's ``reason`` is only its gloss.
+ControlOperation = Literal["start_child", "continue_task", "retry", "check_run"]
+CONTROL_OPERATIONS: tuple[str, ...] = ("start_child", "continue_task", "retry", "check_run")
+CONTROL_DECISION_CODES: tuple[str, ...] = (
+    "allowed",
+    "run_stopped",
+    "run_paused",
+    "task_stopped",
+    "retry_exists",
+)
 
 # A run id / control id must be usable as exactly one filesystem path segment,
 # mirroring the guard the run/script stores already use.
@@ -177,11 +209,46 @@ class RunControlState:
     stop_reason: Optional[str] = None
     stopped_at: Optional[str] = None
     stopped_by: Optional[str] = None
+    stopped_control_id: Optional[str] = None
     stopped_tasks: list[dict[str, Any]] = field(default_factory=list)
     retries: list[dict[str, Any]] = field(default_factory=list)
     last_control_id: Optional[str] = None
     last_action: Optional[ControlAction] = None
     controls_total: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    """A backend-neutral yes/no on whether one operation may proceed right now.
+
+    :func:`evaluate_control_state` folds a :class:`RunControlState` plus an
+    operation into one of these. ``allowed`` is the headline; ``code`` is the
+    stable, machine-branchable verdict (one of :data:`CONTROL_DECISION_CODES`)
+    and ``reason`` is its human gloss. ``desired_state`` echoes the run's
+    projected state so a caller logging a denial has it to hand. ``control_id``
+    points at the specific recorded control responsible for a per-target/​retry
+    block when there is one. For a ``retry`` operation
+    ``replacement_ref`` / ``attempt`` carry the lineage of any retry already
+    recorded for ``target_ref``, so an adapter reuses the existing replacement
+    instead of silently minting a duplicate.
+
+    This is a *decision*, not enforcement: actually declining to dispatch,
+    cancelling, or replaying work stays the adapter's job.
+    """
+
+    allowed: bool
+    code: str
+    reason: str
+    run_id: str
+    operation: str
+    target_ref: Optional[str] = None
+    desired_state: DesiredRunState = "running"
+    control_id: Optional[str] = None
+    replacement_ref: Optional[str] = None
+    attempt: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -341,8 +408,11 @@ class FileControlStore:
                 data = json.loads(raw)
                 control = WorkflowControl.from_dict(data)
             except (json.JSONDecodeError, ControlError):
-                continue  # a torn/forged line is skipped; the rest still loads.
-            out[control.control_id] = control
+                continue  # a torn/malformed line is skipped; the rest still loads.
+            if control.run_id != run_id:
+                continue  # a well-formed line forged into the wrong run directory is ignored.
+            if control.control_id not in out:
+                out[control.control_id] = control  # first write wins for deterministic idempotency.
         return out
 
 
@@ -512,6 +582,7 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
     stop_reason: Optional[str] = None
     stopped_at: Optional[str] = None
     stopped_by: Optional[str] = None
+    stopped_control_id: Optional[str] = None
     stopped_tasks: list[dict[str, Any]] = []
     retries: list[dict[str, Any]] = []
     last_control_id: Optional[str] = None
@@ -526,6 +597,7 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
                 stop_reason = c.reason
                 stopped_at = c.created_at
                 stopped_by = c.actor
+                stopped_control_id = c.control_id
             paused = False
         elif c.action == "pause":
             if not stopped:
@@ -563,12 +635,136 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
         stop_reason=stop_reason,
         stopped_at=stopped_at,
         stopped_by=stopped_by,
+        stopped_control_id=stopped_control_id,
         stopped_tasks=stopped_tasks,
         retries=retries,
         last_control_id=last_control_id,
         last_action=last_action,
         controls_total=len(ordered),
     )
+
+
+# ---------------------------------------------------------------------------
+# Enforcement decisions — the reusable seam adapters consult before acting.
+# ---------------------------------------------------------------------------
+
+
+def evaluate_control_state(
+    control_state: RunControlState,
+    operation: ControlOperation,
+    target_ref: Optional[str] = None,
+) -> ControlDecision:
+    """Decide whether ``operation`` may proceed given a run's control state.
+
+    ``operation`` is one of :data:`CONTROL_OPERATIONS`:
+
+    * ``start_child`` — launch *new* child work. Blocked by a stop (terminal) or
+      a pause (new work is held).
+    * ``continue_task`` — keep an existing ``target_ref`` running. Blocked by a
+      stop or by a matching ``task_stop``; a pause does **not** block it (pausing
+      never claims to kill in-flight work). Requires ``target_ref``.
+    * ``retry`` — replace a failed ``target_ref``. Blocked by a stop, by a
+      matching ``task_stop``, or — to avoid silently duplicating replacement
+      work — by an already-recorded retry, in which case the decision carries
+      that retry's ``replacement_ref`` / ``attempt`` / ``control_id`` so the
+      adapter reuses it (force a fresh attempt with :func:`retry` to override).
+      Absent those, a pause also blocks it, since a retry launches new work.
+      Requires ``target_ref``.
+    * ``check_run`` — may the run make progress at all. Blocked only by a stop;
+      a paused run is still alive.
+
+    Pure and side-effect-free: it reads the projection, never a store. The
+    returned :class:`ControlDecision` records the verdict; *enforcing* it stays
+    the adapter's responsibility.
+    """
+    if operation not in CONTROL_OPERATIONS:
+        raise ControlError(f"unknown control operation: {operation!r}")
+    target = _opt_str(target_ref)
+    if operation in ("continue_task", "retry") and not target:
+        raise ControlError(f"{operation} requires a target_ref (the child call/task id)")
+
+    run_id = control_state.run_id
+    desired = control_state.desired_state
+
+    def decide(
+        allowed: bool,
+        code: str,
+        reason: str,
+        *,
+        control_id: Optional[str] = None,
+        replacement_ref: Optional[str] = None,
+        attempt: Optional[int] = None,
+    ) -> ControlDecision:
+        return ControlDecision(
+            allowed=allowed,
+            code=code,
+            reason=reason,
+            run_id=run_id,
+            operation=operation,
+            target_ref=target,
+            desired_state=desired,
+            control_id=control_id,
+            replacement_ref=replacement_ref,
+            attempt=attempt,
+        )
+
+    # Stop is terminal: it blocks new, continuing, and retry work alike.
+    if control_state.stopped:
+        gloss = "run is stopped" + (f": {control_state.stop_reason}" if control_state.stop_reason else "")
+        return decide(False, "run_stopped", gloss, control_id=control_state.stopped_control_id)
+
+    # An explicit per-task stop blocks only operations on that exact target.
+    if target and operation in ("continue_task", "retry"):
+        ts = _last_match(control_state.stopped_tasks, target)
+        if ts is not None:
+            gloss = f"task {target!r} was stopped" + (f": {ts.get('reason')}" if ts.get("reason") else "")
+            return decide(False, "task_stopped", gloss, control_id=ts.get("control_id"))
+
+    # A retry already on record: surface its lineage so the adapter reuses the
+    # replacement rather than minting a duplicate.
+    if operation == "retry" and target:
+        pr = _last_match(control_state.retries, target)
+        if pr is not None:
+            attempt = pr.get("attempt")
+            gloss = (
+                f"retry of {target!r} already recorded"
+                + (f" (attempt {attempt})" if attempt is not None else "")
+                + "; reuse the recorded replacement or force a new attempt"
+            )
+            return decide(
+                False,
+                "retry_exists",
+                gloss,
+                control_id=pr.get("control_id"),
+                replacement_ref=pr.get("replacement_ref"),
+                attempt=attempt,
+            )
+
+    # A pause holds only new work (start_child / retry); existing tasks continue.
+    if control_state.paused and operation in ("start_child", "retry"):
+        return decide(False, "run_paused", "run is paused; new work is held")
+
+    return decide(True, "allowed", "no recorded control blocks this operation")
+
+
+def may_start_work(control_state: RunControlState) -> ControlDecision:
+    """Convenience wrapper: may *new* child work start on this run?"""
+    return evaluate_control_state(control_state, "start_child")
+
+
+def may_continue_task(control_state: RunControlState, target_ref: str) -> ControlDecision:
+    """Convenience wrapper: may the existing ``target_ref`` task keep running?"""
+    return evaluate_control_state(control_state, "continue_task", target_ref)
+
+
+def may_retry(control_state: RunControlState, target_ref: str) -> ControlDecision:
+    """Convenience wrapper: may ``target_ref`` be retried (or is one already on record)?"""
+    return evaluate_control_state(control_state, "retry", target_ref)
+
+
+def may_check_run(control_state: RunControlState) -> ControlDecision:
+    """Convenience wrapper: may the run make progress at all (only a stop blocks)?"""
+    return evaluate_control_state(control_state, "check_run")
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +899,11 @@ def inspect_run(
     status, script-store waits) and this composes them into one stable shape with
     current phase, waits, child task refs, retry lineage, last events, and
     result/error — no raw JSON spelunking required downstream.
+
+    ``decisions`` exposes the run-level enforcement verdicts (``start_child`` and
+    ``check_run``) the adapter would get from :func:`evaluate_control_state`, so a
+    status reader sees "may new work start / may the run continue" honestly as a
+    *decision* — not a claim that core has cancelled anything.
     """
     state = control_state or RunControlState(run_id=run_id)
     wait_rows = [w.to_dict() for w in (waits or [])]
@@ -714,6 +915,10 @@ def inspect_run(
         "run_id": run_id,
         "lifecycle": lifecycle,
         "control_state": state.to_dict(),
+        "decisions": {
+            "start_child": evaluate_control_state(state, "start_child").to_dict(),
+            "check_run": evaluate_control_state(state, "check_run").to_dict(),
+        },
         "current_phase": current_phase,
         "progress": progress,
         "waits": wait_rows,
@@ -839,6 +1044,15 @@ def _opt_str(value: Any) -> Optional[str]:
 def _require_nonempty(value: Any, label: str) -> None:
     if not isinstance(value, str) or not value:
         raise ControlError(f"{label} must be a non-empty string")
+
+
+def _last_match(rows: Iterable[dict[str, Any]], target: str) -> Optional[dict[str, Any]]:
+    """Return the last projected row whose ``target_ref`` equals ``target``."""
+    match: Optional[dict[str, Any]] = None
+    for row in rows:
+        if isinstance(row, dict) and row.get("target_ref") == target:
+            match = row
+    return match
 
 
 def _require_safe_segment(value: str, label: str) -> None:

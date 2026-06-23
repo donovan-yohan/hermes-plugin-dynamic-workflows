@@ -22,7 +22,7 @@ journal events.
 | Surface | Purpose |
 | --- | --- |
 | `workflow` tool | Single model-facing entry point: dry-run validate, run a definition, or inspect an existing run id. |
-| `workflow_control` tool | Operator surface: list active/recent runs and blocked waits (`overview`), inspect one run's compact control state/waits/links (`status`), or record an append-only pause/resume/stop/task_stop/retry intent. |
+| `workflow_control` tool | Operator surface: list active/recent runs and blocked waits (`overview`), inspect one run's compact control state/waits/links plus run-level enforcement decisions (`status`), or record an append-only pause/resume/stop/task_stop/retry intent. |
 | `workflow_validate` function | Parse and statically validate a workflow definition without side effects. |
 | `workflow_run` function | Execute a validated workflow in the deterministic skeleton runtime. |
 | `workflow_status` function | Query status/progress/result for a workflow run id. |
@@ -42,6 +42,7 @@ The current runtime supports:
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
 - backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
+- backend-neutral **control enforcement decisions**: a pure `evaluate_control_state(state, operation, target_ref?)` seam (plus `may_start_work` / `may_continue_task` / `may_retry` / `may_check_run`) that turns control state + an operation into an `allowed`/`code` `ControlDecision` an adapter consults before starting child work, continuing a task, or retrying — stop blocks everything, pause holds only new work, `task_stop` blocks only its target, and an existing retry surfaces its replacement to avoid silent duplicates; core decides, the adapter still owns the actual cancel/replay
 
 ## Quick start as a Python package
 
@@ -509,7 +510,11 @@ forced = retry(controls, run_id, "call-3", force=True)  # attempt 2, new replace
 
 **Inspect waits without spelunking.** The inspectors read data the other slices
 already persist — a loop's `waiting_for_*` suspension and a `ScriptRunStore`'s
-non-terminal Kanban card states — into uniform `WaitSummary` rows:
+non-terminal Kanban card states — into uniform `WaitSummary` rows. Durable Kanban
+waiting markers created from the VM's `<logical_run_id>:<call_id>` idempotency key
+carry the logical run id, and later card-state writes preserve that association;
+when a legacy/manual Kanban wait lacks a run id, plugin `status` can still attach
+it to the inspected run instead of dropping it:
 
 ```python
 from hermes_workflows import waits_from_loop_status, waits_from_kanban_states
@@ -518,19 +523,53 @@ waits = waits_from_loop_status(loop_status)            # event/approval waits
 waits += waits_from_kanban_states(script_store.kanban_waits())  # blocked cards
 ```
 
+**Decide before acting.** Recording intent is only half a control surface — an
+adapter still has to *decide*, at each branch point, whether it may act.
+`evaluate_control_state(state, operation, target_ref=None)` folds a
+`RunControlState` plus one operation into a `ControlDecision` (`allowed` + a
+stable `code`): a **stopped** run blocks everything; a **paused** run blocks only
+*new* work (`start_child` / `retry`) and never claims to kill in-flight tasks; a
+`task_stop` blocks only its matching `target_ref`; and a `retry` whose target is
+already on record returns `retry_exists` carrying the recorded `replacement_ref` /
+`attempt`, so an adapter reuses it instead of silently duplicating replacement
+work. It is pure — it reads the projection, never a store:
+
+```python
+from hermes_workflows import (
+    evaluate_control_state, may_start_work, may_continue_task, may_retry,
+)
+
+d = may_start_work(state)         # state from project_control_state(...)
+if not d.allowed:
+    ...  # d.code == "run_paused" / "run_stopped"; d.reason explains
+may_continue_task(state, "call-3")           # pause does NOT block this
+may_retry(state, "call-3").replacement_ref   # reuse, don't duplicate
+```
+
+Core *decides*; the adapter still owns the act of declining to dispatch,
+cancelling a process, or replaying a task.
+
 **Compact projections.** `inspect_run(...)` composes one run's lifecycle, control
 state, current phase, waits, child task refs, retry lineage, last events,
-result/error, and dashboard `links` (`run_links` bundles script/journal/snapshot/
-transcript/result paths) into one stable shape. `list_runs(records, control_store,
-waits=...)` is the `/workflows` overview: runs newest-first and capped, merged with
-control state, with blocked waits folded in and aggregate counts.
+result/error, dashboard `links` (`run_links` bundles script/journal/snapshot/
+transcript/result paths), and the run-level `decisions` (`start_child` /
+`check_run`) into one stable shape. `list_runs(records, control_store, waits=...)`
+is the `/workflows` overview: runs newest-first and capped, merged with control
+state, with blocked waits folded in and aggregate counts.
 
 The plugin registers a second **`workflow_control`** tool over a durable
 `FileControlStore` (sibling of the runs dir): `action=overview` / `status` /
 `pause` / `resume` / `stop` / `task_stop` / `retry`. It is the operator surface —
 distinct from the model-facing `workflow` authoring tool — and never deletes audit
-history. Enforcing the intent (pausing fan-out, killing in-flight child work,
-executing the retry) is a backend-adapter responsibility that rides these records.
+history. `overview` folds in persisted Kanban waits and file-backed loop waits;
+`status` filters those waits for the inspected run and includes legacy/manual
+Kanban waits without a stored run id by assigning them to that requested run.
+`status` also surfaces the run-level enforcement decisions honestly; enforcing the
+intent (pausing fan-out, killing in-flight child work, executing the retry) is a
+backend-adapter responsibility that rides these records. This repository does not
+claim a Hermes operator-only registration mode: deployments that expose
+`workflow_control` to model-callable tool selection should scope that toolset to
+trusted operator sessions or wrap it with a host-level approval policy.
 
 ## Saved workflow catalog
 
@@ -571,7 +610,7 @@ flowchart LR
   RT --> STORE[RunStore\nInMemory library, FileRunStore plugin]
 
   S --> STORE
-  WC --> CTL[controls.py\nproject_control_state / inspect_run / list_runs]
+  WC --> CTL[controls.py\nproject_control_state / evaluate_control_state / inspect_run / list_runs]
   CTL --> CS[ControlStore\nappend-only FileControlStore]
   CTL --> STORE
 ```

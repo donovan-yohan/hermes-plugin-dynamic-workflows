@@ -581,6 +581,8 @@ class ScriptRunStore:
         record = {**state, "card_id": card_id}
         with self._lock:
             existing = self._load_kanban_card_state_unlocked(card_id)
+            if "run_id" not in record and isinstance(existing, dict) and existing.get("run_id"):
+                record["run_id"] = existing["run_id"]
             if (
                 existing is not None
                 and existing.get("status") in _KANBAN_TERMINAL_STATUSES

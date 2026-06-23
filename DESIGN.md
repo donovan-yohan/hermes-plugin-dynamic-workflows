@@ -101,11 +101,12 @@ def workflow_status(
 - **`workflow_control`** (issue #9) is the operator surface: a second registered
   Hermes tool whose `action` selects `overview` (list active/recent runs and
   blocked waits), `status` (one run's compact control state, current phase,
-  waits, child task refs, links), or one of the append-only control verbs
-  `pause` / `resume` / `stop` / `task_stop` / `retry`. It is backed by the
-  generic `controls` module (§1.5.2) and a durable `FileControlStore`, so an
-  operator can pause, stop, or retry a run without touching the authoring
-  `workflow` tool and without deleting any audit history.
+  waits, child task refs, links, and the run-level enforcement decisions), or one
+  of the append-only control verbs `pause` / `resume` / `stop` / `task_stop` /
+  `retry`. It is backed by the generic `controls` module (§1.5.2–§1.5.3) and a
+  durable `FileControlStore`, so an operator can pause, stop, or retry a run
+  without touching the authoring `workflow` tool and without deleting any audit
+  history.
 
 ### 1.2 Component map
 
@@ -332,8 +333,11 @@ behaviour, only run ids and three boring-but-load-bearing pieces.
 run's history: a stop *adds* a stop record. Idempotency and cross-restart
 durability come from the same place — `FileControlStore.append` re-reads the
 run's existing control ids from disk before writing, so a re-issued (e.g.
-deterministic retry) id is deduped even by a fresh process, and a torn/forged
-line is skipped rather than failing the whole read.
+deterministic retry) id is deduped even by a fresh process. A torn/malformed line
+is skipped rather than failing the whole read; a well-formed line whose embedded
+`run_id` does not match the directory is ignored; and duplicate `control_id` rows
+are first-write-wins so a later forged duplicate cannot change the projection on
+restart.
 
 **A control-state projection.** `project_control_state(run_id, controls)` folds
 the records into a compact `RunControlState`: `desired_state` (`running` /
@@ -358,8 +362,13 @@ shape explicit and durable.
 `waits_from_loop_status` turns a loop's `waiting_for_event` / `waiting_for_approval`
 state and its suspension event into a uniform `WaitSummary` (§1.5);
 `waits_from_kanban_states` does the same for a `ScriptRunStore`'s non-terminal
-Kanban card states (§5.7). No new backend or store is introduced — the inspectors
-read plain dicts, so they compose with whatever a caller already has.
+Kanban card states (§5.7). Durable Kanban waiting markers created through the VM
+carry the logical run id from the `<logical_run_id>:<call_id>` idempotency key,
+and the store preserves that association across later state writes; for
+legacy/manual waits with no stored `run_id`, the plugin `status` path attaches
+them to the inspected run rather than silently dropping them. No new backend or
+store is introduced — the inspectors read plain dicts, so they compose with
+whatever a caller already has.
 
 **Compact projections, no JSON spelunking.** `inspect_run(...)` composes a single
 run's lifecycle status, control state, current phase, waits, child task refs,
@@ -374,7 +383,53 @@ backend-neutral and trivially testable.
 This is the operator *seam*, narrower than a live scheduler: core records and
 projects control intent durably and exposes inspectable status; enforcing pause,
 killing in-flight child work, and executing retries are backend-adapter
-responsibilities that ride these records.
+responsibilities that ride these records. The plugin registers `workflow_control`
+through the normal Hermes tool registry; this repo does not assert an
+operator-only registration mode. A deployment that makes the tool model-callable
+must scope it to trusted operator sessions/toolsets or add a host-level approval
+policy around destructive verbs.
+
+### 1.5.3 The enforcement-decision seam (issue #9)
+
+Recording and projecting intent (§1.5.2) is only half a control surface — an
+adapter still has to *decide*, at each branch point, whether it may act on that
+intent. `evaluate_control_state(control_state, operation, target_ref=None)` is
+that decision: it folds a `RunControlState` plus one operation into a
+`ControlDecision` — `allowed: bool` plus a stable, machine-branchable `code`
+(`allowed` / `run_stopped` / `run_paused` / `task_stopped` / `retry_exists`),
+its human `reason`, the `desired_state`, and — where one exists — the
+`control_id` of the record responsible for a block. It is **pure**: it reads the
+projection, never a store, so the same state always yields the same verdict and
+it is trivially testable.
+
+The operation vocabulary covers the four branch points an adapter actually hits:
+
+| Operation | Question | Blocked by |
+|-----------|----------|------------|
+| `start_child` | may I launch *new* child work? | stop (terminal), pause (new work held) |
+| `continue_task` | may an existing `target_ref` keep running? | stop, matching `task_stop` — **not** pause |
+| `retry` | may I replace a failed `target_ref`? | stop, matching `task_stop`, an already-recorded retry, then pause |
+| `check_run` | may the run make progress at all? | stop only (a paused run is still alive) |
+
+The semantics fall straight out of §1.5.2's intent model: **stop is terminal and
+blocks everything**; **pause holds only new work** (`start_child` / `retry`) and
+deliberately never blocks `continue_task` or `check_run`, because pausing does
+not claim to kill in-flight waits; **`task_stop` blocks only its exact
+`target_ref`**, leaving sibling tasks and run-level work untouched. The `retry`
+verdict is the dedup guard: when a retry of `target_ref` is already on record the
+decision returns `retry_exists` carrying that retry's `replacement_ref` /
+`attempt` / `control_id`, so an adapter reuses the existing replacement instead
+of silently launching a duplicate (it forces a fresh attempt via `retry(...,
+force=True)` when it genuinely wants another). Thin wrappers `may_start_work`,
+`may_continue_task`, `may_retry`, and `may_check_run` name the common calls.
+
+This is a *decision*, not enforcement. Core answers "should this proceed?"; the
+adapter still owns the act of declining to dispatch, cancelling a process, or
+replaying a task. `inspect_run(...)` surfaces the two run-level verdicts
+(`start_child`, `check_run`) under a `decisions` key so an operator reading
+status sees them honestly as decisions — never as a claim that core has cancelled
+anything. No Relay/ATH/Kanban behaviour lives here; an adapter is free to consult
+more operations (per-task, per-retry) directly.
 
 ### 1.6 The sandboxed runtime (skeleton)
 
