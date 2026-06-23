@@ -565,6 +565,7 @@ def test_loop_run_required_finalizer_failure_blocks_success():
     assert status.finalizer_results[0]["policy"] == "required"
     assert status.report["final_state"] == "halted_finalizer_error"
     assert status.report["required_finalizer_failed"] is True
+    assert status.report["convergence_risk"] == "required_finalizer_failed"
     assert status.events[-1]["kind"] == "halted"
     assert status.events[-1]["prior_state"] == "converged"
 
@@ -662,3 +663,72 @@ def test_resource_finalizer_helper_runs_host_owned_cancelled_trigger_once():
     assert [item.status for item in first] == ["succeeded"]
     assert second == []
     assert calls == [("cancelled", "relay-session-cancel")]
+
+
+def test_duplicate_finalizer_ids_do_not_run_twice():
+    resource_payload = _resource("dup-finalizer")
+    resource_payload["finalizers"].append(
+        {
+            "id": "retire-listener",
+            "action": "ath.listener.retire",
+            "policy": "required",
+            "when": ["success"],
+        }
+    )
+    resource = WorkflowResource.from_dict(resource_payload)
+    calls = []
+
+    def finalizer(context):
+        calls.append(context["finalizer"]["id"])
+        return {"ok": True, "summary": "cleanup once"}
+
+    results = run_resource_finalizers(
+        [resource],
+        trigger="success",
+        runner=finalizer,
+        run_id="loop.dup.finalizer",
+        loop_name="ticket_loop",
+    )
+
+    assert [item.finalizer_id for item in resource.finalizers] == ["retire-listener"]
+    assert len(results) == 1
+    assert calls == ["retire-listener"]
+
+
+def test_resource_owner_cannot_override_controller_provenance():
+    resource = WorkflowResource.from_dict(
+        {
+            "id": "owned-resource",
+            "kind": "ath.listener",
+            "owner": {"run_id": "forged", "loop_name": "other", "iteration": 999, "issue": 52},
+        },
+        default_owner={"run_id": "real", "loop_name": "ticket_loop", "iteration": 1},
+    )
+
+    assert resource.owner["run_id"] == "real"
+    assert resource.owner["loop_name"] == "ticket_loop"
+    assert resource.owner["iteration"] == 1
+    assert resource.owner["issue"] == 52
+
+
+def test_loop_run_finalizer_exception_text_is_redacted_before_journaling():
+    calls = {"sensor": 0}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] == 1:
+            return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "provisioned listener", "resources": [_resource("secret-exception-resource")]}
+
+    def finalizer(context):
+        raise RuntimeError("cleanup failed with ghp_should_not_be_logged")
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, finalizer=finalizer)
+    dumped = json.dumps(status.as_dict())
+
+    assert status.state == "halted_finalizer_error"
+    assert "ghp_should_not_be_logged" not in dumped
+    assert "[REDACTED]" in dumped

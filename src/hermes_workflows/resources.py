@@ -10,10 +10,11 @@ runner.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
-from .grants import find_raw_credential, redact_credentials
+from .grants import REDACTED, find_raw_credential, redact_credentials
 
 __all__ = [
     "FINALIZER_POLICIES",
@@ -50,6 +51,10 @@ FINALIZER_RESULT_STATUSES: tuple[str, ...] = (
     "skipped",
     "preserved",
     "approval_required",
+)
+
+_EMBEDDED_CREDENTIAL_RE = re.compile(
+    r"(?i)(bearer\s+[^\s]+|basic\s+[^\s]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+|xox[abp]-[A-Za-z0-9_-]+)"
 )
 
 
@@ -145,8 +150,12 @@ class WorkflowResource:
         owner = data.get("owner", {})
         if not isinstance(owner, dict):
             raise ValueError("workflow resource owner must be an object")
-        merged_owner = copy.deepcopy(default_owner or {})
-        merged_owner.update(copy.deepcopy(owner))
+        # Actuator-supplied owner metadata may add useful product context
+        # (issue, PR, repo), but controller provenance is reserved. The run id,
+        # loop name, and iteration come from ``default_owner`` and must not be
+        # forgeable by the resource envelope that gets persisted/audited.
+        merged_owner = copy.deepcopy(owner)
+        merged_owner.update(copy.deepcopy(default_owner or {}))
         handle = data.get("handle", {})
         if not isinstance(handle, dict):
             raise ValueError("workflow resource handle must be an object")
@@ -156,7 +165,7 @@ class WorkflowResource:
         finalizers_raw = data.get("finalizers", [])
         if not isinstance(finalizers_raw, list):
             raise ValueError("workflow resource finalizers must be a list")
-        finalizers = tuple(ResourceFinalizer.from_dict(item) for item in finalizers_raw)
+        finalizers = _dedupe_finalizers(ResourceFinalizer.from_dict(item) for item in finalizers_raw)
         return cls(
             resource_id=ident,
             kind=kind,
@@ -256,6 +265,7 @@ def run_resource_finalizers(
                     loop_name=loop_name,
                 )
             )
+            completed.add(key)
     return results
 
 
@@ -318,6 +328,7 @@ def _run_one_finalizer(
     try:
         raw = runner(context)
     except Exception as exc:  # pragma: no cover - backend-owned exception types
+        redacted_error = _redact_exception_text(f"{type(exc).__name__}: {exc}")
         return FinalizerResult(
             resource_id=resource.resource_id,
             finalizer_id=finalizer.finalizer_id,
@@ -325,8 +336,8 @@ def _run_one_finalizer(
             trigger=trigger,
             policy=finalizer.policy,
             status="failed",
-            summary=f"{type(exc).__name__}: {exc}",
-            error=f"{type(exc).__name__}: {exc}",
+            summary=redacted_error,
+            error=redacted_error,
         )
     if not isinstance(raw, dict):
         return FinalizerResult(
@@ -386,6 +397,22 @@ def _normalize_when(value: Any) -> tuple[str, ...]:
         if item not in normalized:
             normalized.append(item)
     return tuple(normalized)
+
+
+def _redact_exception_text(text: str) -> str:
+    redacted = str(redact_credentials(text))
+    return _EMBEDDED_CREDENTIAL_RE.sub(REDACTED, redacted)
+
+
+def _dedupe_finalizers(finalizers: Any) -> tuple[ResourceFinalizer, ...]:
+    deduped: list[ResourceFinalizer] = []
+    seen: set[str] = set()
+    for finalizer in finalizers:
+        if finalizer.finalizer_id in seen:
+            continue
+        seen.add(finalizer.finalizer_id)
+        deduped.append(finalizer)
+    return tuple(deduped)
 
 
 def _identifier_safe(value: str) -> bool:
