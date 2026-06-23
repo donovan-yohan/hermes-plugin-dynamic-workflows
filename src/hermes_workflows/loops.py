@@ -468,8 +468,9 @@ def loop_run(
             )
             break
 
-    report_risk = status.report.get("convergence_risk") if status.report else "not_converged"
+    prior_report_risk = status.report.get("convergence_risk") if status.report else "not_converged"
     _closeout_resources(status, normalized, store, on_event, finalizer)
+    report_risk = "required_finalizer_failed" if status.state == "halted_finalizer_error" else prior_report_risk
     status.updated_at = _utc_now_iso()
     status.report = _report(status, str(report_risk or "not_converged"))
     _persist_status(store, status)
