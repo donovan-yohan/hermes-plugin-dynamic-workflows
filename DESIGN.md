@@ -366,11 +366,19 @@ resource, finalizer}`. Backend adapters own the actual cleanup and return bounde
 
 `ResourceFinalizerRegistry` is the optional host-side dispatch helper for that
 callable seam. It maps dotted action strings (`ath.listener.retire`,
-`relay.session.close`, `process.group.terminate`, etc.) to registered handlers and
-is itself a valid `ResourceFinalizerCallable`. Unknown actions fail closed through
-normal finalizer-result handling, and duplicate action registration requires
-`replace=True`. This keeps ATH/Relay/process integrations first-class as adapters
-without making them imports or branches inside Dynamic Workflows core.
+`relay.automation_run.retire`, `process.group.terminate`, etc.) to registered
+handlers and is itself a valid `ResourceFinalizerCallable`. Unknown actions fail
+closed through normal finalizer-result handling, and duplicate action registration
+requires `replace=True`. This keeps ATH/Relay/process integrations first-class as
+adapters without making them imports or branches inside Dynamic Workflows core.
+
+`examples/release_ops_resource_closeout.py` is the concrete release-ops wiring
+smoke for this boundary. It declares an ATH listener and a Relay automation-run
+resource, runs both finalizers through `ResourceFinalizerRegistry`, and uses local
+stand-in handlers so the core package still has zero ATH/Relay dependencies. The
+real adapters stay in their owning repos: ATH owns `ath.listener.retire`, Relay
+owns `relay.automation_run.retire`, and child session/process termination remains
+a Relay primitive rather than Dynamic Workflows core behavior.
 
 Closeout runs on terminal success, failure, and timeout paths. Waiting states do
 not close resources because those resources may be needed by the resumed run.

@@ -43,7 +43,7 @@ The current runtime supports:
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
 - backend-neutral **resource lifecycle finalizers**: loop actuators can register credential-free resources (ATH listener, Relay session/work context, process, temp workspace, etc.) plus cleanup finalizers; terminal success/failure/timeout paths run matching finalizers through an injected adapter, persist auditable cleanup results, and fail success closed when a `required` finalizer fails
-- a backend-neutral **finalizer adapter registry**: hosts can register action handlers such as `ath.listener.retire` or `relay.session.close` behind `ResourceFinalizerRegistry` without Dynamic Workflows importing ATH/Relay code
+- a backend-neutral **finalizer adapter registry**: hosts can register action handlers such as `ath.listener.retire` or `relay.automation_run.retire` behind `ResourceFinalizerRegistry` without Dynamic Workflows importing ATH/Relay code
 - backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
 - backend-neutral **control enforcement decisions**: a pure `evaluate_control_state(state, operation, target_ref?)` seam (plus `may_start_work` / `may_continue_task` / `may_retry` / `may_check_run`) that turns control state + an operation into an `allowed`/`code` `ControlDecision` an adapter consults before starting child work, continuing a task, or retrying — stop blocks everything, pause holds only new work, `task_stop` blocks only its target, and an existing retry surfaces its replacement to avoid silent duplicates; core decides, the adapter still owns the actual cancel/replay
 - **event-driven trigger migration docs/templates**: cron is documented as a workflow starter or visibility heartbeat only, not the owner of goal-directed phase advancement; `event_driven_pr_validation_lane` rewrites a PR watchdog as a trigger-started workflow with durable QA/review awaits
@@ -564,6 +564,15 @@ packages. It maps dotted action strings to handlers and is itself a valid
 `finalizer` callable. Unknown actions fail closed through normal finalizer-result
 handling. This keeps `hermes_workflows` generic: ATH/Relay/process integrations
 register handlers, but core does not import or call those systems directly.
+
+See `examples/release_ops_resource_closeout.py` for a runnable release-ops
+closeout smoke that declares both `ath.listener.retire` and
+`relay.automation_run.retire`. The example uses local stand-in handlers so this
+package remains dependency-free; production hosts register the ATH adapter from
+`async_threads.finalizers` and the Relay adapter from Relay's own runtime
+boundary. Dynamic Workflows should record the resource/finalizer envelopes and
+call the injected registry only — not import ATH, import Relay, or kill child
+sessions itself.
 
 Eligible finalizers run once on terminal `success`, `failure`, or `timeout` paths
 (and the model also understands future `cancelled` / `superseded` triggers for

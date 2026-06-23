@@ -221,7 +221,7 @@ class ResourceFinalizerRegistry:
     """Action-string dispatch for backend-specific resource finalizer adapters.
 
     The workflow core stays backend-neutral: resources declare dotted action
-    strings such as ``ath.listener.retire`` or ``relay.session.close`` and a
+    strings such as ``ath.listener.retire`` or ``relay.automation_run.retire`` and a
     host/application registers handlers for the actions it supports. The
     registry is itself a ``ResourceFinalizerCallable`` and can be passed as
     ``loop_run(..., finalizer=registry)``.
