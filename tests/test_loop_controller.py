@@ -732,3 +732,49 @@ def test_loop_run_finalizer_exception_text_is_redacted_before_journaling():
     assert status.state == "halted_finalizer_error"
     assert "ghp_should_not_be_logged" not in dumped
     assert "[REDACTED]" in dumped
+
+
+def test_loop_run_merges_repeated_resource_registration_updates_and_finalizers():
+    calls = {"sensor": 0, "cleanup": []}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] < 3:
+            return {"converged": False, "signal_key": f"needs-work-{calls['sensor']}", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        resource = _resource("relay-session-merge")
+        resource["handle"] = {"session_id": f"relay-{context['iteration']}"}
+        resource["metadata"] = {"generation": context["iteration"]}
+        if context["iteration"] == 2:
+            resource["finalizers"].append(
+                {
+                    "id": "release-work-context",
+                    "action": "relay.work_context.release",
+                    "policy": "required",
+                    "when": ("success",),
+                }
+            )
+        return {"summary": "resource registration", "resources": [resource]}
+
+    def finalizer(context):
+        calls["cleanup"].append((context["resource"]["handle"], context["finalizer"]["id"]))
+        return {"ok": True, "summary": "cleanup done"}
+
+    status = loop_run(loop_spec(max_repeated_signal=99), sensor=sensor, actuator=actuator, finalizer=finalizer)
+
+    assert status.state == "converged"
+    assert len(status.resources) == 1
+    resource = status.resources[0]
+    assert resource["handle"] == {"session_id": "relay-2"}
+    assert resource["metadata"] == {"generation": 2}
+    assert [item["id"] for item in resource["finalizers"]] == ["retire-listener", "release-work-context"]
+    assert [result["finalizer_id"] for result in status.finalizer_results] == [
+        "retire-listener",
+        "release-work-context",
+    ]
+    assert calls["cleanup"] == [
+        ({"session_id": "relay-2"}, "retire-listener"),
+        ({"session_id": "relay-2"}, "release-work-context"),
+    ]

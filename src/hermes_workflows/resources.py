@@ -269,7 +269,7 @@ def run_resource_finalizers(
     return results
 
 
-def has_required_finalizer_failure(results: list[dict[str, Any]] | list[FinalizerResult]) -> bool:
+def has_required_finalizer_failure(results: list[dict[str, Any] | FinalizerResult]) -> bool:
     for item in results:
         data = item.to_dict() if isinstance(item, FinalizerResult) else item
         if data.get("policy") == "required" and data.get("status") == "failed":
@@ -384,10 +384,10 @@ def _normalize_when(value: Any) -> tuple[str, ...]:
         return ("success", "failure", "timeout", "cancelled", "superseded")
     if isinstance(value, str):
         values = (value,)
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         values = tuple(value)
     else:
-        raise ValueError("resource finalizer when must be a string or list")
+        raise ValueError("resource finalizer when must be a string, list, or tuple")
     if not values:
         raise ValueError("resource finalizer when must not be empty")
     normalized: list[str] = []
@@ -419,5 +419,4 @@ def _identifier_safe(value: str) -> bool:
     return bool(value) and all(c.isalnum() or c in "._-" for c in value)
 
 
-def _dotted_identifier_safe(value: str) -> bool:
-    return bool(value) and all(c.isalnum() or c in "._-" for c in value)
+_dotted_identifier_safe = _identifier_safe
