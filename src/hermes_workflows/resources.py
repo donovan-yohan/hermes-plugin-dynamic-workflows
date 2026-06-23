@@ -328,7 +328,7 @@ def _run_one_finalizer(
     try:
         raw = runner(context)
     except Exception as exc:  # pragma: no cover - backend-owned exception types
-        redacted_error = _redact_exception_text(f"{type(exc).__name__}: {exc}")
+        redacted_error = _redact_text(f"{type(exc).__name__}: {exc}")
         return FinalizerResult(
             resource_id=resource.resource_id,
             finalizer_id=finalizer.finalizer_id,
@@ -350,7 +350,7 @@ def _run_one_finalizer(
             summary=f"finalizer returned {type(raw).__name__}, expected dict",
             error="malformed_result",
         )
-    redacted = redact_credentials(raw)
+    redacted = _redact_finalizer_payload(raw)
     ok = redacted.get("ok", True)
     if not isinstance(ok, bool):
         return FinalizerResult(
@@ -399,7 +399,20 @@ def _normalize_when(value: Any) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _redact_exception_text(text: str) -> str:
+def _redact_finalizer_payload(payload: Any) -> Any:
+    redacted = redact_credentials(payload)
+    if isinstance(redacted, dict):
+        return {key: _redact_finalizer_payload(value) for key, value in redacted.items()}
+    if isinstance(redacted, list):
+        return [_redact_finalizer_payload(item) for item in redacted]
+    if isinstance(redacted, tuple):
+        return tuple(_redact_finalizer_payload(item) for item in redacted)
+    if isinstance(redacted, str):
+        return _redact_text(redacted)
+    return redacted
+
+
+def _redact_text(text: str) -> str:
     redacted = str(redact_credentials(text))
     return _EMBEDDED_CREDENTIAL_RE.sub(REDACTED, redacted)
 

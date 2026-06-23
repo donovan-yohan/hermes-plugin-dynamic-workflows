@@ -778,3 +778,33 @@ def test_loop_run_merges_repeated_resource_registration_updates_and_finalizers()
         ({"session_id": "relay-2"}, "retire-listener"),
         ({"session_id": "relay-2"}, "release-work-context"),
     ]
+
+
+def test_loop_run_finalizer_return_summary_error_and_evidence_redact_embedded_tokens():
+    calls = {"sensor": 0}
+
+    def sensor(context):
+        calls["sensor"] += 1
+        if calls["sensor"] == 1:
+            return {"converged": False, "signal_key": "needs-work", "summary": "needs work"}
+        return {"converged": True, "signal_key": "done", "summary": "done"}
+
+    def actuator(context):
+        return {"summary": "provisioned listener", "resources": [_resource("secret-return-resource")]}
+
+    def finalizer(context):
+        return {
+            "ok": False,
+            "summary": "cleanup failed with ghp_should_not_be_logged",
+            "error": "api returned bearer sk-shouldnotbelogged",
+            "evidence": [{"detail": "nested github_pat_should_not_be_logged"}],
+        }
+
+    status = loop_run(loop_spec(), sensor=sensor, actuator=actuator, finalizer=finalizer)
+    dumped = json.dumps(status.as_dict())
+
+    assert status.state == "halted_finalizer_error"
+    assert "ghp_should_not_be_logged" not in dumped
+    assert "sk-shouldnotbelogged" not in dumped
+    assert "github_pat_should_not_be_logged" not in dumped
+    assert dumped.count("[REDACTED]") >= 3
