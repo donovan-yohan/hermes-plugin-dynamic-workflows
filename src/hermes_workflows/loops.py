@@ -899,16 +899,20 @@ def _register_resources(
     iteration: int,
     resources: list[WorkflowResource],
 ) -> None:
-    existing_ids = {item.get("id") for item in status.resources if isinstance(item, dict)}
-    registered: list[dict[str, Any]] = []
+    changed: list[dict[str, Any]] = []
     for resource in resources:
-        if resource.resource_id in existing_ids:
-            continue
-        existing_ids.add(resource.resource_id)
         resource_dict = resource.to_dict()
-        status.resources.append(resource_dict)
-        registered.append(resource_dict)
-    if registered:
+        existing = _find_resource(status.resources, resource.resource_id)
+        if existing is None:
+            status.resources.append(resource_dict)
+            changed.append(resource_dict)
+            continue
+        merged = _merge_resource_registration(existing, resource_dict)
+        if merged != existing:
+            existing.clear()
+            existing.update(merged)
+            changed.append(copy.deepcopy(existing))
+    if changed:
         _record_event(
             status,
             spec,
@@ -917,9 +921,46 @@ def _register_resources(
             "resources_registered",
             "acting",
             iteration,
-            f"registered {len(registered)} workflow resource(s)",
-            resources=registered,
+            f"registered or updated {len(changed)} workflow resource(s)",
+            resources=changed,
         )
+
+
+def _find_resource(resources: list[dict[str, Any]], resource_id: str) -> Optional[dict[str, Any]]:
+    for resource in resources:
+        if isinstance(resource, dict) and resource.get("id") == resource_id:
+            return resource
+    return None
+
+
+def _merge_resource_registration(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(existing)
+    for key in ("kind", "owner", "handle", "metadata"):
+        if key in incoming:
+            merged[key] = copy.deepcopy(incoming[key])
+    merged["finalizers"] = _merge_finalizer_dicts(
+        merged.get("finalizers", []),
+        incoming.get("finalizers", []),
+    )
+    return merged
+
+
+def _merge_finalizer_dicts(existing: Any, incoming: Any) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for item in list(existing if isinstance(existing, list) else []) + list(incoming if isinstance(incoming, list) else []):
+        if not isinstance(item, dict):
+            continue
+        finalizer_id = item.get("id")
+        if not isinstance(finalizer_id, str):
+            continue
+        item_copy = copy.deepcopy(item)
+        if finalizer_id in positions:
+            merged[positions[finalizer_id]] = item_copy
+        else:
+            positions[finalizer_id] = len(merged)
+            merged.append(item_copy)
+    return merged
 
 
 def _closeout_resources(
