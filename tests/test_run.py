@@ -489,3 +489,132 @@ def test_policy_max_active_awaits_counts_nested_conditional_parallel_waits():
     assert status.error is not None
     assert "max_active_awaits=1" in status.error["message"]
     assert runner.calls == []
+
+
+def test_phase_inherits_governance_for_validate_false_disallowed_profiles():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "phase_profile_governance",
+        "policy": {"network": False, "filesystem": False, "allowed_profiles": ["qa"]},
+        "steps": [
+            {
+                "kind": "phase",
+                "id": "review_phase",
+                "steps": [
+                    {"kind": "kanban_agent", "id": "review", "profile": "reviewer", "task": "review", "output_schema": {"status": "string"}}
+                ],
+            }
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "not allowed" in status.error["message"]
+    assert runner.calls == []
+
+
+def test_phase_inherits_and_propagates_agent_call_budget():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "phase_call_budget",
+        "policy": {"network": False, "filesystem": False, "max_agent_calls": 1},
+        "steps": [
+            {
+                "kind": "phase",
+                "id": "first_phase",
+                "steps": [
+                    {"kind": "agent", "id": "inside", "agent": "hermes.echo", "input": {"prompt": "LEAK_SENTINEL_PHASE_INPUT"}, "output_schema": {"echo": "object"}}
+                ],
+            },
+            {"kind": "agent", "id": "outside", "agent": "hermes.echo", "input": {}, "output_schema": {"echo": "object"}},
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_agent_calls=1" in status.error["message"]
+    assert "LEAK_SENTINEL_PHASE_INPUT" not in status.error["message"]
+    assert len(runner.calls) == 1
+
+
+def test_phase_inherits_active_await_budget_before_runner_calls():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "phase_active_await_budget",
+        "policy": {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa", "reviewer"],
+            "max_active_awaits": 1,
+        },
+        "steps": [
+            {
+                "kind": "phase",
+                "id": "gates_phase",
+                "steps": [
+                    {
+                        "kind": "parallel",
+                        "id": "gates",
+                        "branches": [
+                            {"kind": "kanban_agent", "id": "qa", "profile": "qa", "task": "qa", "output_schema": {"status": "string"}},
+                            {"kind": "kanban_agent", "id": "review", "profile": "reviewer", "task": "review", "output_schema": {"status": "string"}},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_active_awaits=1" in status.error["message"]
+    assert runner.calls == []
+
+
+def test_phase_inherits_and_propagates_kanban_card_budget():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "phase_kanban_budget",
+        "policy": {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa"],
+            "max_agent_calls": 5,
+            "max_kanban_cards": 1,
+        },
+        "steps": [
+            {
+                "kind": "phase",
+                "id": "first_phase",
+                "steps": [
+                    {"kind": "kanban_agent", "id": "qa_one", "profile": "qa", "task": "qa1", "output_schema": {"status": "string"}}
+                ],
+            },
+            {"kind": "kanban_agent", "id": "qa_two", "profile": "qa", "task": "qa2", "output_schema": {"status": "string"}},
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_kanban_cards=1" in status.error["message"]
+    assert len(runner.calls) == 1

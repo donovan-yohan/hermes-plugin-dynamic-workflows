@@ -350,7 +350,15 @@ def test_static_policy_broker_rejects_malformed_clock_values():
 
 def test_static_policy_broker_rejects_malformed_id_factory_values():
     request = good_request(ttl_seconds=60)
-    for bad_grant_id in ("../x", ".hidden", "grant:colon", {"not": "a-string"}):
+    for bad_grant_id in (
+        "../x",
+        ".hidden",
+        "grant:colon",
+        "sk-test",
+        "ghp_SECRET",
+        "github_pat_SECRET",
+        {"not": "a-string"},
+    ):
         broker = policy_broker(id_factory=lambda _request, value=bad_grant_id: value)  # type: ignore[arg-type]
 
         direct_decision = broker(request)
@@ -360,6 +368,12 @@ def test_static_policy_broker_rejects_malformed_id_factory_values():
         assert direct_decision.code == "malformed"
         assert resolved_decision.granted is False
         assert resolved_decision.code == "malformed"
+
+
+def test_static_policy_broker_rejects_malformed_backend_before_minting_grants():
+    for bad_backend in (123, "", "   ", None, "sk-backend"):
+        with pytest.raises(GrantError):
+            policy_broker(backend=bad_backend)  # type: ignore[arg-type]
 
 
 def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
