@@ -91,13 +91,14 @@ def make_release_sensor() -> Any:
                 "summary": "release lane not yet registered",
                 "next_hint": "register ATH listener and Relay automation-run resources",
             }
+        safe_context = context or {}
         return {
             "converged": True,
             "signal_key": "release-slice:merged-and-verified",
             "summary": "PR merged and release evidence captured",
             "evidence": [
                 {"kind": "github_pr", "status": "merged"},
-                {"kind": "resource_count", "count": len(context.get("resources", []))},
+                {"kind": "resource_count", "count": len(safe_context.get("resources", []))},
             ],
         }
 
@@ -109,30 +110,36 @@ def build_demo_finalizers(calls: list[tuple[str, str]]) -> ResourceFinalizerRegi
     finalizers = ResourceFinalizerRegistry()
 
     def retire_ath_listener(context: dict[str, Any]) -> dict[str, Any]:
-        resource = context["resource"]
-        calls.append((resource["id"], context["trigger"]))
+        safe_context = context or {}
+        resource = safe_context.get("resource") or {}
+        handle = resource.get("handle") or {}
+        trigger = safe_context.get("trigger", "unknown")
+        calls.append((resource.get("id", "unknown"), trigger))
         return {
             "ok": True,
             "summary": "ATH listener retired",
             "evidence": [
                 {
                     "kind": "ath.listener.retire",
-                    "threadKey": resource["handle"]["threadKey"],
+                    "threadKey": handle.get("threadKey", "unknown"),
                     "enabledAfter": False,
                 }
             ],
         }
 
     def retire_relay_automation_run(context: dict[str, Any]) -> dict[str, Any]:
-        resource = context["resource"]
-        calls.append((resource["id"], context["trigger"]))
+        safe_context = context or {}
+        resource = safe_context.get("resource") or {}
+        handle = resource.get("handle") or {}
+        trigger = safe_context.get("trigger", "unknown")
+        calls.append((resource.get("id", "unknown"), trigger))
         return {
             "ok": True,
             "summary": "Relay automation run retired",
             "evidence": [
                 {
                     "kind": "relay.automation_run.retire",
-                    "automationRunId": resource["handle"]["automationRunId"],
+                    "automationRunId": handle.get("automationRunId", "unknown"),
                     "statusAfter": "retired",
                 }
             ],

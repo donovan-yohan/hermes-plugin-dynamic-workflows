@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,7 @@ def _load_release_ops_example():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["release_ops_resource_closeout"] = module
     spec.loader.exec_module(module)
     return module
 
