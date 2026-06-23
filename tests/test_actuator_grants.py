@@ -98,7 +98,20 @@ def test_request_grant_rejects_non_positive_ttl():
 
 
 def test_request_grant_rejects_malformed_request_id():
-    for bad_request_id in (123, "", "   ", "../x", "with/slash", "ghp_secretlike"):
+    for bad_request_id in (
+        123,
+        "",
+        "   ",
+        ".",
+        "..",
+        "...",
+        "../x",
+        "with/slash",
+        "a:b",
+        "_leading",
+        "***",
+        "a" * 129,
+    ):
         with pytest.raises(GrantError):
             good_request(request_id=bad_request_id)
 
@@ -541,6 +554,16 @@ def test_validate_grant_rejects_non_finite_timestamps():
     assert result.code == "malformed"
 
 
+def test_validate_grant_rejects_malformed_validation_clock_without_raising():
+    grant = resolve_grant(policy_broker(), good_request()).grant
+    assert grant is not None
+
+    for bad_now in ("not-a-number", True, False, float("nan"), float("inf")):
+        result = validate_grant(grant, action="session.status", now=bad_now)
+        assert result.ok is False
+        assert result.code == "malformed"
+
+
 def test_validate_grant_rejects_non_finite_timestamps_on_session_grant_objects():
     grant_obj = resolve_grant(policy_broker(), good_request()).grant
     assert grant_obj is not None
@@ -581,11 +604,31 @@ def test_validate_grant_fails_closed_for_poisoned_session_grant_object_fields():
     object.__setattr__(bad_audit, "audit", 123)
     bad_request_id = SessionGrant.from_dict(grant_obj.to_dict())
     object.__setattr__(bad_request_id, "request_id", "../x")
+    bad_grant_id = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(bad_grant_id, "grant_id", "../x")
+    bad_side_effect_class = SessionGrant.from_dict(grant_obj.to_dict())
+    object.__setattr__(bad_side_effect_class, "side_effect_class", "root_shell")
 
-    for poisoned in (bad_handle, bad_audit, bad_request_id):
+    for poisoned in (bad_handle, bad_audit, bad_request_id, bad_grant_id, bad_side_effect_class):
         result = validate_grant(poisoned, action="session.status", now=FIXED_NOW + 10)
         assert result.ok is False
         assert result.code == "malformed"
+
+
+def test_resolve_grant_rejects_malformed_grant_id_from_broker():
+    request = good_request()
+    clean = resolve_grant(policy_broker(), request).grant
+    assert clean is not None
+    poisoned = SessionGrant.from_dict(clean.to_dict())
+    object.__setattr__(poisoned, "grant_id", "../x")
+
+    def rogue_broker(request):
+        return GrantDecision(True, "granted", "issued malformed grant id", poisoned)
+
+    decision = resolve_grant(rogue_broker, request)
+
+    assert decision.granted is False
+    assert decision.code == "malformed"
 
 
 # ---------------------------------------------------------------------------
