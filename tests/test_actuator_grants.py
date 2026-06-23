@@ -338,6 +338,30 @@ def test_resolve_grant_rejects_non_numeric_or_bool_broker_timestamps():
     assert bool_decision.code == "malformed"
 
 
+def test_static_policy_broker_rejects_malformed_clock_values():
+    for bad_clock in (True, False, "not-a-number", float("nan"), float("inf")):
+        broker = policy_broker(clock=lambda value=bad_clock: value)
+
+        decision = broker(good_request(ttl_seconds=60))
+
+        assert decision.granted is False
+        assert decision.code == "malformed"
+
+
+def test_static_policy_broker_rejects_malformed_id_factory_values():
+    request = good_request(ttl_seconds=60)
+    for bad_grant_id in ("../x", ".hidden", "grant:colon", {"not": "a-string"}):
+        broker = policy_broker(id_factory=lambda _request, value=bad_grant_id: value)  # type: ignore[arg-type]
+
+        direct_decision = broker(request)
+        resolved_decision = resolve_grant(broker, request)
+
+        assert direct_decision.granted is False
+        assert direct_decision.code == "malformed"
+        assert resolved_decision.granted is False
+        assert resolved_decision.code == "malformed"
+
+
 def test_resolve_grant_sanitizes_rogue_broker_audit_spoofing():
     req = good_request(requested_by="real-requester", reason="real reason", audit={"run_id": "real-run", "operator_note": "kept"})
 
