@@ -18,6 +18,7 @@ from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
+from .script_catalog import FileWorkflowScriptCatalog
 from .script_store import ScriptRunStore
 from .script_validator import ScriptValidation, validate_script
 from .vm import JournalSink, ScriptRunResult, VMLimits, run_script
@@ -32,6 +33,10 @@ __all__ = [
     "workflow_status",
     "workflow_validate_script",
     "run_workflow_script",
+    "workflow_script_catalog",
+    "workflow_save_script",
+    "workflow_inspect_script",
+    "workflow_run_script",
 ]
 
 
@@ -45,11 +50,20 @@ def workflow(
     dry_run: bool = False,
     registry: Optional[RunStore] = None,
     catalog: Optional[FileWorkflowCatalog] = None,
+    script_catalog: Optional[FileWorkflowScriptCatalog] = None,
+    script_store: Optional[ScriptRunStore] = None,
     agent_runner: Optional[AgentRunner] = None,
     validate: bool = True,
     max_parallel: int = 8,
     include_steps: bool = True,
     session_id: Optional[str] = None,
+    script_name: Optional[str] = None,
+    script_source: Optional[str] = None,
+    script_args: Any = None,
+    script_version: Optional[int] = None,
+    include_source: bool = False,
+    include_versions: bool = False,
+    replace: bool = False,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
 
@@ -111,7 +125,41 @@ def workflow(
             "handle": handle.as_dict(),
             "status": status.as_dict(),
         }
-    raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template")
+    if op == "script_catalog":
+        return workflow_script_catalog(catalog=script_catalog, include_versions=include_versions)
+    if op == "script_save":
+        if not script_name or script_source is None:
+            raise ValueError("workflow script_save requires 'script_name' and 'script_source'")
+        return workflow_save_script(
+            script_name,
+            script_source,
+            catalog=script_catalog,
+            version=script_version,
+            replace=replace,
+        )
+    if op == "script_inspect":
+        if not script_name:
+            raise ValueError("workflow script_inspect requires 'script_name'")
+        return workflow_inspect_script(
+            script_name,
+            catalog=script_catalog,
+            version=script_version,
+            include_source=include_source,
+        )
+    if op == "run_script":
+        if not script_name:
+            raise ValueError("workflow run_script requires 'script_name'")
+        result = workflow_run_script(
+            script_name,
+            args=script_args,
+            catalog=script_catalog,
+            store=script_store,
+            agent_runner=agent_runner,
+            version=script_version,
+            validate=validate,
+        )
+        return {"operation": "run_script", "script_name": script_name, "result": result.as_dict()}
+    raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
 
 
 def _run_and_status(
@@ -281,6 +329,82 @@ def workflow_run(
 
     store.set_status(rid, "succeeded", result=final)
     return RunHandle(run_id=rid, status="succeeded", created_at=record.created_at, def_hash=h)
+
+
+def workflow_script_catalog(
+    *,
+    catalog: Optional[FileWorkflowScriptCatalog] = None,
+    include_versions: bool = False,
+) -> dict[str, Any]:
+    """List saved Python workflow-script harnesses from the script catalog."""
+    active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
+    return {
+        "operation": "script_catalog",
+        "scripts": active_catalog.list_scripts(include_versions=include_versions),
+    }
+
+
+def workflow_save_script(
+    script_name: str,
+    source: str,
+    *,
+    catalog: Optional[FileWorkflowScriptCatalog] = None,
+    version: Optional[int] = None,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Validate and save a versioned Python workflow-script harness."""
+    active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
+    entry = active_catalog.save_script(script_name, source, version=version, replace=replace)
+    return {"operation": "script_save", "script": entry}
+
+
+def workflow_inspect_script(
+    script_name: str,
+    *,
+    catalog: Optional[FileWorkflowScriptCatalog] = None,
+    version: Optional[int] = None,
+    include_source: bool = False,
+) -> dict[str, Any]:
+    """Inspect one saved Python workflow-script harness version."""
+    active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
+    return {
+        "operation": "script_inspect",
+        "script": active_catalog.inspect_script(script_name, version=version, include_source=include_source),
+    }
+
+
+def workflow_run_script(
+    script_name: str,
+    *,
+    args: Any = None,
+    catalog: Optional[FileWorkflowScriptCatalog] = None,
+    store: Optional[ScriptRunStore] = None,
+    agent_runner: Optional[AgentRunner] = None,
+    limits: Optional[VMLimits] = None,
+    journal: Optional[JournalSink] = None,
+    validate: bool = True,
+    run_id: Optional[str] = None,
+    replay_from: Optional[str] = None,
+    deterministic_runner: Optional[bool] = None,
+    version: Optional[int] = None,
+    kanban_backend: Optional["KanbanBackend"] = None,
+) -> ScriptRunResult:
+    """Load and run a saved Python workflow-script harness by catalog name."""
+    active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
+    source = active_catalog.load_script(script_name, version=version)
+    return run_workflow_script(
+        source,
+        args=args,
+        agent_runner=agent_runner,
+        limits=limits,
+        journal=journal,
+        validate=validate,
+        store=store,
+        run_id=run_id,
+        replay_from=replay_from,
+        deterministic_runner=deterministic_runner,
+        kanban_backend=kanban_backend,
+    )
 
 
 def workflow_validate_script(source: str) -> ScriptValidation:

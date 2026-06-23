@@ -32,6 +32,7 @@ from hermes_workflows.primitives import (  # noqa: E402
 )
 from hermes_workflows.registry import FileRunStore  # noqa: E402
 from hermes_workflows.catalog import FileWorkflowCatalog  # noqa: E402
+from hermes_workflows.script_catalog import FileWorkflowScriptCatalog  # noqa: E402
 from hermes_workflows import controls as _controls  # noqa: E402
 from hermes_workflows.controls import FileControlStore  # noqa: E402
 from hermes_workflows.script_store import ScriptRunStore  # noqa: E402
@@ -115,6 +116,17 @@ def _plugin_catalog() -> FileWorkflowCatalog:
     return FileWorkflowCatalog()
 
 
+def _plugin_script_catalog() -> FileWorkflowScriptCatalog:
+    return FileWorkflowScriptCatalog()
+
+
+def _plugin_script_run_store(session_id: Optional[str] = None) -> ScriptRunStore:
+    root = _state_root() / "script-runs"
+    if session_id:
+        root = root / session_id
+    return ScriptRunStore(str(root))
+
+
 def _session_id_from_kwargs(kwargs: dict[str, Any]) -> Optional[str]:
     """Extract a Hermes session id from dispatched kwargs when available."""
     parent_agent = kwargs.get("parent_agent")
@@ -141,7 +153,18 @@ WORKFLOW_SCHEMA = {
         "properties": {
             "action": {
                 "type": ["string", "null"],
-                "enum": ["validate", "run", "status", "catalog", "run_template", None],
+                "enum": [
+                    "validate",
+                    "run",
+                    "status",
+                    "catalog",
+                    "run_template",
+                    "script_catalog",
+                    "script_save",
+                    "script_inspect",
+                    "run_script",
+                    None,
+                ],
                 "description": "Optional explicit operation. Defaults from supplied fields.",
                 "default": None,
             },
@@ -164,6 +187,49 @@ WORKFLOW_SCHEMA = {
                 "type": ["string", "null"],
                 "description": "Safe template name for action=run_template.",
                 "default": None,
+            },
+            "script_name": {
+                "type": ["string", "null"],
+                "description": "Safe saved script harness name for script_inspect/run_script/script_save.",
+                "default": None,
+            },
+            "script_source": {
+                "type": ["string", "null"],
+                "description": "Workflow-script source for action=script_save.",
+                "default": None,
+            },
+            "script_args": {
+                "description": "Arguments passed to a saved script harness for action=run_script.",
+                "oneOf": [
+                    {"type": "object"},
+                    {"type": "array"},
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ],
+                "default": None,
+            },
+            "script_version": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "Optional saved script harness version.",
+                "default": None,
+            },
+            "include_source": {
+                "type": "boolean",
+                "description": "Include script source in action=script_inspect output.",
+                "default": False,
+            },
+            "include_versions": {
+                "type": "boolean",
+                "description": "List all saved script harness versions for action=script_catalog.",
+                "default": False,
+            },
+            "replace": {
+                "type": "boolean",
+                "description": "Allow action=script_save to replace an existing explicit version.",
+                "default": False,
             },
             "dry_run": {
                 "type": "boolean",
@@ -493,9 +559,18 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             inputs=params.get("inputs"),
             run_id=params.get("run_id"),
             template_name=params.get("template_name"),
+            script_name=params.get("script_name"),
+            script_source=params.get("script_source"),
+            script_args=params.get("script_args"),
+            script_version=params.get("script_version"),
+            include_source=params.get("include_source", False),
+            include_versions=params.get("include_versions", False),
+            replace=params.get("replace", False),
             dry_run=params.get("dry_run", False),
             registry=store,
             catalog=_plugin_catalog(),
+            script_catalog=_plugin_script_catalog(),
+            script_store=_plugin_script_run_store(session_id=session_id),
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),

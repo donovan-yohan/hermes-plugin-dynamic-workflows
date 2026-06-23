@@ -61,6 +61,10 @@ def test_register_exposes_workflow_tools():
     plugin.register(ctx)
 
     assert set(ctx.tools) == {"workflow", "workflow_control"}
+    action_enum = ctx.tools["workflow"]["schema"]["parameters"]["properties"]["action"]["enum"]
+    assert "script_save" in action_enum
+    assert "run_script" in action_enum
+    assert "script_source" in ctx.tools["workflow"]["schema"]["parameters"]["properties"]
     for name, registered in ctx.tools.items():
         assert registered["toolset"] == "dynamic_workflows"
         assert registered["schema"]["name"] == name
@@ -110,3 +114,47 @@ def _assert_registered_handlers_return_json_success_payloads():
     assert unified_payload["success"] is True
     assert unified_payload["data"]["operation"] == "run"
     assert unified_payload["data"]["journal"]
+
+
+def test_registered_workflow_handler_runs_saved_script_harness():
+    old_state_dir = os.environ.get("HERMES_WORKFLOWS_STATE_DIR")
+    old_script_dir = os.environ.get("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        os.environ["HERMES_WORKFLOWS_STATE_DIR"] = str(root / "runs")
+        os.environ["HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR"] = str(root / "scripts")
+        try:
+            plugin = _load_plugin_root()
+            ctx = FakeContext()
+            plugin.register(ctx)
+            source = (
+                'meta = {"name": "saved", "description": "plugin script"}\n'
+                'return {"value": args["value"]}\n'
+            )
+
+            save_payload = json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"action": "script_save", "script_name": "saved", "script_source": source}
+                )
+            )
+            run_payload = json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"action": "run_script", "script_name": "saved", "script_args": {"value": 42}}
+                )
+            )
+        finally:
+            if old_state_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_STATE_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_STATE_DIR"] = old_state_dir
+            if old_script_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR"] = old_script_dir
+
+    assert save_payload["success"] is True
+    assert save_payload["data"]["script"]["name"] == "saved"
+    assert run_payload["success"] is True
+    assert run_payload["data"]["operation"] == "run_script"
+    assert run_payload["data"]["result"]["ok"] is True
+    assert run_payload["data"]["result"]["value"] == {"value": 42}

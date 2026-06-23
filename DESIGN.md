@@ -74,8 +74,10 @@ def workflow_status(
 
 - **`workflow`** chooses the operation from supplied fields: `dry_run` or
   `action='validate'` validates only, a `definition` runs, `template_name` runs a
-  saved catalog template, `action='catalog'` lists saved templates, and `run_id`
-  without a definition reads status. It is the tool shape meant for model use.
+  saved catalog template, `action='catalog'` lists saved JSON templates,
+  `action='script_catalog'` / `script_save` / `script_inspect` / `run_script`
+  operate the saved Python script-harness catalog, and `run_id` without a
+  definition reads status. It is the tool shape meant for model use.
 
 - **`workflow_validate`** parses (`definition` may be a parsed `dict` or a JSON
   string), validates the schema, and runs the sandbox-policy lint. It has **no
@@ -139,6 +141,7 @@ def workflow_status(
 |------|----------------|
 | `primitives.py` | Public entry points; `workflow` facade plus explicit validate/run/status primitives. |
 | `catalog.py` | File-backed saved template catalog for safe `<name>.workflow.json` listing/loading. |
+| `script_catalog.py` | Versioned file-backed saved Python script harness catalog for validate/save/list/inspect/run-by-name flows (#29). |
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
@@ -686,9 +689,11 @@ deterministic orchestration brain in the Claude Dynamic Workflows shape
 it is **never executed inside the parent Hermes process**. It runs in a
 sandboxed subprocess; the parent owns every capability.
 
-This mode is exposed only as the library/operator primitives
-`workflow_validate_script` and `run_workflow_script`. The single model-facing
-`workflow` tool and the JSON runtime are unchanged.
+This mode is exposed as the library/operator primitives
+`workflow_validate_script` and `run_workflow_script`, and as saved-harness
+facade actions (`script_catalog`, `script_save`, `script_inspect`, `run_script`)
+that load validated script versions through the same subprocess VM. The JSON
+runtime is unchanged.
 
 ### 5.1 Three enforcement layers
 
@@ -760,6 +765,39 @@ a *partial* run (this slice replays a *completed* run; a run suspended on a Kanb
 await now resumes via §5.9, but resuming an arbitrarily-interrupted run from its
 last completed step is still future), no-duplicate-Kanban side-effect dedup, and
 launch-approval/session-policy governance (#11).
+
+### 5.5 Saved script harness catalog (issue #29)
+
+`script_catalog.py` turns the VM into a reusable harness library instead of a
+one-off script launcher. A saved harness is a Python workflow script with a safe
+single-segment name and an explicit integer version:
+
+```text
+<root>/<script-name>/v000001.workflow.py
+<root>/<script-name>/v000001.meta.json
+```
+
+`FileWorkflowScriptCatalog.save_script()` validates source with the same static
+launch gate before writing it, writes atomically, and keeps versions immutable
+unless `replace=True` is explicit. New implicit saves append after the highest
+visible version across all roots, so a profile-local catalog cannot silently
+shadow a bundled example version. `load_script()` / `inspect_script()` resolve
+only paths that stay under configured roots, so symlink/path-traversal escapes do
+not become a filesystem-write primitive. The default roots are profile-local
+`$HERMES_HOME/dynamic-workflows/scripts` plus package-bundled examples under
+`hermes_workflows/examples/scripts` (with the repository `examples/scripts`
+mirror also discovered in source checkouts).
+
+The `workflow` facade exposes the catalog as model-facing operations:
+
+- `script_catalog` — list latest or all saved versions;
+- `script_save` — validate and persist generated harness source;
+- `script_inspect` — return metadata and optional source for a saved version;
+- `run_script` — load a saved version and execute it through `run_workflow_script`.
+
+This gives loop-engineering agents a generic "save this capability harness and
+reuse it by name" substrate without granting scripts direct filesystem/network
+access or hardcoding repo-specific primitives.
 
 ### 5.6 Durable script run store and deterministic replay cache (issue #3)
 
