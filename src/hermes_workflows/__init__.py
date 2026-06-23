@@ -28,6 +28,10 @@ from .primitives import (
     workflow_status,
     workflow_validate_script,
     run_workflow_script,
+    workflow_script_catalog,
+    workflow_save_script,
+    workflow_inspect_script,
+    workflow_run_script,
 )
 from .models import (
     Diagnostic,
@@ -124,6 +128,12 @@ from .controls import (
     run_links,
     current_phase,
 )
+from .script_catalog import (
+    FileWorkflowScriptCatalog,
+    ScriptCatalogEntry,
+    safe_script_name,
+    default_script_catalog_roots,
+)
 from .script_store import (
     ScriptRunStore,
     ScriptRunMeta,
@@ -202,6 +212,10 @@ __all__ = [
     "workflow_status",
     "workflow_validate_script",
     "run_workflow_script",
+    "workflow_script_catalog",
+    "workflow_save_script",
+    "workflow_inspect_script",
+    "workflow_run_script",
     "GovernancePolicy",
     # subprocess workflow VM (issue #2)
     "loop_validate",
@@ -290,6 +304,11 @@ __all__ = [
     "list_runs",
     "run_links",
     "current_phase",
+    # saved workflow-script harness catalog (issue #29)
+    "FileWorkflowScriptCatalog",
+    "ScriptCatalogEntry",
+    "safe_script_name",
+    "default_script_catalog_roots",
     # durable script run store + replay cache (issue #3)
     "ScriptRunStore",
     "ScriptRunMeta",

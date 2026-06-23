@@ -38,7 +38,8 @@ The current runtime supports:
 - in-memory run storage for library use
 - parent-owned filesystem run storage for plugin use: `snapshot.json` + compact `journal.jsonl`
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
-- a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`; not model-facing)
+- a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`)
+- a versioned **saved script harness catalog**: validate, save, list, inspect, and run reusable Python workflow-script harnesses by name/version via `FileWorkflowScriptCatalog` and `workflow` actions (`script_catalog`, `script_save`, `script_inspect`, `run_script`)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
 - backend-neutral **operator controls, status & wait inspection**: append-only pause/resume/stop/task_stop/retry control records (durable `FileControlStore`, never deletes the audit trail), a compact control-state projection (stop is terminal; idempotent retry lineage with explicit replacement refs), wait inspection from existing loop suspensions and durable Kanban card states, and `inspect_run` / `list_runs` projections behind the model-neutral `workflow_control` operator tool
@@ -116,6 +117,10 @@ The plugin registers this tool in the `dynamic_workflows` toolset:
   - `action: "status"` reads a prior `run_id`.
   - `action: "catalog"` lists saved templates from bundled examples and `$HERMES_WORKFLOWS_CATALOG_DIR` or `$HERMES_HOME/dynamic-workflows/templates`.
   - `action: "run_template"` loads a safe `<name>.workflow.json` template and runs it; `template_name` alone also infers `run_template`.
+  - `action: "script_catalog"` lists saved Python script harnesses from `$HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR`, `$HERMES_HOME/dynamic-workflows/scripts`, and bundled `examples/scripts`.
+  - `action: "script_save"` validates and saves a versioned script harness (`script_name`, `script_source`; optional `script_version`, `replace`).
+  - `action: "script_inspect"` returns one script harness version's metadata (optional `include_source`).
+  - `action: "run_script"` loads a saved script harness by `script_name` / optional `script_version` and runs it through the parent-owned subprocess VM with `script_args`.
 
 The lower-level `workflow_validate`, `workflow_run`, and `workflow_status` functions remain available
 for tests, library callers, and operator/debug integrations, but they are not registered as
@@ -260,6 +265,50 @@ These limits are metadata-only. Failure status records include the policy reason
 and machine error type, not raw prompts, card bodies, transcripts, or secrets. A
 future gateway/CLI slice still owns the human launch/child-approval UX; this slice
 only adds the runtime-enforceable backpressure/allowlist substrate.
+
+### Saved script harness catalog (#29 first slice)
+
+Declarative `.workflow.json` templates are useful when the flow is known ahead of time. #29 adds the parallel surface for reusable **Python workflow-script harnesses**: a model can author a small script using the safe VM capability globals (`agent`, `kanban_agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`), validate/save it, list/inspect it later, and run it by name with repo/tool values supplied as `script_args`.
+
+Storage is versioned and path-safe. New saves append after the highest visible
+version across all configured roots; explicit versions are immutable unless
+`replace=True`, so a profile-local script cannot silently shadow a bundled
+example version.
+
+```text
+$HERMES_HOME/dynamic-workflows/scripts/<script_name>/v000001.workflow.py
+$HERMES_HOME/dynamic-workflows/scripts/<script_name>/v000001.meta.json
+```
+
+The catalog reads package-bundled examples from `hermes_workflows/examples/scripts/` (and the repository mirror at `examples/scripts/` in source checkouts). The bundled `generic_issue_lifecycle` harness demonstrates a non-repo-specific issue lifecycle lane: `repo`, `issue`, `workspace`, `review_profile`, and `qa_profile` are runtime args rather than hardcoded primitives.
+
+```python
+from hermes_workflows.primitives import workflow
+
+# Save a generated harness after validation.
+workflow(
+    action="script_save",
+    script_name="my_issue_lane",
+    script_source='meta = {"name": "my_issue_lane", "description": "demo"}\nlog("start")\nreturn {"ok": True}\n',
+)
+
+# List / inspect / run saved harnesses.
+workflow(action="script_catalog", include_versions=True)
+workflow(action="script_inspect", script_name="generic_issue_lifecycle")
+workflow(
+    action="run_script",
+    script_name="generic_issue_lifecycle",
+    script_args={
+        "repo": "owner/project",
+        "issue": 29,
+        "workspace": "/repo",
+        "review_profile": "reviewer",
+        "qa_profile": "qa",
+    },
+)
+```
+
+Safety boundaries are the same as the subprocess VM: no imports, no direct filesystem/network/process/env access, restricted builtins, scrubbed environment, bounded RPC/runtime limits, and every effect must cross the parent-owned capability broker.
 
 ### Event-driven PR validation lane (#10)
 
