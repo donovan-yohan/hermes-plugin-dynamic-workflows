@@ -45,9 +45,18 @@ __all__ = [
     "parse_ref",
 ]
 
-# Capability keys the policy block is allowed to mention. Anything else trips
-# E_DISALLOWED_CAPABILITY. ``max_parallel`` is a tuning knob, not a capability.
-KNOWN_CAPABILITIES: frozenset[str] = frozenset({"network", "filesystem", "max_parallel"})
+# Capability/policy keys the policy block is allowed to mention.
+KNOWN_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "network",
+        "filesystem",
+        "max_parallel",
+        "max_agent_calls",
+        "max_kanban_cards",
+        "max_active_awaits",
+        "allowed_profiles",
+    }
+)
 
 # $ref:inputs.<key>  |  $ref:<step_id>.output[.<field>...]
 REF_PATTERN = re.compile(
@@ -100,8 +109,10 @@ def policy_lint(definition: dict[str, Any]) -> list[Diagnostic]:
 
     declared_inputs = set(definition.get("inputs", {}) or {})
     known_step_ids = _collect_all_step_ids(steps)
+    policy = definition.get("policy") if isinstance(definition.get("policy"), dict) else {}
+    allowed_profiles = _allowed_profiles(policy.get("allowed_profiles")) if isinstance(policy, dict) else None
 
-    diags.extend(_lint_agent_steps(steps, declared_inputs, known_step_ids))
+    diags.extend(_lint_agent_steps(steps, declared_inputs, known_step_ids, allowed_profiles))
     diags.extend(_lint_if_steps(steps, declared_inputs, known_step_ids))
     diags.extend(_lint_execution_order(steps))
     diags.extend(_lint_cycles(steps))
@@ -160,6 +171,29 @@ def _lint_policy_block(definition: dict[str, Any]) -> list[Diagnostic]:
                     pointer="/policy/max_parallel",
                 )
             )
+    for key in ("max_agent_calls", "max_kanban_cards", "max_active_awaits"):
+        if key in policy:
+            value = policy.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                diags.append(
+                    Diagnostic(
+                        severity="error",
+                        code=err.E_DISALLOWED_CAPABILITY,
+                        message=f"policy.{key} must be a non-negative integer",
+                        pointer=f"/policy/{key}",
+                    )
+                )
+    if "allowed_profiles" in policy:
+        profiles = policy.get("allowed_profiles")
+        if _allowed_profiles(profiles) is None:
+            diags.append(
+                Diagnostic(
+                    severity="error",
+                    code=err.E_DISALLOWED_CAPABILITY,
+                    message="policy.allowed_profiles must be a list of identifier-safe profile strings",
+                    pointer="/policy/allowed_profiles",
+                )
+            )
     for key in policy:
         if key not in KNOWN_CAPABILITIES:
             diags.append(
@@ -173,6 +207,18 @@ def _lint_policy_block(definition: dict[str, Any]) -> list[Diagnostic]:
     return diags
 
 
+def _allowed_profiles(value: Any) -> frozenset[str] | None:
+    if not isinstance(value, list):
+        return None
+    if any(not isinstance(item, str) or not _is_identifier_safe(item) for item in value):
+        return None
+    return frozenset(value)
+
+
+def _is_identifier_safe(value: str) -> bool:
+    return bool(value) and all(c.isalnum() or c in "._-" for c in value)
+
+
 # ---------------------------------------------------------------------------
 # Agent steps: agent ids, references, output schema.
 # ---------------------------------------------------------------------------
@@ -181,11 +227,22 @@ def _lint_agent_steps(
     steps: list[Any],
     declared_inputs: set[str],
     known_step_ids: set[Any],
+    allowed_profiles: frozenset[str] | None,
 ) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     for step, ptr in _schema.iter_agent_steps(steps):
         kind = step.get("kind")
         agent = step.get("agent")
+        profile = step.get("profile")
+        if kind == "kanban_agent" and isinstance(profile, str) and allowed_profiles is not None and profile not in allowed_profiles:
+            diags.append(
+                Diagnostic(
+                    severity="error",
+                    code=err.E_DISALLOWED_CAPABILITY,
+                    message=f"kanban profile {profile!r} is not allowed by policy.allowed_profiles",
+                    pointer=f"{ptr}/profile",
+                )
+            )
         if kind == "agent" and isinstance(agent, str) and is_kanban_runner_id(agent):
             diags.append(
                 Diagnostic(

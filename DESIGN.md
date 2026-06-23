@@ -448,7 +448,23 @@ the definition, and routes **all** external effects through the single
 modeled deterministically; the skeleton executes synchronously so runs are
 reproducible and easy to test.
 
----
+The first #11 governance slice adds runtime-enforced fanout/backpressure policy
+for the declarative runtime. `policy.max_agent_calls` caps total effect-boundary
+calls, `policy.max_kanban_cards` caps Kanban-backed awaits, `policy.max_active_awaits`
+caps logical simultaneous waits in a `parallel` step, and `policy.allowed_profiles`
+allowlists `kanban_agent.profile` before any card/runner call. These guards run in
+static validation where possible and again at runtime so `validate=false` cannot
+bypass them. Status failures are metadata-only (`SandboxPolicyError` type and a
+short policy reason); they do not serialize raw prompts, card bodies, or transcripts.
+Gateway/CLI launch approval and child-approval UX remain future host integration,
+not something this skeleton pretends to own.
+
+### 1.7 Workflow definition format
+
+A workflow definition is a JSON object with `version`, `name`, optional `inputs`,
+a `policy` object, and a recursive `steps` list. The governance keys above are
+part of the `policy` object alongside the default-deny `network` / `filesystem`
+flags and `max_parallel` logical fanout width.
 
 ## 2. Claude Dynamic Workflows observations
 

@@ -137,7 +137,15 @@ If Hermes does not show `workflow` after restart, check:
   "version": "1",
   "name": "hello",
   "inputs": { "name": "string" },
-  "policy": { "network": false, "filesystem": false, "max_parallel": 2 },
+  "policy": {
+    "network": false,
+    "filesystem": false,
+    "max_parallel": 2,
+    "max_agent_calls": 8,
+    "max_kanban_cards": 3,
+    "max_active_awaits": 2,
+    "allowed_profiles": ["qa", "reviewer"]
+  },
   "steps": [
     {
       "kind": "agent",
@@ -235,7 +243,25 @@ Mapping common watchdogs to workflow starts:
 it reports durable blocked waits and projected pause/stop/retry intent without a
 cron job rediscovering state.
 
-### Event-driven PR validation template
+### Governance policy knobs (#11 first slice)
+
+The declarative runtime now enforces the parts of workflow governance it can own
+honestly before any external runner/card call is made:
+
+- `max_agent_calls` caps total effect-boundary calls (`agent` + `kanban_agent`).
+- `max_kanban_cards` caps Kanban card creation/reattach attempts.
+- `max_active_awaits` caps logical simultaneously-waiting Kanban awaits inside a
+  `parallel` step.
+- `allowed_profiles` is a parent-owned allowlist for `kanban_agent.profile`; a
+  disallowed profile fails static validation and also fails at runtime when
+  `validate=false` skips the gate.
+
+These limits are metadata-only. Failure status records include the policy reason
+and machine error type, not raw prompts, card bodies, transcripts, or secrets. A
+future gateway/CLI slice still owns the human launch/child-approval UX; this slice
+only adds the runtime-enforceable backpressure/allowlist substrate.
+
+### Event-driven PR validation lane (#10)
 
 `examples/event_driven_pr_validation_lane.workflow.json` rewrites the common "PR
 watchdog" as a saved workflow template. A webhook or calendar start supplies the

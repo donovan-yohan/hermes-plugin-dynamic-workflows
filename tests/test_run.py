@@ -233,3 +233,259 @@ def test_default_registry_is_process_global_when_omitted():
     status = workflow_status(handle.run_id)
     assert status.run_id == handle.run_id
     assert status.status in TERMINAL
+
+
+# --------------------------------------------------------------------------- #
+# Governance / fanout policy (#11 first slice)
+# --------------------------------------------------------------------------- #
+
+
+def kanban_definition(profile="qa", *, policy=None) -> dict:
+    return {
+        "version": "1",
+        "name": "kanban_governed",
+        "policy": policy
+        or {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa"],
+            "max_agent_calls": 1,
+            "max_kanban_cards": 1,
+            "max_active_awaits": 1,
+        },
+        "steps": [
+            {
+                "kind": "kanban_agent",
+                "id": "qa_gate",
+                "profile": profile,
+                "task": {"summary": "qa"},
+                "input": {"secret_prompt": "do not persist this raw prompt"},
+                "output_schema": {"status": "string"},
+            }
+        ],
+    }
+
+
+class RecordingRunner:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, agent_id, input):
+        self.calls.append((agent_id, input))
+        if agent_id.startswith("kanban."):
+            return {"task_id": "kb_1", "profile": agent_id.split(".", 1)[1], "status": "succeeded"}
+        return {"echo": dict(input)}
+
+
+def test_policy_rejects_disallowed_kanban_profile_before_run_record():
+    store = InMemoryRunStore()
+    definition = kanban_definition(profile="reviewer")
+
+    try:
+        workflow_run(definition, registry=store)
+    except WorkflowValidationError as err:
+        assert any(d.code == "E_DISALLOWED_CAPABILITY" for d in err.result.errors)
+    else:
+        raise AssertionError("expected policy validation error")
+
+    assert list(store.list()) == []
+
+
+def test_validate_false_runtime_rejects_disallowed_kanban_profile_before_runner_call():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+
+    handle = workflow_run(kanban_definition(profile="reviewer"), registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "not allowed" in status.error["message"]
+    assert runner.calls == []
+
+
+def test_validate_false_runtime_rejects_malformed_governance_policy_before_runner_call():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = kanban_definition(policy={
+        "network": False,
+        "filesystem": False,
+        "allowed_profiles": "qa",
+        "max_agent_calls": "1",
+    })
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner, validate=False)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert status.error["type"] == "SandboxPolicyError"
+    assert "policy.max_agent_calls" in status.error["message"] or "policy.allowed_profiles" in status.error["message"]
+    assert runner.calls == []
+
+
+def test_policy_max_agent_calls_caps_total_effect_calls_without_leaking_input():
+    store = InMemoryRunStore()
+    definition = hello_definition()
+    definition["policy"].update({"max_agent_calls": 1})
+    definition["steps"][1]["input"] = {"text": "s3cr3t raw prompt"}
+
+    handle = workflow_run(definition, inputs={"name": "world"}, registry=store)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_agent_calls=1" in status.error["message"]
+    assert "s3cr3t" not in status.error["message"]
+
+
+def test_policy_max_kanban_cards_caps_card_creation():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = kanban_definition(policy={
+        "network": False,
+        "filesystem": False,
+        "allowed_profiles": ["qa"],
+        "max_agent_calls": 5,
+        "max_kanban_cards": 1,
+    })
+    definition["steps"].append({
+        "kind": "kanban_agent",
+        "id": "qa_gate_2",
+        "profile": "qa",
+        "task": {"summary": "second qa"},
+        "output_schema": {"status": "string"},
+    })
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_kanban_cards=1" in status.error["message"]
+    assert len(runner.calls) == 1
+
+
+def test_policy_max_active_awaits_caps_parallel_waits_before_runner_call():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "parallel_waits",
+        "policy": {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa", "reviewer"],
+            "max_agent_calls": 5,
+            "max_kanban_cards": 5,
+            "max_active_awaits": 1,
+        },
+        "steps": [
+            {
+                "kind": "parallel",
+                "id": "gates",
+                "branches": [
+                    {"kind": "kanban_agent", "id": "qa_gate", "profile": "qa", "task": "qa", "output_schema": {"status": "string"}},
+                    {"kind": "kanban_agent", "id": "review_gate", "profile": "reviewer", "task": "review", "output_schema": {"status": "string"}},
+                ],
+            }
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_active_awaits=1" in status.error["message"]
+    assert runner.calls == []
+
+
+def test_policy_max_active_awaits_allows_sequential_waits_inside_parallel_branch():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "sequential_waits_in_parallel_branch",
+        "policy": {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa"],
+            "max_agent_calls": 5,
+            "max_kanban_cards": 5,
+            "max_active_awaits": 1,
+        },
+        "steps": [
+            {
+                "kind": "parallel",
+                "id": "outer",
+                "branches": [
+                    {
+                        "kind": "pipeline",
+                        "id": "sequential_qa",
+                        "steps": [
+                            {"kind": "kanban_agent", "id": "qa_one", "profile": "qa", "task": "qa1", "output_schema": {"status": "string"}},
+                            {"kind": "kanban_agent", "id": "qa_two", "profile": "qa", "task": "qa2", "output_schema": {"status": "string"}},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    handle = workflow_run(definition, registry=store, agent_runner=runner)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "succeeded"
+    assert status.status == "succeeded"
+    assert len(runner.calls) == 2
+
+
+def test_policy_max_active_awaits_counts_nested_conditional_parallel_waits():
+    store = InMemoryRunStore()
+    runner = RecordingRunner()
+    definition = {
+        "version": "1",
+        "name": "conditional_parallel_waits",
+        "inputs": {"run": "bool"},
+        "policy": {
+            "network": False,
+            "filesystem": False,
+            "allowed_profiles": ["qa", "reviewer"],
+            "max_agent_calls": 5,
+            "max_kanban_cards": 5,
+            "max_active_awaits": 1,
+        },
+        "steps": [
+            {
+                "kind": "parallel",
+                "id": "outer",
+                "branches": [
+                    {
+                        "kind": "if",
+                        "id": "conditional_gates",
+                        "condition": {"ref": "$ref:inputs.run", "op": "truthy"},
+                        "then": [
+                            {
+                                "kind": "parallel",
+                                "id": "inner_gates",
+                                "branches": [
+                                    {"kind": "kanban_agent", "id": "qa_gate", "profile": "qa", "task": "qa", "output_schema": {"status": "string"}},
+                                    {"kind": "kanban_agent", "id": "review_gate", "profile": "reviewer", "task": "review", "output_schema": {"status": "string"}},
+                                ],
+                            }
+                        ],
+                        "else": [],
+                    }
+                ],
+            }
+        ],
+    }
+
+    handle = workflow_run(definition, inputs={"run": True}, registry=store, agent_runner=runner)
+    status = workflow_status(handle.run_id, registry=store)
+
+    assert handle.status == "failed"
+    assert status.error is not None
+    assert "max_active_awaits=1" in status.error["message"]
+    assert runner.calls == []
