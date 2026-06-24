@@ -128,21 +128,31 @@ def test_bundled_generic_issue_lifecycle_script_harness_lists_and_runs():
         "generic_issue_lifecycle",
         args={
             "repo": "owner/project",
-            "issue": 29,
+            "issue_number": 29,
+            "base_branch": "main",
             "workspace": "/repo",
-            "review_profile": "reviewer",
-            "qa_profile": "qa",
+            "expected_head_sha": "abc123",
+            "profile_bindings": {
+                "planner": "planner",
+                "implementer": "implementer",
+                "reviewer": "reviewer",
+                "qa": "qa",
+                "ops": "ops",
+            },
         },
         catalog=catalog,
     )
 
     assert result.ok is True
-    assert result.value == {
-        "planned_phase": "plan",
-        "review_profile": "reviewer",
-        "qa_profile": "qa",
-        "issue": 29,
-    }
+    assert result.value["repo"] == "owner/project"
+    assert result.value["issue"] == 29
+    assert result.value["profiles"]["reviewer"] == "reviewer"
+    assert result.value["profiles"]["qa"] == "qa"
+    assert result.value["head_sha"] == "abc123"
+    assert result.value["review_ok"] is True
+    assert result.value["qa_ok"] is True
+    assert result.value["release"] is True
+    assert result.value["blocked"] is False
 
 
 def test_script_catalog_listing_skips_symlink_escape_and_save_refuses_escape():

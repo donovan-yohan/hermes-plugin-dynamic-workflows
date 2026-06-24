@@ -43,7 +43,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-hermes_workflows = ["examples/scripts/*/*.workflow"]
+hermes_workflows = ["examples/scripts/*/*.workflow", "examples/scripts/*/*.workflow.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
