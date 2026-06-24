@@ -68,6 +68,11 @@ def test_safe_builtins_and_helpers_are_allowed():
     assert validate_script(src).ok
 
 
+def test_generic_capability_global_is_allowed():
+    src = META + "result = await capability('tools.echo', {'x': 1})\nreturn result\n"
+    assert validate_script(src).ok
+
+
 # --------------------------------------------------------------------------- #
 # meta contract
 # --------------------------------------------------------------------------- #

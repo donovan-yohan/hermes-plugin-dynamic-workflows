@@ -33,6 +33,12 @@ from typing import Any, Callable, Optional
 
 from . import rpc
 from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_id, is_kanban_runner_id
+from .capabilities import (
+    CapabilityPolicy,
+    CapabilityRegistry,
+    normalize_capability_name,
+    safe_capability_metadata_value,
+)
 from .errors import (
     CapabilityDenied,
     CorruptScriptRunError,
@@ -78,7 +84,7 @@ JournalSink = Callable[[dict[str, Any]], None]
 
 # Capability methods the broker is willing to dispatch. Anything else is denied
 # regardless of what the (untrusted) subprocess sends.
-_ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "log", "phase", "workflow"})
+_ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "capability", "log", "phase", "workflow"})
 
 # Sentinel: a replay consult that found no cache entry for a call id (a miss),
 # so the broker must fall through to a live dispatch.
@@ -110,6 +116,7 @@ class VMLimits:
     max_rpc_calls: int = 1000
     max_agent_calls: int = 200
     max_kanban_calls: int = 100
+    max_capability_calls: int = 100
     max_runtime_s: float = 30.0
     allow_nested_workflows: bool = False
     token_budget: Optional[int] = None
@@ -187,6 +194,8 @@ class CapabilityBroker:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        capability_registry: Optional[CapabilityRegistry] = None,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._runner = agent_runner
         self._limits = limits
@@ -206,6 +215,8 @@ class CapabilityBroker:
         # a replay reattaches the same card rather than opening a duplicate.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        self._capability_registry = capability_registry
+        self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
         # Absolute wall-clock deadline for this run, set at construction (a few ms
         # before the subprocess spawns and the _drive watchdog arms). A durable
         # Kanban await is bounded by *this* shared deadline rather than a fresh
@@ -216,6 +227,7 @@ class CapabilityBroker:
         self._rpc_calls = 0
         self._agent_calls = 0
         self._kanban_calls = 0
+        self._capability_calls = 0
         self._tokens = 0
         self._replayed_calls = 0
         self.should_abort = False
@@ -291,7 +303,7 @@ class CapabilityBroker:
             self._emit(self._call_event(call_id, method, params, ok=False, error="runner_error"))
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
-                "error": {"code": "runner_error", "message": f"{type(exc).__name__}: {exc}"},
+                "error": {"code": "runner_error", "message": f"{type(exc).__name__} raised while dispatching brokered call"},
                 "budget": self._budget_info(),
             }
 
@@ -304,7 +316,7 @@ class CapabilityBroker:
         cache line is fail-safe — on replay the missing id is a miss and the call
         simply re-runs.
         """
-        if self._recorder is not None and self._is_cacheable(method):
+        if self._recorder is not None and self._is_cacheable(method, params):
             try:
                 self._recorder.record(call_id, method, replay_args_hash(method, params), value)
             except Exception:  # noqa: BLE001 — persistence is best-effort.
@@ -314,16 +326,25 @@ class CapabilityBroker:
         except Exception:  # noqa: BLE001 — journaling is best-effort.
             pass
 
-    def _is_cacheable(self, method: str) -> bool:
+    def _is_cacheable(self, method: str, params: dict[str, Any]) -> bool:
         """Whether a call's result may be written to the #3 replay cache.
 
         Mirrors :func:`is_replayable`, with one subtraction: a ``kanban_agent``
         served by a live :class:`KanbanBackend` is a durable external effect, not
         a pure function, so it is never cached. On replay it re-runs and the
         idempotency key reattaches the same card — no duplicate, no stale value.
+        Generic host capabilities are cacheable only when the host registered the
+        specific capability as replayable.
         """
         if method == "kanban_agent" and self._kanban_backend is not None:
             return False
+        if method == "capability":
+            if self._capability_registry is None:
+                return False
+            try:
+                return self._capability_registry.get(params.get("name", "")).replayable
+            except (CapabilityDenied, ValueError):
+                return False
         return is_replayable(method, deterministic_runner=self._deterministic_runner)
 
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
@@ -356,7 +377,9 @@ class CapabilityBroker:
             self._agent_calls += 1
         elif method == "kanban_agent":
             self._kanban_calls += 1
-        if method in ("agent", "kanban_agent") and isinstance(entry.value, dict):
+        elif method == "capability":
+            self._capability_calls += 1
+        if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
             usage = entry.value.get("_tokens")
             if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
                 self._tokens += usage
@@ -373,11 +396,56 @@ class CapabilityBroker:
             return self._handle_agent(params)
         if method == "kanban_agent":
             return self._handle_kanban(call_id, params)
+        if method == "capability":
+            return self._handle_capability(call_id, params)
         if method == "workflow":
             if not self._limits.allow_nested_workflows:
                 raise CapabilityDenied("nested workflows are not permitted", code="nested_denied")
             raise CapabilityDenied("nested workflows are not implemented in this slice", code="nested_unsupported")
         raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
+
+    def _handle_capability(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch one generic host-owned capability through the registry."""
+
+        raw_name = params.get("name")
+        if not isinstance(raw_name, str) or not raw_name:
+            raise CapabilityDenied("capability call requires a non-empty 'name'", code="bad_request")
+        try:
+            name = normalize_capability_name(raw_name)
+        except ValueError as exc:
+            raise CapabilityDenied(str(exc), code="bad_request") from exc
+        self._check_token_budget()
+        self._capability_calls += 1
+        if self._capability_calls > self._limits.max_capability_calls:
+            raise CapabilityDenied(
+                f"max_capability_calls ({self._limits.max_capability_calls}) exceeded", code="limit_capability"
+            )
+        if self._capability_registry is None:
+            raise CapabilityDenied("no capability registry configured for this run", code="capability_unavailable")
+        capability = self._capability_registry.get(name)
+        if self._replay is not None and capability.side_effect_class != "read_only" and not capability.replayable:
+            self.should_abort = True
+            self.abort_reason = (
+                f"replay cannot safely re-dispatch non-replayable capability {capability.name!r}; "
+                "register it as replayable and honor the provided idempotency_key, or split it outside replay"
+            )
+            raise CapabilityDenied(self.abort_reason, code="capability_replay_unsafe")
+        result = self._capability_registry.run(
+            capability.name,
+            params,
+            policy=self._capability_policy,
+            run_context={
+                "idempotency_root": self._idempotency_root,
+                "call_id": call_id,
+                "idempotency_key": f"{self._idempotency_root}:{call_id}",
+                "replay": self._replay is not None,
+            },
+        )
+        usage = result.get("_tokens")
+        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+            self._tokens += usage
+        _validate_output(result, params.get("schema"))
+        return result
 
     def _check_token_budget(self) -> None:
         """Hard ceiling: once the token budget is spent, deny further effects."""
@@ -682,8 +750,10 @@ class CapabilityBroker:
             event["agent_id"] = params.get("agent_id")
         if method in ("kanban_agent",):
             event["profile"] = params.get("profile")
+        if method in ("capability",):
+            event["capability"] = safe_capability_metadata_value(params.get("name"))
         if params.get("label"):
-            event["label"] = params.get("label")
+            event["label"] = safe_capability_metadata_value(params.get("label"))
         if error:
             event["error"] = error
         if replayed:
@@ -727,6 +797,8 @@ class WorkflowVM:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        capability_registry: Optional[CapabilityRegistry] = None,
+        capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._limits = limits if limits is not None else VMLimits()
@@ -739,6 +811,9 @@ class WorkflowVM:
         # Durable Kanban awaitable wiring (issue #5): forwarded to the broker.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        # Generic host-owned capability API wiring (issue #29): forwarded to the broker.
+        self._capability_registry = capability_registry
+        self._capability_policy = capability_policy
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -773,6 +848,8 @@ class WorkflowVM:
             deterministic_runner=self._deterministic_runner,
             kanban_backend=self._kanban_backend,
             idempotency_root=self._idempotency_root,
+            capability_registry=self._capability_registry,
+            capability_policy=self._capability_policy,
         )
         try:
             result = self._drive(script, args, broker, calls)
@@ -831,6 +908,7 @@ class WorkflowVM:
                 "limits": {
                     "max_rpc_calls": self._limits.max_rpc_calls,
                     "max_agent_calls": self._limits.max_agent_calls,
+                    "max_capability_calls": self._limits.max_capability_calls,
                     "max_runtime_s": self._limits.max_runtime_s,
                 },
                 "budget": {"total": self._limits.token_budget, "spent": 0,
@@ -988,6 +1066,7 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "max_rpc_calls": limits.max_rpc_calls,
         "max_agent_calls": limits.max_agent_calls,
         "max_kanban_calls": limits.max_kanban_calls,
+        "max_capability_calls": limits.max_capability_calls,
         "max_runtime_s": limits.max_runtime_s,
         "allow_nested_workflows": limits.allow_nested_workflows,
         "token_budget": limits.token_budget,
@@ -1115,6 +1194,7 @@ def _limits_from_view(view: Any) -> VMLimits:
         max_rpc_calls=_req_int(view, "max_rpc_calls", default.max_rpc_calls),
         max_agent_calls=_req_int(view, "max_agent_calls", default.max_agent_calls),
         max_kanban_calls=_req_int(view, "max_kanban_calls", default.max_kanban_calls),
+        max_capability_calls=_req_int(view, "max_capability_calls", default.max_capability_calls),
         max_runtime_s=_req_float(view, "max_runtime_s", default.max_runtime_s),
         allow_nested_workflows=_req_bool(
             view, "allow_nested_workflows", default.allow_nested_workflows
@@ -1139,6 +1219,8 @@ def run_script(
     replay_from: Optional[str] = None,
     deterministic_runner: Optional[bool] = None,
     kanban_backend: Optional[KanbanBackend] = None,
+    capability_registry: Optional[CapabilityRegistry] = None,
+    capability_policy: Optional[CapabilityPolicy] = None,
 ) -> ScriptRunResult:
     """Construct a :class:`WorkflowVM` and run one script, optionally durable.
 
@@ -1244,6 +1326,8 @@ def run_script(
             deterministic_runner=deterministic,
             kanban_backend=kanban_backend,
             idempotency_root=idempotency_root,
+            capability_registry=capability_registry,
+            capability_policy=capability_policy,
         )
         return vm.run(script, args=args, validate=validate)
 
@@ -1285,6 +1369,8 @@ def run_script(
         deterministic_runner=deterministic,
         kanban_backend=kanban_backend,
         idempotency_root=idempotency_root,
+        capability_registry=capability_registry,
+        capability_policy=capability_policy,
     )
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id

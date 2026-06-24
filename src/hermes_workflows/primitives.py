@@ -14,6 +14,7 @@ from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
 from .agents import AgentRunner, StubAgentRunner
+from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
@@ -64,6 +65,8 @@ def workflow(
     include_source: bool = False,
     include_versions: bool = False,
     replace: bool = False,
+    capability_registry: Optional[CapabilityRegistry] = None,
+    capability_policy: Optional[CapabilityPolicy] = None,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
 
@@ -157,6 +160,8 @@ def workflow(
             agent_runner=agent_runner,
             version=script_version,
             validate=validate,
+            capability_registry=capability_registry,
+            capability_policy=capability_policy,
         )
         return {"operation": "run_script", "script_name": script_name, "result": result.as_dict()}
     raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
@@ -388,6 +393,8 @@ def workflow_run_script(
     deterministic_runner: Optional[bool] = None,
     version: Optional[int] = None,
     kanban_backend: Optional["KanbanBackend"] = None,
+    capability_registry: Optional[CapabilityRegistry] = None,
+    capability_policy: Optional[CapabilityPolicy] = None,
 ) -> ScriptRunResult:
     """Load and run a saved Python workflow-script harness by catalog name."""
     active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
@@ -404,6 +411,8 @@ def workflow_run_script(
         replay_from=replay_from,
         deterministic_runner=deterministic_runner,
         kanban_backend=kanban_backend,
+        capability_registry=capability_registry,
+        capability_policy=capability_policy,
     )
 
 
@@ -431,6 +440,8 @@ def run_workflow_script(
     replay_from: Optional[str] = None,
     deterministic_runner: Optional[bool] = None,
     kanban_backend: Optional["KanbanBackend"] = None,
+    capability_registry: Optional[CapabilityRegistry] = None,
+    capability_policy: Optional[CapabilityPolicy] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -468,6 +479,8 @@ def run_workflow_script(
         replay_from=replay_from,
         deterministic_runner=deterministic_runner,
         kanban_backend=kanban_backend,
+        capability_registry=capability_registry,
+        capability_policy=capability_policy,
     )
 
 
