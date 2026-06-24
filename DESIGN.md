@@ -142,6 +142,7 @@ def workflow_status(
 | `primitives.py` | Public entry points; `workflow` facade plus explicit validate/run/status primitives. |
 | `catalog.py` | File-backed saved template catalog for safe `<name>.workflow.json` listing/loading. |
 | `script_catalog.py` | Versioned file-backed saved Python script harness catalog for validate/save/list/inspect/run-by-name flows (#29). |
+| `capabilities.py` | Generic host-owned capability registry/policy for workflow scripts: named handlers, side-effect class allowlists, approval ids, credential guards, and bounded output capture (#29). |
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
@@ -441,7 +442,7 @@ shape explicit and durable.
 `waits_from_loop_status` turns a loop's `waiting_for_event` / `waiting_for_approval`
 state and its suspension event into a uniform `WaitSummary` (§1.5);
 `waits_from_kanban_states` does the same for a `ScriptRunStore`'s non-terminal
-Kanban card states (§5.7). Durable Kanban waiting markers created through the VM
+Kanban card states (§5.8). Durable Kanban waiting markers created through the VM
 carry the logical run id from the `<logical_run_id>:<call_id>` idempotency key,
 and the store preserves that association across later state writes; for
 legacy/manual waits with no stored `run_id`, the plugin `status` path attaches
@@ -760,8 +761,8 @@ injects it via `registry=`.
 The declarative JSON runtime (§1.5) interprets a static AST. A second,
 additive execution mode lets the model author a **Python workflow script** — a
 deterministic orchestration brain in the Claude Dynamic Workflows shape
-(`agent()` / `kanban_agent()` / `parallel()` / `pipeline()` / `phase()` /
-`log()` / `workflow()`, plus `args` / `budget`). Because a script is real code,
+(`agent()` / `kanban_agent()` / `capability()` / `parallel()` / `pipeline()` /
+`phase()` / `log()` / `workflow()`, plus `args` / `budget`). Because a script is real code,
 it is **never executed inside the parent Hermes process**. It runs in a
 sandboxed subprocess; the parent owns every capability.
 
@@ -790,9 +791,10 @@ runtime is unchanged.
               │ boot           guest re-validates, then exec under restricted
               ▼                __builtins__ (allow-list only) and RPC-backed globals
    ┌──────────────────────┐   layer 3: capability broker (parent process)
-   │  CapabilityBroker     │   method allow-list, known-agent registry, output
-   │  .handle(call)        │   schema, budget + max_rpc/agent/kanban limits;
-   └──────────────────────┘   every request journaled with a stable call id
+   │  CapabilityBroker     │   method allow-list, known-agent/kanban gates,
+   │  .handle(call)        │   capability registry policy, output schema,
+   └──────────────────────┘   budget + max_rpc/agent/kanban/capability limits;
+                              every request journaled with a stable call id
 ```
 
 The layers are defence-in-depth and mutually distrustful. Even if the static
@@ -819,7 +821,25 @@ effects funnel through the same injected `AgentRunner` boundary as the JSON
 runtime (default `StubAgentRunner`), so script runs are reproducible and
 testable without a live Hermes.
 
-### 5.3 Failure containment and governance seam
+### 5.3 Generic capability registry and policy (#29)
+
+The `capability()` script global is the generic extension point for external tools/CLIs/session managers. Core does **not** ship a generic shell executor. Instead a host registers named handlers in `CapabilityRegistry`, for example `github.issue.view`, `relay.automation.status`, or `local.build.read_log`. Each registration declares a maximum `side_effect_class` from the same closed vocabulary used by scoped grants: `read_only`, `session_launch`, `session_control`, or `external_write`.
+
+Each run may pass a `CapabilityPolicy` to `run_workflow_script` / `workflow_run_script`:
+
+- `allowed_names` optionally narrows which registered names may be called;
+- `allowed_side_effect_classes` defaults to `("read_only",)`, so mutating handlers fail closed unless explicitly allowed;
+- `approval_required_classes` defaults to `session_launch`, `session_control`, and `external_write`; a script must supply an `approval_id` that appears in `approved_approval_ids` before those handlers run;
+- `max_stream_bytes` clips returned `stdout`, `stderr`, `summary`, and `error` strings and annotates them with `*_truncated` flags;
+- `max_result_bytes` fails closed if the total result is still too large after stream clipping.
+
+Capability request metadata (`input`, `label`, `approval_id`, `schema`) is rejected before dispatch if it contains credential-shaped keys/values. Handler results are credential-redacted before returning to the script or entering run state, and handler exceptions are collapsed to bounded generic capability errors rather than forwarding raw exception text. Journal entries remain metadata-only by default (`method`, `call_id`, redacted `capability`, redacted `label`, `ok`, `error`) unless the caller deliberately disables redaction for debugging.
+
+Replay/resume is fail-closed for generic side effects. The broker passes each handler `run.call_id` and `run.idempotency_key` (`<logical_run_id>:<stable_call_id>`). Registered capabilities are only written to the replay cache when `WorkflowCapability.replayable=True`; non-`read_only` capabilities that are not replayable are denied during replay rather than re-dispatched and duplicated. A replayable mutating handler must honor the idempotency key if it ever runs after a cache miss.
+
+This gives workflow scripts a reusable tool/CLI/session-manager seam without adding repo-specific primitives or smuggling ambient credentials into the subprocess.
+
+### 5.4 Failure containment and governance seam
 
 A subprocess crash, a CPU-spin timeout (`VMLimits.max_runtime_s`), a protocol
 breach, or an exit-without-result is mapped to a failed `ScriptRunResult` —
@@ -830,19 +850,19 @@ governance surface; launch-approval/session routing remain parent-owned future
 work. Journal events are metadata-only by default (method, call id, agent
 id/profile, ok) — raw inputs/outputs and prompts are redacted.
 
-### 5.4 What is intentionally deferred
+### 5.5 What is intentionally deferred
 
 The #2 slice proved the subprocess VM, the parent-owned RPC broker, the static
 launch gate, and capability enforcement with tests. The durable run store and
-deterministic replay cache (#3) are now implemented additively (see §5.6).
+deterministic replay cache (#3) are now implemented additively (see §5.7).
 Still out of scope here (tracked by #4/#11): the full script-API surface with
 loop guards and richer helpers (#4), true concurrent fan-out, general resume from
 a *partial* run (this slice replays a *completed* run; a run suspended on a Kanban
-await now resumes via §5.9, but resuming an arbitrarily-interrupted run from its
+await now resumes via §5.10, but resuming an arbitrarily-interrupted run from its
 last completed step is still future), no-duplicate-Kanban side-effect dedup, and
 launch-approval/session-policy governance (#11).
 
-### 5.5 Saved script harness catalog (issue #29)
+### 5.6 Saved script harness catalog (issue #29)
 
 `script_catalog.py` turns the VM into a reusable harness library instead of a
 one-off script launcher. A saved harness is a Python workflow script with a safe
@@ -875,7 +895,7 @@ This gives loop-engineering agents a generic "save this capability harness and
 reuse it by name" substrate without granting scripts direct filesystem/network
 access or hardcoding repo-specific primitives.
 
-### 5.6 Durable script run store and deterministic replay cache (issue #3)
+### 5.7 Durable script run store and deterministic replay cache (issue #3)
 
 The broker journals each capability request with a **stable, ascending call id**
 (1, 2, 3, ...) minted by the guest's RPC client. Because a workflow script is
@@ -949,7 +969,7 @@ script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
 
-### 5.7 `kanban_agent` as a durable awaitable (issue #5)
+### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
 `kanban.py` upgrades `kanban_agent` from a synchronous stub call into a
 **durable, idempotent awaitable**, owned entirely by the parent broker — the
@@ -964,7 +984,7 @@ and tests are unchanged.
 
 **Idempotency / no duplicate on replay.** The broker keys each card by
 `<logical_run_id>:<stable_call_id>`. The call id is reproducible across a replay
-(§5.6), and a replay inherits the source run's id as the root (via
+(§5.7), and a replay inherits the source run's id as the root (via
 `replay_from`), so create/reattach converges on **one** card per logical step.
 Critically, a live Kanban call is a durable external effect, **not** a pure
 function, so it is *excluded from the #3 replay cache* — on replay it re-runs and
@@ -1038,10 +1058,10 @@ parent restart (composing with `DurableKanbanBackend` for the recorded-outcome
 half), and defer dispatch to the gateway (the workflow only creates/waits — no
 duplicate dispatcher). The remaining item — a true `pause` of an *unresolved* card
 that persists the suspended run and resumes it in a fresh process from a replayed
-event rather than holding a thread — now ships as a seam (§5.9); what a real
+event rather than holding a thread — now ships as a seam (§5.10); what a real
 backend still owns is durably *producing* the wakeup event from the worker side.
 
-### 5.10 Real Hermes Kanban backend adapter (issue #5)
+### 5.11 Real Hermes Kanban backend adapter (issue #5)
 
 `hermes_kanban.py` is the production-shaped backend that closes the
 "documented/stubbed, not implemented" residual. `HermesKanbanBackend` implements
@@ -1067,7 +1087,7 @@ re-implementing it:
   guarantee.
 
 * **resolve from real terminal events.** `await_resolution` delegates to a
-  composed `EventLogKanbanBackend` (§5.7), so the await is event-driven from the
+  composed `EventLogKanbanBackend` (§5.8), so the await is event-driven from the
   durable log, bounded by the run deadline, and honours `after_version` and the
   `on_block` policy. The narrow **Kanban task-event bridge** (the only #7 seam
   this slice touches) is `map_hermes_terminal_status` /
@@ -1089,9 +1109,9 @@ This is a **library/operator** backend injected via
 tool. Production residuals (tracked for the gateway integration, not this slice):
 durably *producing* terminal events from the worker side, a `hermes kanban
 comment` path for board-side result-validation diagnostics, and a cross-host
-notifier transport (§5.7).
+notifier transport (§5.8).
 
-### 5.8 Structured result contracts for Kanban tasks (issue #6)
+### 5.9 Structured result contracts for Kanban tasks (issue #6)
 
 A workflow cannot safely branch on a prose summary. When `kanban_agent` is given
 a `schema=`, that schema is treated as a **template-guided payload schema over a
@@ -1121,18 +1141,18 @@ script can branch on, or to a deterministic block — never to unvalidated prose
 dressed as success. The worker-side enforcement (a Kanban tool that rejects a
 completion lacking a valid `metadata.workflow_result`) is the production
 counterpart to this parent-side validation and remains future work alongside the
-real Kanban backend (§5.7).
+real Kanban backend (§5.8).
 
-### 5.9 Durable suspend/resume of an unresolved paused await (issue #5)
+### 5.10 Durable suspend/resume of an unresolved paused await (issue #5)
 
-§5.7 made `on_block="pause"` keep awaiting a card until a terminal event, bounded
+§5.8 made `on_block="pause"` keep awaiting a card until a terminal event, bounded
 by the run's wall-clock limit — an *in-process* hold that, on a card that never
 resolves in time, simply failed the run with `kanban_timeout`. This slice closes
 the last residual of the durable-pause story: a paused, **unresolved** card now
 *suspends* the run rather than holding a thread to the deadline, and a fresh
 process *resumes* it from a replayed event. It reuses the existing pieces (the
 durable card-state file, the append-only event log, and the notifier/event-log
-backend of §5.7) — no new store layout, no cross-host transport.
+backend of §5.8) — no new store layout, no cross-host transport.
 
 **Opt-in suspend window.** `VMLimits.kanban_suspend_after_s` (default `None`,
 preserving the prior block-to-deadline behaviour) bounds how long a paused await
@@ -1149,18 +1169,18 @@ back to the script, so suspension mirrors the existing `should_abort` path: the
 broker sets `should_suspend` + `suspend_info` (the metadata-safe `card_id` /
 `profile` / `call_id` / `on_block`) and the VM kills the subprocess — the script's
 in-subprocess local state is discarded, which is safe because a resume re-runs the
-script from scratch over the §5.6 replay cache. The run is reported as a distinct
+script from scratch over the §5.7 replay cache. The run is reported as a distinct
 `ScriptRunResult(suspended=True)` (it is neither `succeeded` nor `failed`) and
 recorded with `run.json` status `suspended`; `ScriptRunStore.suspended_runs()` is
 the operator/resumer-facing discovery view.
 
 **Resume is just replay.** Resuming a suspended run is the ordinary
-`run_workflow_script(..., replay_from=<suspended_run_id>)` path (§5.6). The replay
+`run_workflow_script(..., replay_from=<suspended_run_id>)` path (§5.7). The replay
 re-runs the script: deterministic calls before the pause are served from the
 cache, and the paused `kanban_agent` reattaches the **same** content-addressed
 card (its idempotency key keys on the original logical run, stable across the
 replay) and reads the durable event log. If a worker/gateway — possibly a
-different process — has since durably appended a terminal event (§5.7's
+different process — has since durably appended a terminal event (§5.8's
 `publish_kanban_event`), the await resolves and the run completes; if the card is
 still unresolved, the run suspends again. Because the Kanban await is excluded
 from the replay cache, the resume never serves a stale value: it always re-reads
@@ -1173,9 +1193,9 @@ suspended run is resumed when something re-invokes `run_workflow_script` with
 `replay_from` (an operator, a cron, a gateway callback). The parent does not itself
 hold the suspension open. Durably *producing* the wakeup event from the worker
 side, and a cross-host notification transport, remain the production residuals
-(§5.7).
+(§5.8).
 
-### 5.5 Adversarial review and residual limitations
+### 5.12 Adversarial review and residual limitations
 
 The validator/guest/broker boundary was red-teamed with an independent
 multi-agent review whose findings were each reproduced against the real VM.
@@ -1301,8 +1321,8 @@ Near-term and future work, roughly in priority order:
    realized as a first-class feature. The script-VM side now ships the first
    piece of this: a durable `ScriptRunStore` plus a deterministic replay cache
    that re-runs a *completed* script without duplicating deterministic RPC work
-   (§5.6, issue #3), and a run *suspended* on an unresolved paused Kanban await now
-   resumes in a fresh process from a replayed event (§5.9, issue #5). Remaining:
+   (§5.7, issue #3), and a run *suspended* on an unresolved paused Kanban await now
+   resumes in a fresh process from a replayed event (§5.10, issue #5). Remaining:
    general resume from a *partial* run (arbitrary mid-step interruption) and dedup
    of durable side effects (e.g. no-duplicate Kanban task creation) on rerun.
 
@@ -1319,7 +1339,7 @@ Near-term and future work, roughly in priority order:
    scrubbed environment, a static launch gate, restricted builtins, and a
    parent-owned RPC capability broker — without a JS engine or any runtime
    dependency. Durable journal + deterministic replay for scripts (#3) now ships
-   additively (§5.6). Remaining work: the full script API with loop guards (#4),
+   additively (§5.7). Remaining work: the full script API with loop guards (#4),
    resume from a partial run, and resource quotas beyond the wall-clock timeout
    and call-count caps.
 

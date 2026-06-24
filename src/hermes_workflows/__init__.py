@@ -43,6 +43,14 @@ from .models import (
 )
 from .script_validator import ScriptValidation, validate_script
 from .runtime import GovernancePolicy
+from .capabilities import (
+    CapabilityHandler,
+    WorkflowCapability,
+    CapabilityPolicy,
+    CapabilityRegistry,
+    UnknownWorkflowCapability,
+    normalize_capability_name,
+)
 from .loops import (
     LoopEvent,
     FileLoopRunStore,
@@ -232,6 +240,13 @@ __all__ = [
     "workflow_inspect_script",
     "workflow_run_script",
     "GovernancePolicy",
+    # generic workflow-script capability API (issue #29)
+    "CapabilityHandler",
+    "WorkflowCapability",
+    "CapabilityPolicy",
+    "CapabilityRegistry",
+    "UnknownWorkflowCapability",
+    "normalize_capability_name",
     # subprocess workflow VM (issue #2)
     "loop_validate",
     "loop_run",

@@ -12,8 +12,9 @@ no Hermes credentials. It:
    (defence in depth: the transport is never trusted);
 4. compiles the script into a private async entrypoint and executes it with a
    restricted ``__builtins__`` and only RPC-backed capability globals;
-5. routes every ``agent`` / ``kanban_agent`` / ``log`` / ``phase`` / ``workflow``
-   call back to the parent broker and blocks for the structured response;
+5. routes every ``agent`` / ``kanban_agent`` / ``capability`` / ``log`` /
+   ``phase`` / ``workflow`` call back to the parent broker and blocks for the
+   structured response;
 6. reports the final return value (or the script's exception) in a ``done``
    frame and exits.
 
@@ -199,6 +200,13 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
         return conn.call("workflow", {"name": name, "args": args})
 
+    async def capability(name: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
+                         approval_id: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
+        return conn.call(
+            "capability",
+            {"name": name, "input": input or {}, "label": label, "approval_id": approval_id, "schema": schema},
+        )
+
     def log(message: Any) -> None:
         conn.call("log", {"message": str(message)})
 
@@ -231,6 +239,7 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
         "meta": meta,
         "agent": agent,
         "kanban_agent": kanban_agent,
+        "capability": capability,
         "workflow": workflow,
         "log": log,
         "phase": phase,

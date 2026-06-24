@@ -127,13 +127,14 @@ def script_run_id(script: str, args: Any = None) -> str:
 def replay_args_hash(method: str, params: dict[str, Any]) -> str:
     """Canonical integrity hash of a capability call's *semantic* arguments.
 
-    The cosmetic ``label`` (display-only, does not affect a call's result) is
-    excluded so a relabelled-but-equivalent call still replays. Everything else
-    in ``params`` (``agent_id``/``profile``, ``input``, ``task``, ``schema``)
-    participates, so any change that could change the result is detected as a
-    replay mismatch.
+    The cosmetic ``label`` (display-only for built-in agent calls) is excluded so
+    a relabelled-but-equivalent call still replays. Generic host capabilities
+    receive ``label`` in handler context, so their full params participate.
     """
-    keyed = {k: v for k, v in params.items() if k != "label"}
+    if method == "capability":
+        keyed = dict(params)
+    else:
+        keyed = {k: v for k, v in params.items() if k != "label"}
     return canonical_hash({"method": method, "params": keyed})
 
 

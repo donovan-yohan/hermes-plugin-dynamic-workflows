@@ -39,6 +39,7 @@ The current runtime supports:
 - parent-owned filesystem run storage for plugin use: `snapshot.json` + compact `journal.jsonl`
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
 - a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`)
+- a generic **host-owned capability API** for workflow scripts: scripts call `await capability("name", input)`; the parent dispatches only explicitly registered handlers through `CapabilityRegistry` / `CapabilityPolicy`, with side-effect-class allowlists, approval ids for mutating classes, credential rejection/redaction, and bounded stdout/stderr/summary/error capture
 - a versioned **saved script harness catalog**: validate, save, list, inspect, and run reusable Python workflow-script harnesses by name/version via `FileWorkflowScriptCatalog` and `workflow` actions (`script_catalog`, `script_save`, `script_inspect`, `run_script`)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
@@ -270,7 +271,7 @@ only adds the runtime-enforceable backpressure/allowlist substrate.
 
 ### Saved script harness catalog (#29 first slice)
 
-Declarative `.workflow.json` templates are useful when the flow is known ahead of time. #29 adds the parallel surface for reusable **Python workflow-script harnesses**: a model can author a small script using the safe VM capability globals (`agent`, `kanban_agent`, `parallel`, `pipeline`, `phase`, `log`, `workflow`), validate/save it, list/inspect it later, and run it by name with repo/tool values supplied as `script_args`.
+Declarative `.workflow.json` templates are useful when the flow is known ahead of time. #29 adds the parallel surface for reusable **Python workflow-script harnesses**: a model can author a small script using the safe VM capability globals (`agent`, `kanban_agent`, `capability`, `parallel`, `pipeline`, `phase`, `log`, `workflow`), validate/save it, list/inspect it later, and run it by name with repo/tool values supplied as `script_args`.
 
 Storage is versioned and path-safe. New saves append after the highest visible
 version across all configured roots; explicit versions are immutable unless
@@ -311,6 +312,35 @@ workflow(
 ```
 
 Safety boundaries are the same as the subprocess VM: no imports, no direct filesystem/network/process/env access, restricted builtins, scrubbed environment, bounded RPC/runtime limits, and every effect must cross the parent-owned capability broker.
+
+### Generic host-owned capabilities (#29)
+
+Workflow scripts may request explicitly registered host capabilities without Dynamic Workflows adding a new primitive for every external tool:
+
+```python
+from hermes_workflows import CapabilityPolicy, CapabilityRegistry, run_workflow_script
+
+registry = CapabilityRegistry()
+registry.register(
+    "github.issue.view",
+    lambda ctx: {"ok": True, "output": {"issue": ctx["input"]["issue"]}},
+    side_effect_class="read_only",
+    description="host-owned GitHub issue lookup",
+)
+
+result = run_workflow_script(
+    'meta = {"name": "demo", "description": "d"}\n'
+    'info = await capability("github.issue.view", {"issue": args["issue"]})\n'
+    'return info\n',
+    args={"issue": 29},
+    capability_registry=registry,
+    capability_policy=CapabilityPolicy(allowed_names=("github.issue.view",)),
+)
+```
+
+The default policy allows only `read_only` registered capabilities. `session_launch`, `session_control`, and `external_write` classes require both an allowed side-effect class and an `approval_id` listed in `CapabilityPolicy.approved_approval_ids`. Capability request metadata (`input`, `label`, `approval_id`, `schema`) rejects credential-shaped payloads before dispatch; journal labels are redacted defensively; handler exceptions are returned as generic bounded capability errors rather than raw exception text. Returned values are credential-redacted and have bounded `stdout`, `stderr`, `summary`, and `error` strings before they can reach script output or run state.
+
+Durable replay is fail-closed for side effects. Every handler receives `run.call_id` and `run.idempotency_key` (`<logical_run_id>:<stable_call_id>`). A non-`read_only` capability that is not registered with `replayable=True` will not be re-dispatched during replay/resume; replayable capabilities may be cached after success, and if they must re-run after a cache miss they are expected to honor the idempotency key. Core still does not provide a generic shell escape — CLI/tool adapters must live in the host that owns the policy, approval, and idempotency boundary.
 
 ### Event-driven PR validation lane (#10)
 
