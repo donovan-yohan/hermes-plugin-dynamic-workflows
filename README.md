@@ -40,6 +40,7 @@ The current runtime supports:
 - a Hermes plugin entrypoint: `plugin.yaml` + root `__init__.py::register(ctx)`
 - a subprocess **workflow script VM**: run model-authored Python orchestration scripts out-of-process under a static launch gate, scrubbed env, restricted builtins, and a parent-owned RPC capability broker (library/operator primitives `workflow_validate_script` / `run_workflow_script`)
 - a generic **host-owned capability API** for workflow scripts: scripts call `await capability("name", input)`; the parent dispatches only explicitly registered handlers through `CapabilityRegistry` / `CapabilityPolicy`, with side-effect-class allowlists, approval ids for mutating classes, credential rejection/redaction, and bounded stdout/stderr/summary/error capture
+- a backend-neutral **workflow event broker** for GitHub/webhook-style wakeups: producers publish stable external events once, runs wait on source/type/subject/payload predicates with `after_version`, duplicates are idempotent, and file-backed events survive restart without timer polling
 - a versioned **saved script harness catalog**: validate, save, list, inspect, and run reusable Python workflow-script harnesses by name/version via `FileWorkflowScriptCatalog` and `workflow` actions (`script_catalog`, `script_save`, `script_inspect`, `run_script`)
 - a first **loop-controller** slice for feedback-driven agent workflows: validate a generic loop spec, run injected sensors/verifiers and actuators through explicit controller states, retry noisy sensors once, and halt on step/time/budget/stall brakes without trusting agent self-report
 - backend-neutral **scoped actuator grants**: a loop actuator requests an explicit, expiring, audited session-launch/control grant through an injected broker instead of holding a raw shell token or browser cookie; issued handles persist and re-validate across restarts, and denied/expired/credential-bearing grants fail closed in `halted_grant_denied`
@@ -341,6 +342,46 @@ result = run_workflow_script(
 The default policy allows only `read_only` registered capabilities. `session_launch`, `session_control`, and `external_write` classes require both an allowed side-effect class and an `approval_id` listed in `CapabilityPolicy.approved_approval_ids`. Capability request metadata (`input`, `label`, `approval_id`, `schema`) rejects credential-shaped payloads before dispatch; journal labels are redacted defensively; handler exceptions are returned as generic bounded capability errors rather than raw exception text. Returned values are credential-redacted and have bounded `stdout`, `stderr`, `summary`, and `error` strings before they can reach script output or run state.
 
 Durable replay is fail-closed for side effects. Every handler receives `run.call_id` and `run.idempotency_key` (`<logical_run_id>:<stable_call_id>`). A non-`read_only` capability that is not registered with `replayable=True` will not be re-dispatched during replay/resume; replayable capabilities may be cached after success, and if they must re-run after a cache miss they are expected to honor the idempotency key. Core still does not provide a generic shell escape — CLI/tool adapters must live in the host that owns the policy, approval, and idempotency boundary.
+
+### Generic workflow event broker (#7)
+
+Kanban task events have their own durable log; #7 also needs a backend-neutral seam for non-card events such as GitHub webhooks. `events.py` provides that seam without adding polling or a phase-advancement daemon:
+
+```python
+from hermes_workflows import (
+    FileWorkflowEventStore,
+    FifoWorkflowEventNotifier,
+    WorkflowEventBroker,
+    WorkflowEventPredicate,
+    publish_github_webhook_event,
+)
+
+store = FileWorkflowEventStore("/tmp/workflow-events")
+notifier = FifoWorkflowEventNotifier("/tmp/workflow-events/events.notify")
+
+# webhook producer path
+published = publish_github_webhook_event(
+    store,
+    notifier,
+    payload,
+    headers={"X-GitHub-Event": "check_run", "X-GitHub-Delivery": "delivery-id"},
+)
+
+# workflow/controller wait path
+broker = WorkflowEventBroker(store, notifier)
+event = broker.wait_for(
+    WorkflowEventPredicate(
+        source="github",
+        event_type="github.check_run.completed",
+        subject="github:owner/repo:check_run:123",
+        payload_match={"check_run.head_sha": "abc123", "check_run.conclusion": "success"},
+        after_version=0,
+    ),
+    timeout=30,
+)
+```
+
+`event_id` makes webhook retries idempotent; the store assigns monotonic `version`s so waiters can ignore stale delivery with `after_version`; `FileWorkflowEventStore` persists JSONL events so a process restart can consume an event that arrived while the workflow was down. File-backed append/read uses a POSIX lock file so multiple local producer processes share one version stream; non-POSIX hosts should provide a real shared store for production multi-process writes. `ThreadWorkflowEventNotifier` is same-process, while `FifoWorkflowEventNotifier` gives a single-host cross-process wakeup hint; missed FIFO wakeups are safe because waiters always re-read the durable store on bounded idle wake. GitHub normalization stores compact PR/issue/check/deployment metadata, validates webhook event/action components, drops headers after using delivery/event names, and redacts credential-shaped payload values. This is intentionally just the durable wakeup substrate — host webhook receivers and workflow/controller phase policy decide when to publish and what to do after a match.
 
 ### Event-driven PR validation lane (#10)
 
