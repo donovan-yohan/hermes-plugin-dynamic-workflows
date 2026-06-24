@@ -131,6 +131,21 @@ class StubAgentRunner:
 
         if agent_id.startswith("kanban."):
             profile = agent_id.split(".", 1)[1]
+            task = input.get("task") if isinstance(input.get("task"), dict) else {}
+            call_input = input.get("input") if isinstance(input.get("input"), dict) else {}
+            contract = task.get("return_contract") if isinstance(task, dict) else None
+            if isinstance(contract, dict) and {"approved", "head_sha"}.issubset(contract):
+                expected = task.get("expected_head_sha") if isinstance(task, dict) else None
+                head_value = call_input.get("head_sha") if isinstance(call_input, dict) else None
+                head_sha = str(head_value or expected or "stub-head-sha")
+                return {
+                    "task_id": f"kb_{digest}",
+                    "profile": profile,
+                    "status": "succeeded",
+                    "approved": True,
+                    "head_sha": head_sha,
+                    "blockers": [],
+                }
             return {
                 "task_id": f"kb_{digest}",
                 "profile": profile,

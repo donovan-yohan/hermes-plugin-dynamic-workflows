@@ -896,6 +896,18 @@ This gives loop-engineering agents a generic "save this capability harness and
 reuse it by name" substrate without granting scripts direct filesystem/network
 access or hardcoding repo-specific primitives.
 
+The bundled `generic_issue_lifecycle` script is the #8 flagship harness rather
+than a fake profile demo. It accepts repo/issue/base/workspace/board/tenant and a
+`profile_bindings` map at runtime, then performs the lifecycle with brokered
+calls only: issue inventory, planner Kanban card, implementer Kanban card,
+`hermes.github.pr_head` exact-head snapshot, reviewer + QA Kanban gates, a
+bounded fixer loop controlled by `max_fix_attempts`, `hermes.github.release_exact_head`, and an ops closeout
+card. Review/QA gates are strict: workers must return `approved: true` and the
+current `head_sha`; missing approval/head values block release rather than
+silently passing. The default stub runner can execute the graph end-to-end for dry runs; a
+live host swaps in real Kanban/profile bindings and GitHub head/release agents
+without changing the script source.
+
 ### 5.7 Durable script run store and deterministic replay cache (issue #3)
 
 The broker journals each capability request with a **stable, ascending call id**

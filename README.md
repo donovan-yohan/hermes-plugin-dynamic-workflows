@@ -284,7 +284,9 @@ $HERMES_HOME/dynamic-workflows/scripts/<script_name>/v000001.workflow.py
 $HERMES_HOME/dynamic-workflows/scripts/<script_name>/v000001.meta.json
 ```
 
-The catalog reads package-bundled examples from `hermes_workflows/examples/scripts/` (and the repository mirror at `examples/scripts/` in source checkouts). The bundled `generic_issue_lifecycle` harness demonstrates a non-repo-specific issue lifecycle lane: `repo`, `issue`, `workspace`, `review_profile`, and `qa_profile` are runtime args rather than hardcoded primitives.
+The catalog reads package-bundled examples from `hermes_workflows/examples/scripts/` (and the repository mirror at `examples/scripts/` in source checkouts). The bundled `generic_issue_lifecycle` harness demonstrates a non-repo-specific GitHub issue lifecycle lane: repo/issue/base/workspace/board/tenant and every worker profile are runtime args, not hardcoded deployment names. It loads issue context once, plans one slice, awaits implementation/review/QA Kanban cards, validates the exact PR head, loops through up to `max_fix_attempts` fixer cards, and asks ops to release/close out only after review and QA explicitly return `{approved: true, head_sha: <current head>}`.
+
+Bind local profiles with `profile_bindings` (`planner`, `implementer`, `reviewer`, `qa`, optional `fixer`, `ops`). Older `*_profile` args are still accepted as compatibility fallbacks. `board`, `tenant`, and `workspace` are forwarded to the Kanban backend; with the default stub runner the same script exercises the graph without live workers.
 
 ```python
 from hermes_workflows.primitives import workflow
@@ -304,10 +306,17 @@ workflow(
     script_name="generic_issue_lifecycle",
     script_args={
         "repo": "owner/project",
-        "issue": 29,
+        "issue_number": 29,
+        "base_branch": "main",
         "workspace": "/repo",
-        "review_profile": "reviewer",
-        "qa_profile": "qa",
+        "board": "engineering",
+        "profile_bindings": {
+            "planner": "planner",
+            "implementer": "impl",
+            "reviewer": "reviewer",
+            "qa": "qa",
+            "ops": "ops",
+        },
     },
 )
 ```
