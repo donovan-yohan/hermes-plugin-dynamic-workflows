@@ -143,6 +143,7 @@ def workflow_status(
 | `catalog.py` | File-backed saved template catalog for safe `<name>.workflow.json` listing/loading. |
 | `script_catalog.py` | Versioned file-backed saved Python script harness catalog for validate/save/list/inspect/run-by-name flows (#29). |
 | `capabilities.py` | Generic host-owned capability registry/policy for workflow scripts: named handlers, side-effect class allowlists, approval ids, credential guards, and bounded output capture (#29). |
+| `events.py` | Backend-neutral workflow event broker for non-Kanban events: durable event ids/versions, predicate waits, GitHub webhook normalization, and no-poll wakeups (#7). |
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
@@ -1195,7 +1196,19 @@ hold the suspension open. Durably *producing* the wakeup event from the worker
 side, and a cross-host notification transport, remain the production residuals
 (§5.8).
 
-### 5.12 Adversarial review and residual limitations
+### 5.12 Generic workflow event broker for GitHub/webhook wakeups (issue #7)
+
+Kanban awaits use the task event log above. Non-card signals (GitHub PR/check/review/deployment webhooks, gateway-origin events, future external predicates) use `events.py`:
+
+- `WorkflowEvent` is a durable, credential-redacted event envelope with stable `event_id`, `source`, `event_type`, `subject`, monotonic store-assigned `version`, and compact `payload`.
+- `WorkflowEventPredicate` matches `source` / `event_type` / `subject` / dotted `payload_match` fields and ignores stale events with `after_version`; stores expose `current_version()` so callers can register "from now" waits without racing old events.
+- `InMemoryWorkflowEventStore` and `FileWorkflowEventStore` append idempotently by `event_id`; duplicate webhook delivery returns the original stored version. The file store uses a POSIX lock file for multi-process local writers and degrades to in-process locking on non-POSIX hosts.
+- `WorkflowEventBroker.wait_for(...)` checks the durable store first, then blocks on an injected notifier between reads. `ThreadWorkflowEventNotifier` is same-process; `FifoWorkflowEventNotifier` is a single-host cross-process wakeup channel. The notifier is only a wakeup hint; the file/event store is the source of truth, so process restart after event arrival still works and missed wakeups degrade to bounded idle re-read.
+- `workflow_event_from_github_webhook` / `publish_github_webhook_event` normalize GitHub webhook payloads into compact PR/issue/check/deployment subjects without performing any GitHub API polling. GitHub event/action components are validated before becoming `event_type`; headers are not persisted.
+
+This intentionally stops at the event substrate. A host webhook receiver owns authenticity checks and calls the producer helper. A workflow/controller owns phase policy after a matched event. Dynamic Workflows core does not run a daemon, timer poller, or dispatcher.
+
+### 5.13 Adversarial review and residual limitations
 
 The validator/guest/broker boundary was red-teamed with an independent
 multi-agent review whose findings were each reproduced against the real VM.

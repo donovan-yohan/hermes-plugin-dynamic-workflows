@@ -51,6 +51,21 @@ from .capabilities import (
     UnknownWorkflowCapability,
     normalize_capability_name,
 )
+from .events import (
+    WorkflowEvent,
+    WorkflowEventPredicate,
+    WorkflowEventStore,
+    InMemoryWorkflowEventStore,
+    FileWorkflowEventStore,
+    WorkflowEventNotifier,
+    ThreadWorkflowEventNotifier,
+    FifoWorkflowEventNotifier,
+    WorkflowEventBroker,
+    publish_workflow_event,
+    publish_github_webhook_event,
+    workflow_event_from_github_webhook,
+    match_workflow_event,
+)
 from .loops import (
     LoopEvent,
     FileLoopRunStore,
@@ -247,6 +262,20 @@ __all__ = [
     "CapabilityRegistry",
     "UnknownWorkflowCapability",
     "normalize_capability_name",
+    # generic workflow event broker (issue #7)
+    "WorkflowEvent",
+    "WorkflowEventPredicate",
+    "WorkflowEventStore",
+    "InMemoryWorkflowEventStore",
+    "FileWorkflowEventStore",
+    "WorkflowEventNotifier",
+    "ThreadWorkflowEventNotifier",
+    "FifoWorkflowEventNotifier",
+    "WorkflowEventBroker",
+    "publish_workflow_event",
+    "publish_github_webhook_event",
+    "workflow_event_from_github_webhook",
+    "match_workflow_event",
     # subprocess workflow VM (issue #2)
     "loop_validate",
     "loop_run",
