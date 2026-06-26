@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes_workflows"
 version = "0.1.0"
-description = "Sandboxed, script-led dynamic workflow orchestration over Hermes agents and Kanban awaitables (pure-stdlib skeleton)."
+description = "Resumable, inspectable dynamic workflow orchestration for Hermes Agent."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Donovan Yohan" }]
 keywords = ["hermes", "workflows", "orchestration", "agents", "sandbox"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Topic :: Software Development :: Libraries",
