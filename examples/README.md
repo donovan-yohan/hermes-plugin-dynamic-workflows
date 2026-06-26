@@ -61,7 +61,7 @@ recorded, and progress `2 / 2`.
 The `run_id` follows the scheme `wf_<def_hash8>_<uuid12>`, so it sorts by
 source definition and correlates back to the workflow via its `def_hash`.
 
-## `hello_script.workflow.py` — subprocess script VM (issue #2)
+## `hello_script.workflow.py` — subprocess script VM
 
 A Python *script* counterpart to `hello.workflow.json`. Instead of a declarative
 AST, it is deterministic orchestration code that runs in a sandboxed subprocess
@@ -85,7 +85,7 @@ Expected: `validate ok: True`, `run ok: True value: {"greeting": "hello, world",
 ids. Pass `agent_runner=` to `run_workflow_script` to swap in a real Hermes
 fan-out, or `limits=VMLimits(...)` to tighten budgets and caps.
 
-## `scoped_session_grant.json` — scoped actuator grants (issue #33)
+## `scoped_session_grant.json` — scoped actuator grants
 
 A documentation-only shape file for backend-neutral session-launch grants. It is
 **not** a workflow definition and is **not** loaded by the catalog. It shows the
@@ -117,27 +117,21 @@ Expected: `granted: True`, a `handle` carrying only `session_id` /
 expired, or credential-bearing grant fails closed instead — see
 `DESIGN.md §1.5.1` and the README "Scoped actuator grants" section.
 
-## `release_ops_resource_closeout.py` — ATH + Relay resource finalizers
+## `release_ops_resource_closeout.py` — resource finalizers
 
-A runnable release-ops closeout example for issue #52 / #31. It uses the real
-Dynamic Workflows loop controller and `ResourceFinalizerRegistry`, declares both
-ATH and Relay resources, and dispatches production action names:
+A runnable release-ops closeout example for the loop controller and
+`ResourceFinalizerRegistry`. It declares two credential-free resources and dispatches
+host-owned finalizer action names through local stand-in handlers, so this package
+stays backend-neutral and dependency-free.
 
-- `ath.listener.retire`
-- `relay.automation_run.retire`
-
-The file intentionally uses local stand-in handlers so this package stays
-backend-neutral and dependency-free. In production, the host process registers the
-real adapters in their owning repos instead:
+Production hosts register their own adapters for the action strings they own:
 
 ```python
 from hermes_workflows import ResourceFinalizerRegistry
-from async_threads.finalizers import register_ath_finalizers
 
 finalizers = ResourceFinalizerRegistry()
-register_ath_finalizers(finalizers, registry=async_thread_registry, secret_root=secret_root)
-# Relay registers `relay.automation_run.retire` from its own runtime/adapter
-# boundary; Dynamic Workflows core should not import Relay internals.
+finalizers.register("ath.listener.retire", retire_listener)
+finalizers.register("relay.automation_run.retire", retire_automation_run)
 ```
 
 Run the zero-dependency smoke:
@@ -147,8 +141,8 @@ PYTHONPATH=src python examples/release_ops_resource_closeout.py
 ```
 
 Expected: terminal `converged` state and two succeeded finalizer results. The
-example retires the Relay automation/watchdog record only; artifact-preserving
-child-session/process termination remains Relay-owned follow-up work.
+example only retires the declared automation/listener records; child-session or
+process termination remains the responsibility of the host adapter.
 
 ## Notes
 

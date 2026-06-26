@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes_workflows"
 version = "0.1.0"
-description = "Sandboxed, script-led dynamic workflow orchestration over Hermes agents and Kanban awaitables (pure-stdlib skeleton)."
+description = "Resumable, inspectable dynamic workflow orchestration for Hermes Agent."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
