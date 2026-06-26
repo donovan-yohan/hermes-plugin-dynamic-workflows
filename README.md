@@ -2,10 +2,10 @@
 
 > **Turn “go do this multi-step agent thing” into a resumable, inspectable workflow.**
 >
-> Dynamic Workflows gives Hermes Agent one `workflow` tool for validating, running,
-> pausing, resuming, and inspecting agent workflows made of deterministic steps,
-> durable waits, event wakeups, guarded script harnesses, scoped grants, and cleanup
-> finalizers.
+> Dynamic Workflows gives Hermes Agent a `workflow` authoring tool plus a
+> `workflow_control` operator tool for validating, running, pausing, resuming, and
+> inspecting agent workflows made of deterministic steps, durable waits, event
+> wakeups, guarded script harnesses, scoped grants, and cleanup finalizers.
 
 ![Dynamic Workflows infographic](docs/illustrations/public-release/01-infographic-agent-workflow-loop.png)
 
@@ -49,12 +49,12 @@ losing the whole run. Dynamic Workflows makes that middle explicit.
 trigger / operator / model
           │
           ▼
-  workflow(validate/run/status/control)
+  workflow(validate/run/status/catalog/script)
           │
           ├─ declarative JSON steps: agent · kanban_agent · if · parallel · pipeline · phase
           ├─ script harness VM: safe globals + parent-owned RPC capabilities
           ├─ durable waits: task-board events, webhook events, approval requests
-          ├─ controls: pause · resume · stop · task_stop · retry
+          ├─ workflow_control: pause · resume · stop · task_stop · retry
           └─ finalizers: cleanup host-owned resources on success/failure/timeout
 ```
 
@@ -107,7 +107,7 @@ pytest -q
 Run the bundled hello workflow through the library primitives:
 
 ```bash
-PYTHONPATH=src python3 - <<'PY'
+python3 - <<'PY'
 import json
 from hermes_workflows.primitives import workflow_validate, workflow_run, workflow_status
 

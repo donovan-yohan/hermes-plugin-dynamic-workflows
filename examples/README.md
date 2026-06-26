@@ -130,8 +130,8 @@ Production hosts register their own adapters for the action strings they own:
 from hermes_workflows import ResourceFinalizerRegistry
 
 finalizers = ResourceFinalizerRegistry()
-finalizers.register("listener.retire", retire_listener)
-finalizers.register("automation_run.retire", retire_automation_run)
+finalizers.register("ath.listener.retire", retire_listener)
+finalizers.register("relay.automation_run.retire", retire_automation_run)
 ```
 
 Run the zero-dependency smoke:

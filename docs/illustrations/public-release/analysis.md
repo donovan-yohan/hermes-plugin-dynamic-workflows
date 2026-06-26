@@ -19,7 +19,7 @@ Information visualization: explain why Dynamic Workflows exists and where it fit
 ## Core arguments
 
 1. Dynamic Workflows turns long-running agent work into explicit runs instead of timer rediscovery.
-2. The model-facing surface is one `workflow` tool with validate/run/status/control operations.
+2. The public surface is a `workflow` authoring tool plus a `workflow_control` operator tool.
 3. The runtime supports declarative JSON steps and guarded Python script harnesses.
 4. Effects cross parent-owned boundaries: agent runners, task-board waits, capability policies, event broker, controls, and finalizers.
 5. `0.1.0` is a public alpha: useful for experiments and adapter prototyping, not a hardened untrusted-code sandbox.
