@@ -37,18 +37,20 @@ from hermes_workflows.kanban import (
     normalize_on_block,
 )
 from hermes_workflows.script_store import ScriptRunStore
+from hermes_workflows.controls import InMemoryControlStore, stop_task
 from hermes_workflows.vm import CapabilityBroker, VMLimits
 
 META = 'meta = {"name": "k5", "description": "d"}\n'
 
 
-def _broker(backend, *, root="root", limits=None):
+def _broker(backend, *, root="root", limits=None, control_store=None):
     return CapabilityBroker(
         # A stub runner is present but unused on the durable Kanban path.
         agent_runner=lambda agent_id, input: {},
         limits=limits or VMLimits(),
         kanban_backend=backend,
         idempotency_root=root,
+        control_store=control_store,
     )
 
 
@@ -213,6 +215,19 @@ def test_broker_unknown_profile_is_rejected_with_diagnostic():
     assert ret["error"]["code"] == "unknown_profile"
     assert "ghost" in ret["error"]["message"]
     assert backend.created_cards == []  # nothing opened for an unknown assignee.
+
+
+def test_control_task_stop_blocks_kanban_child_before_card_create():
+    controls = InMemoryControlStore()
+    stop_task(controls, "root", "qa-label", reason="cancel just this child")
+    backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+    broker = _broker(backend, root="root", control_store=controls)
+
+    ret = broker.handle(_kanban_frame(1, labels=["qa-label"], on_block="return"))
+
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "task_stopped"
+    assert backend.created_cards == []
 
 
 def test_broker_await_timeout_is_bounded_by_runtime_limit():

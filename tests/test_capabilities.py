@@ -13,6 +13,7 @@ from hermes_workflows import (
 from hermes_workflows.vm import CapabilityBroker
 from hermes_workflows import rpc
 from hermes_workflows.agents import StubAgentRunner
+from hermes_workflows.controls import InMemoryControlStore, pause_run, stop_task
 from hermes_workflows.script_store import ScriptRunStore
 
 META = 'meta = {"name": "cap-demo", "description": "d"}\n'
@@ -59,6 +60,56 @@ def test_script_can_call_registered_read_only_capability():
     assert event["capability"] == "tools.echo"
     assert event["label"] == "inventory"
     assert "params" not in event
+
+
+def test_control_pause_blocks_script_capability_dispatch():
+    calls = []
+    registry = CapabilityRegistry()
+    registry.register("tools.echo", lambda ctx: calls.append(ctx) or {"ok": True})
+    controls = InMemoryControlStore()
+    pause_run(controls, "wfs_pause_cap", reason="hold")
+    script = META + 'return await capability("tools.echo", {}, label="inventory")\n'
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script,
+            store=store,
+            run_id="wfs_pause_cap",
+            capability_registry=registry,
+            control_store=controls,
+        )
+        persisted = store.load_run("wfs_pause_cap")
+
+    assert res.paused is True
+    assert res.error["code"] == "run_paused"
+    assert persisted.status == "paused"
+    assert calls == []
+
+
+def test_control_task_stop_blocks_matching_script_child_label():
+    calls = []
+    registry = CapabilityRegistry()
+    registry.register("tools.echo", lambda ctx: calls.append(ctx) or {"ok": True})
+    controls = InMemoryControlStore()
+    stop_task(controls, "wfs_task_cap", "inventory", reason="skip this call")
+    script = META + 'return await capability("tools.echo", {}, label="inventory")\n'
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script,
+            store=store,
+            run_id="wfs_task_cap",
+            capability_registry=registry,
+            control_store=controls,
+        )
+        persisted = store.load_run("wfs_task_cap")
+
+    assert res.ok is False
+    assert res.error["code"] == "task_stopped"
+    assert persisted.status == "failed"
+    assert calls == []
 
 
 def test_unregistered_capability_fails_closed():
