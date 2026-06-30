@@ -158,3 +158,49 @@ def test_registered_workflow_handler_runs_saved_script_harness():
     assert run_payload["data"]["operation"] == "run_script"
     assert run_payload["data"]["result"]["ok"] is True
     assert run_payload["data"]["result"]["value"] == {"value": 42}
+
+
+def test_workflow_control_status_surfaces_script_declared_phases():
+    old_state_dir = os.environ.get("HERMES_WORKFLOWS_STATE_DIR")
+    old_script_dir = os.environ.get("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        os.environ["HERMES_WORKFLOWS_STATE_DIR"] = str(root / "runs")
+        os.environ["HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR"] = str(root / "scripts")
+        try:
+            plugin = _load_plugin_root()
+            ctx = FakeContext()
+            plugin.register(ctx)
+            source = (
+                'meta = {"name": "saved", "description": "plugin script", '
+                '"phases": [{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
+                'return {"value": args["value"]}\n'
+            )
+            json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"action": "script_save", "script_name": "saved", "script_source": source}
+                )
+            )
+            run_payload = json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"action": "run_script", "script_name": "saved", "script_args": {"value": 42}}
+                )
+            )
+            run_id = run_payload["data"]["result"]["run_id"]
+            status_payload = json.loads(ctx.tools["workflow_control"]["handler"]({"action": "status", "run_id": run_id}))
+        finally:
+            if old_state_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_STATE_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_STATE_DIR"] = old_state_dir
+            if old_script_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR"] = old_script_dir
+
+    assert status_payload["success"] is True
+    assert status_payload["data"]["lifecycle"] == "succeeded"
+    assert status_payload["data"]["phases"] == [
+        {"id": "phase_1", "title": "Plan", "detail": "choose work", "status": "queued"},
+        {"id": "phase_2", "title": "Build", "detail": "", "status": "queued"},
+    ]

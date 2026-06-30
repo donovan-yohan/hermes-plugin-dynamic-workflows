@@ -35,6 +35,10 @@ from hermes_workflows.script_store import (
 )
 
 META = 'meta = {"name": "demo", "description": "d"}\n'
+PHASE_META = (
+    'meta = {"name": "demo", "description": "d", '
+    '"phases": [{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
+)
 
 # A script exercising every replayable method (log, agent, phase, kanban_agent).
 FULL_SCRIPT = META + (
@@ -139,6 +143,24 @@ def test_load_run_returns_terminal_metadata():
         assert loaded.value == {"greeting": "hello, world", "profile": "relayplanner"}
         assert loaded.deterministic_runner is True  # default stub auto-detected.
         assert loaded.meta == {"name": "demo", "description": "d"}
+
+
+def test_script_run_snapshot_persists_declared_phase_metadata():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        script = PHASE_META + 'phase("Plan")\nreturn {"ok": True}\n'
+        res = run_workflow_script(script, store=store, run_id="run_phases")
+        assert res.ok, res.error
+
+        loaded = store.load_run("run_phases")
+        assert loaded.phases == [
+            {"title": "Plan", "detail": "choose work"},
+            {"title": "Build"},
+        ]
+        snapshot = json.loads((Path(tmp) / "runs" / "run_phases" / "run.json").read_text(encoding="utf-8"))
+        assert snapshot["phases"] == loaded.phases
+        phase_call = [e for e in store.journal("run_phases") if e.get("method") == "phase"][0]
+        assert phase_call["phase_title"] == "Plan"
 
 
 def test_minted_run_id_is_used_when_omitted():

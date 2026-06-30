@@ -52,10 +52,33 @@ def test_control_flow_and_await_are_allowed():
 
 def test_meta_phases_field_is_allowed():
     src = (
-        'meta = {"name": "x", "description": "y", "phases": ["a", "b"]}\n'
+        'meta = {"name": "x", "description": "y", "phases": '
+        '[{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
         "log('go')\n"
     )
-    assert validate_script(src).ok
+    v = validate_script(src)
+    assert v.ok
+    assert v.meta["phases"] == [
+        {"title": "Plan", "detail": "choose work"},
+        {"title": "Build"},
+    ]
+
+
+def test_invalid_meta_phases_are_rejected_with_stable_diagnostics():
+    v = validate_script(
+        'meta = {"name": "x", "description": "y", "phases": '
+        '["plan", {"detail": "missing title"}, {"title": "", "detail": "x"}, {"title": "Build", "detail": 3}]}\n'
+        "log('go')\n"
+    )
+    diagnostics = [d.as_dict() for d in v.diagnostics]
+    assert not v.ok
+    assert {d["code"] for d in diagnostics} == {"E_SCRIPT_META_PHASES"}
+    assert [d["pointer"] for d in diagnostics] == [
+        "/script/meta/phases/0",
+        "/script/meta/phases/1/title",
+        "/script/meta/phases/2/title",
+        "/script/meta/phases/3/detail",
+    ]
 
 
 def test_safe_builtins_and_helpers_are_allowed():

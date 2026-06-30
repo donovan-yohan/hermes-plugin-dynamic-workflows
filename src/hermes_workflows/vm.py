@@ -752,6 +752,8 @@ class CapabilityBroker:
             event["profile"] = params.get("profile")
         if method in ("capability",):
             event["capability"] = safe_capability_metadata_value(params.get("name"))
+        if method in ("phase",):
+            event["phase_title"] = safe_capability_metadata_value(params.get("title"))
         if params.get("label"):
             event["label"] = safe_capability_metadata_value(params.get("label"))
         if error:
@@ -1332,11 +1334,13 @@ def run_script(
         return vm.run(script, args=args, validate=validate)
 
     # Durable path: validate up front so a rejected script never leaves an
-    # orphan run directory, then begin -> drive -> finish.
-    if validate:
-        validation = validate_script(script)
-        if not validation.ok:
-            raise ScriptValidationError(validation.diagnostics)
+    # orphan run directory, then begin -> drive -> finish. Even when callers opt
+    # out of the launch gate, run the static pass as metadata extraction only so
+    # a valid meta.phases declaration can be persisted in the initial snapshot.
+    validation = validate_script(script)
+    if validate and not validation.ok:
+        raise ScriptValidationError(validation.diagnostics)
+    validation_meta = validation.meta if validation.ok else None
 
     persist_run_id = run_id if run_id is not None else store.next_run_id(script, args)
     store.begin(
@@ -1345,6 +1349,7 @@ def run_script(
         args=args,
         limits=_limits_view(effective_limits),
         deterministic_runner=deterministic,
+        meta=validation_meta,
         replay_of=replay_from,
     )
 

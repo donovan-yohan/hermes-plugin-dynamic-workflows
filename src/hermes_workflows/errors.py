@@ -93,6 +93,7 @@ E_SCRIPT_TOO_LARGE = "E_SCRIPT_TOO_LARGE"  # source/AST exceeds the size bound.
 E_SCRIPT_META_POSITION = "E_SCRIPT_META_POSITION"  # 'meta' is not the first statement.
 E_SCRIPT_META_SHAPE = "E_SCRIPT_META_SHAPE"  # 'meta' is not a pure literal dict.
 E_SCRIPT_META_FIELDS = "E_SCRIPT_META_FIELDS"  # 'meta' lacks name/description.
+E_SCRIPT_META_PHASES = "E_SCRIPT_META_PHASES"  # 'meta.phases' has an invalid shape.
 E_SCRIPT_IMPORT = "E_SCRIPT_IMPORT"  # import / from-import is forbidden.
 E_SCRIPT_CLASSDEF = "E_SCRIPT_CLASSDEF"  # class definitions are forbidden.
 E_SCRIPT_SCOPE = "E_SCRIPT_SCOPE"  # global / nonlocal is forbidden.

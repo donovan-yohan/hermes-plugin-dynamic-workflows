@@ -52,6 +52,7 @@ __all__ = [
     "SAFE_MODULE_GLOBALS",
     "FORBIDDEN_NAMES",
     "ScriptValidation",
+    "normalize_meta_phases",
     "validate_script",
     "wrap_source",
 ]
@@ -234,6 +235,11 @@ def _validate_meta(body: list[ast.stmt], diags: list[Diagnostic]) -> Optional[di
         diags.append(_e(err.E_SCRIPT_META_SHAPE, "'meta' must be a dict literal", _line(first)))
         return None
 
+    normalized_phases = _validate_meta_phases(meta_value, diags)
+    if normalized_phases is not None:
+        meta_value = dict(meta_value)
+        meta_value["phases"] = normalized_phases
+
     missing = [k for k in ("name", "description") if not _nonempty_str(meta_value.get(k))]
     if missing:
         diags.append(
@@ -241,6 +247,72 @@ def _validate_meta(body: list[ast.stmt], diags: list[Diagnostic]) -> Optional[di
         )
         return meta_value
     return meta_value
+
+
+def normalize_meta_phases(meta: Any) -> list[dict[str, str]]:
+    """Return normalized script phase declarations from a validated ``meta``.
+
+    The public script contract is ``meta.phases = [{"title": str, "detail"?: str}]``.
+    ``id`` is optional and preserved when present. Invalid/unvalidated shapes
+    return an empty list so status surfaces fail closed rather than leaking
+    arbitrary data.
+    """
+    if not isinstance(meta, dict):
+        return []
+    phases = meta.get("phases")
+    if not isinstance(phases, list):
+        return []
+    out: list[dict[str, str]] = []
+    for phase in phases:
+        if not isinstance(phase, dict) or not _nonempty_str(phase.get("title")):
+            return []
+        row = {"title": str(phase["title"]).strip()}
+        if _nonempty_str(phase.get("detail")):
+            row["detail"] = str(phase["detail"]).strip()
+        if _nonempty_str(phase.get("id")):
+            row["id"] = str(phase["id"]).strip()
+        out.append(row)
+    return out
+
+
+def _validate_meta_phases(meta: dict[str, Any], diags: list[Diagnostic]) -> Optional[list[dict[str, str]]]:
+    if "phases" not in meta:
+        return None
+    phases = meta.get("phases")
+    if not isinstance(phases, list):
+        diags.append(_e_ptr(err.E_SCRIPT_META_PHASES, "'meta.phases' must be a literal list", "/script/meta/phases"))
+        return None
+    normalized: list[dict[str, str]] = []
+    for index, phase in enumerate(phases):
+        pointer = f"/script/meta/phases/{index}"
+        if not isinstance(phase, dict):
+            diags.append(_e_ptr(err.E_SCRIPT_META_PHASES, "each meta phase must be a dict", pointer))
+            continue
+        title = phase.get("title")
+        if not _nonempty_str(title):
+            diags.append(
+                _e_ptr(err.E_SCRIPT_META_PHASES, "each meta phase must define a non-empty title", f"{pointer}/title")
+            )
+            continue
+        detail = phase.get("detail")
+        if "detail" in phase and not _nonempty_str(detail):
+            diags.append(
+                _e_ptr(err.E_SCRIPT_META_PHASES, "meta phase detail must be a non-empty string when present", f"{pointer}/detail")
+            )
+            continue
+        phase_id = phase.get("id")
+        if "id" in phase and not _nonempty_str(phase_id):
+            diags.append(
+                _e_ptr(err.E_SCRIPT_META_PHASES, "meta phase id must be a non-empty string when present", f"{pointer}/id")
+            )
+            continue
+        row = {"title": str(title).strip()}
+        if _nonempty_str(detail):
+            row["detail"] = str(detail).strip()
+        if _nonempty_str(phase_id):
+            row["id"] = str(phase_id).strip()
+        normalized.append(row)
+    return normalized if len(normalized) == len(phases) else None
 
 
 # ---------------------------------------------------------------------------
@@ -363,4 +435,9 @@ def _line(node: ast.AST) -> int:
 def _e(code: str, message: str, line: int) -> Diagnostic:
     """Build an error diagnostic with a line-anchored pointer."""
     pointer = f"/script/line/{line}" if line else "/script"
+    return Diagnostic(severity="error", code=code, message=message, pointer=pointer)
+
+
+def _e_ptr(code: str, message: str, pointer: str) -> Diagnostic:
+    """Build an error diagnostic with an explicit stable pointer."""
     return Diagnostic(severity="error", code=code, message=message, pointer=pointer)
