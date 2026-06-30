@@ -23,7 +23,7 @@ if _SRC.exists():
     if src_text not in sys.path:
         sys.path.insert(0, src_text)
 
-from hermes_workflows.errors import ControlError, WorkflowError  # noqa: E402
+from hermes_workflows.errors import ControlError, ScriptRunStoreError, WorkflowError  # noqa: E402
 from hermes_workflows.primitives import (  # noqa: E402
     workflow as _workflow,
     workflow_run as _workflow_run,
@@ -569,7 +569,9 @@ def _inspect_script_run(
         run_id,
         lifecycle=record.status,
         control_state=state,
-        current_phase=(record.meta or {}).get("name") if isinstance(record.meta, dict) else None,
+        current_phase=_script_current_phase(events)
+        or ((record.meta or {}).get("name") if isinstance(record.meta, dict) else None),
+        phases=record.phases,
         progress=_script_run_progress(record, progress_events),
         waits=waits,
         result=record.value,
@@ -631,15 +633,25 @@ def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
         if _plugin_store(session_id=session_id).get(run_id) is not None:
             return True
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
-        return False
+        pass
     try:
-        script_store = _plugin_script_store(session_id=session_id)
-        if script_store is not None:
-            script_store.load_run(run_id)
-            return True
+        _plugin_script_run_store(session_id=session_id).load_run(run_id)
+        return True
+    except (ScriptRunStoreError, ValueError):
+        pass
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
         pass
     return bool(_loop_waits(run_id=run_id))
+
+
+def _script_current_phase(events: list[dict[str, Any]]) -> Optional[str]:
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("method") != "phase" or event.get("ok") is not True:
+            continue
+        title = event.get("phase_title") or event.get("label")
+        if isinstance(title, str) and title:
+            return title
+    return None
 
 
 def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
@@ -694,6 +706,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 for w in _kanban_waits(_plugin_script_store(session_id=session_id), run_id=run_id) + _loop_waits(run_id=run_id)
                 if w.run_id == run_id
             ]
+            events = run_store.journal(run_id, limit=events_limit) if record is not None else []
             links = _control_link_resolver(run_store)(record) if record is not None else {"run_id": run_id}
             report = _controls.inspect_run(
                 run_id,
@@ -704,9 +717,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 waits=waits,
                 result=record.result if record is not None else None,
                 error=record.error if record is not None else None,
-                last_events=run_store.journal(run_id, limit=events_limit)
-                if record is not None
-                else [],
+                last_events=events,
                 links=links,
                 events_limit=events_limit,
             )

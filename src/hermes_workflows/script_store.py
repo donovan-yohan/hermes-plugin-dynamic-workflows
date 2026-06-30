@@ -55,6 +55,7 @@ from typing import Any, Callable, Optional
 
 from .errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
 from .registry import utc_now_iso
+from .script_validator import normalize_meta_phases
 
 __all__ = [
     "SCRIPT_SCHEMA_VERSION",
@@ -226,6 +227,7 @@ class ScriptRunMeta:
             "args_hash": self.args_hash,
             "status": self.status,
             "meta": self.meta,
+            "phases": self.phases,
             "limits": self.limits,
             "value": self.value,
             "error": self.error,
@@ -234,6 +236,11 @@ class ScriptRunMeta:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+    @property
+    def phases(self) -> list[dict[str, str]]:
+        """Validated/normalized phase declarations exposed as progress metadata."""
+        return normalize_meta_phases(self.meta)
 
 
 @dataclass(frozen=True)
@@ -333,6 +340,7 @@ class ScriptRunStore:
         args: Any,
         limits: Optional[dict[str, Any]],
         deterministic_runner: bool,
+        meta: Optional[dict[str, Any]] = None,
         replay_of: Optional[str] = None,
     ) -> ScriptRunMeta:
         """Create the run directory, write ``run.json`` (status=running), and a
@@ -344,6 +352,7 @@ class ScriptRunStore:
             args_hash=canonical_hash(args),
             limits=limits,
             deterministic_runner=deterministic_runner,
+            meta=meta,
             replay_of=replay_of,
         )
         with self._lock:
@@ -386,7 +395,7 @@ class ScriptRunStore:
             "method": event.get("method"),
             "ok": event.get("ok"),
         }
-        for key in ("agent_id", "profile", "label", "error", "replayed"):
+        for key in ("agent_id", "profile", "label", "phase_title", "error", "replayed"):
             if event.get(key) is not None:
                 data[key] = event.get(key)
         with self._lock:
