@@ -225,6 +225,7 @@ def workflow(
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
+            limits=VMLimits(max_parallel=max_parallel),
             version=script_version,
             validate=validate,
             run_id=run_id,

@@ -1165,6 +1165,7 @@ class WorkflowVM:
             ret_executor = ThreadPoolExecutor(max_workers=max(1, int(self._limits.max_parallel or 1)))
             ret_write_lock = threading.Lock()
             pending_rets: set[Future[Any]] = set()
+            done_received = threading.Event()
 
             def _set_protocol_error(message: str) -> None:
                 nonlocal protocol_error
@@ -1174,6 +1175,14 @@ class WorkflowVM:
             def _handle_and_reply(call_frame: dict[str, Any]) -> None:
                 nonlocal suspended
                 ret = broker.handle(call_frame)
+                if done_received.is_set():
+                    # The guest already reported a terminal result (for example,
+                    # one pipeline item failed while a sibling parent-side runner
+                    # call was still executing). The runner work still has to
+                    # drain before this VM returns, but writing a late ret frame
+                    # only races child shutdown and can mask the real terminal
+                    # error as a BrokenPipe protocol failure.
+                    return
                 try:
                     with ret_write_lock:
                         rpc.write_frame(proc.stdin, ret)
@@ -1231,19 +1240,18 @@ class WorkflowVM:
                         pending_rets.add(ret_executor.submit(_handle_and_reply, frame))
                     elif kind == rpc.T_DONE:
                         done = frame
+                        done_received.set()
                         break
                     # Unknown frame types are ignored (forward-compatible).
             finally:
                 if pending_rets:
-                    wait(pending_rets, timeout=5)
+                    wait(pending_rets)
                     for fut in list(pending_rets):
                         if fut.done():
                             exc = fut.exception()
                             if exc is not None:
                                 _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
-                        else:
-                            fut.cancel()
-                ret_executor.shutdown(wait=False, cancel_futures=True)
+                ret_executor.shutdown(wait=True, cancel_futures=True)
         finally:
             timer.cancel()
             _close(proc.stdin)

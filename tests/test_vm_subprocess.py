@@ -17,9 +17,10 @@ import os
 import stat
 import tempfile
 import threading
+import time
 from pathlib import Path
 
-from hermes_workflows import run_workflow_script
+from hermes_workflows import FileWorkflowScriptCatalog, run_workflow_script, workflow
 from hermes_workflows.agents import StubAgentRunner
 from hermes_workflows.errors import ScriptValidationError
 from hermes_workflows.script_store import ReplayCache, ReplayEntry, replay_args_hash
@@ -267,6 +268,88 @@ def test_pipeline_failure_reports_item_and_stage():
     assert res.error["stage_index"] == 1
     assert res.error["cause_type"] == "CapabilityError"
     assert res.error["code"] == "runner_error"
+
+
+def test_workflow_run_script_facade_forwards_max_parallel_limit():
+    class CountingRunner:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return dict(input)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    source = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item}),\n"
+        ")\n"
+        "return {'outs': outs}\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        catalog = FileWorkflowScriptCatalog([Path(d) / "scripts"])
+        catalog.save_script("bounded_pipeline", source)
+        runner = CountingRunner()
+
+        result = workflow(
+            action="run_script",
+            script_name="bounded_pipeline",
+            script_catalog=catalog,
+            agent_runner=runner,
+            max_parallel=1,
+        )["result"]
+
+    assert result["ok"] is True, result.get("error")
+    assert runner.max_active == 1
+
+
+def test_pipeline_failure_waits_for_in_flight_parent_runner_work():
+    class FailSlowRunner:
+        def __init__(self):
+            self.slow_started = threading.Event()
+            self.slow_finished = threading.Event()
+            self.calls = []
+            self.lock = threading.Lock()
+
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            payload = dict(input)
+            with self.lock:
+                self.calls.append(payload)
+            if payload == {"item": 0, "stage": 1}:
+                self.slow_started.wait(timeout=1.0)
+                raise RuntimeError("fast failure at item0 stage1")
+            if payload == {"item": 1, "stage": 0}:
+                self.slow_started.set()
+                time.sleep(0.25)
+                self.slow_finished.set()
+            return payload
+
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1}),\n"
+        ")\n"
+        "return {'outs': outs}\n"
+    )
+    runner = FailSlowRunner()
+    started = time.monotonic()
+
+    res = run_workflow_script(script, agent_runner=runner, limits=VMLimits(max_parallel=2, max_runtime_s=5.0))
+    elapsed = time.monotonic() - started
+
+    assert res.ok is False
+    assert res.error["type"] == "PipelineStageError"
+    assert runner.slow_started.is_set(), runner.calls
+    assert runner.slow_finished.is_set(), runner.calls
+    assert elapsed >= 0.20
 
 
 def test_kanban_agent_routes_through_reserved_runner():
