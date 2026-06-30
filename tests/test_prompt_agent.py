@@ -233,6 +233,36 @@ def test_prompt_agent_duplicate_prompt_hits_current_run_cache():
         assert hit["cache"] == "run"
 
 
+def test_prompt_agent_duplicate_prompt_cache_hit_obeys_token_budget():
+    runner = FakeChildRunner({"answer": "same", "_tokens": 1})
+    script = META + (
+        'await agent("same", {"label": "x"})\n'
+        'await agent("same", {"label": "x"})\n'
+        'return {"code": "bypassed"}\n'
+    )
+
+    res = run_workflow_script(script, child_agent_runner=runner, limits=VMLimits(token_budget=1))
+
+    assert res.ok is False
+    assert "hard-limit" in res.error["message"]
+    assert [request.prompt for request in runner.requests] == ["same"]
+
+
+def test_prompt_agent_duplicate_prompt_cache_hit_obeys_max_agent_calls():
+    runner = FakeChildRunner({"answer": "same", "_tokens": 0})
+    script = META + (
+        'await agent("same", {"label": "x"})\n'
+        'await agent("same", {"label": "x"})\n'
+        'return {"code": "bypassed"}\n'
+    )
+
+    res = run_workflow_script(script, child_agent_runner=runner, limits=VMLimits(max_agent_calls=1))
+
+    assert res.ok is False
+    assert res.error["code"] == "limit_agent"
+    assert [request.prompt for request in runner.requests] == ["same"]
+
+
 def test_prompt_agent_negative_and_bool_tokens_do_not_lower_or_spend_budget():
     runner = PromptOutputRunner(
         {

@@ -521,7 +521,11 @@ class CapabilityBroker:
             )
             raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
         _validate_output(value, request.schema)
+        self._check_start_control(call_id, "agent", params)
+        self._check_token_budget()
         self._agent_calls += 1
+        if self._agent_calls > self._limits.max_agent_calls:
+            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         usage = _non_negative_token_usage(value)
         if usage is not None:
             self._tokens += usage
