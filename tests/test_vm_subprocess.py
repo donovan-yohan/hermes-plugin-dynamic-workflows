@@ -16,6 +16,7 @@ Deterministic by construction: all effects route through ``StubAgentRunner``.
 import os
 import stat
 import tempfile
+import threading
 from pathlib import Path
 
 from hermes_workflows import run_workflow_script
@@ -99,6 +100,87 @@ def test_parallel_and_pipeline_execute_in_guest():
     res = run_workflow_script(script)
     assert res.ok, res.error
     assert res.value == {"parallel": ["hello, a", "hello, b"], "pipeline": ["X0", "Y1"]}
+
+
+def test_parallel_runs_bounded_concurrent_and_preserves_result_order():
+    started = []
+    finished = []
+    start_gate = threading.Event()
+    finish_gate = threading.Event()
+    lock = threading.Lock()
+
+    class BlockingRunner:
+        def __call__(self, agent_id, input):
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    start_gate.set()
+            if not start_gate.wait(2.0):
+                raise RuntimeError("parallel did not start the first two calls concurrently")
+            if index == 0:
+                if not finish_gate.wait(2.0):
+                    raise RuntimeError("second call did not finish while first was still running")
+            elif index == 1:
+                with lock:
+                    finished.append(index)
+                finish_gate.set()
+            with lock:
+                if index != 1:
+                    finished.append(index)
+            return {"i": index}
+
+    journal = []
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return {'order': [o['i'] for o in outs]}\n"
+    )
+    res = run_workflow_script(script, agent_runner=BlockingRunner(), limits=VMLimits(max_parallel=2), journal=journal.append)
+
+    assert res.ok, res.error
+    assert res.value == {"order": [0, 1, 2]}
+    assert started[:2] == [0, 1]
+    assert finished[:2] == [1, 0]
+    assert started == [0, 1, 2]
+
+    starts = [e for e in journal if e["type"] == "rpc_call_start" and e["method"] == "agent"]
+    results = [e for e in journal if e["type"] == "rpc_call" and e["method"] == "agent"]
+    assert [e["parallel_index"] for e in starts] == [0, 1, 2]
+    assert [e["parallel_index"] for e in results] == [1, 0, 2]
+    assert [e["call_id"] for e in starts[:2]] == [1, 2]
+    assert [e["call_id"] for e in results] == [2, 1, 3]
+
+
+def test_parallel_width_prevents_dispatching_queued_children_after_failure():
+    started = []
+    lock = threading.Lock()
+
+    class FailingRunner:
+        def __call__(self, agent_id, input):
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            return {"i": index}
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=FailingRunner(), limits=VMLimits(max_parallel=1))
+
+    assert res.ok is False
+    assert res.error["type"] == "CapabilityError"
+    assert started == [0]
 
 
 def test_kanban_agent_routes_through_reserved_runner():
