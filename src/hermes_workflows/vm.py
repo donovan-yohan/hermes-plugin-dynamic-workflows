@@ -397,8 +397,7 @@ class CapabilityBroker:
             # the runner; a method/args drift fails closed; a miss falls through
             # to a live dispatch (the call was non-replayable in the source run).
             if self._replay is not None:
-                with self._lock:
-                    replayed = self._maybe_replay(call_id, method, params)
+                replayed = self._maybe_replay(call_id, method, params)
                 if replayed is not _MISS:
                     return replayed
 
@@ -497,14 +496,17 @@ class CapabilityBroker:
     def started_event(self, frame: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Return a metadata-only start marker for parallel child calls.
 
-        Sequential calls keep the historical one-result-event journal shape. A
-        workflow-script ``parallel()`` call annotates child RPC frames with a
-        private ``_parallel_index`` parameter; those calls get a separate start
-        marker so operators can see real dispatch timing without exposing raw
-        inputs.
+        Sequential calls keep the historical one-result-event journal shape.
+        Workflow-script ``parallel()`` and ``pipeline()`` calls annotate child
+        RPC frames with private index parameters; those calls get a separate
+        start marker so operators can see real dispatch timing without exposing
+        raw inputs.
         """
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
-        if "_parallel_index" not in params:
+        if not any(
+            key in params
+            for key in ("_parallel_index", "_pipeline_item_index", "_pipeline_stage_index")
+        ):
             return None
         event = self._call_event(
             frame.get("id"),
@@ -513,7 +515,8 @@ class CapabilityBroker:
             ok=True,
             event_type="rpc_call_start",
         )
-        event["parallel_index"] = params.get("_parallel_index")
+        if "_parallel_index" in params:
+            event["parallel_index"] = params.get("_parallel_index")
         return event
 
     def _maybe_prompt_cache_hit(self, call_id: Any, params: dict[str, Any]) -> Any:
@@ -579,12 +582,14 @@ class CapabilityBroker:
             return _MISS
         args_hash = replay_args_hash(method, params) if isinstance(params, dict) else ""
         if entry.method != method or entry.args_hash != args_hash:
-            self.should_abort = True
-            self.abort_reason = (
-                f"replay drift at call {call_id}: recorded {entry.method!r} does not "
-                f"match {method!r} (or arguments changed)"
-            )
-            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+            with self._lock:
+                self.should_abort = True
+                self.abort_reason = (
+                    f"replay drift at call {call_id}: recorded {entry.method!r} does not "
+                    f"match {method!r} (or arguments changed)"
+                )
+                abort_reason = self.abort_reason
+            raise CapabilityDenied(abort_reason, code="replay_mismatch")
         # Hit. Mirror the live accounting so cap-/budget-gated control flow in the
         # script reproduces the recorded run:
         #  * advance the soft per-method counters, so a later *non-cached* call
@@ -593,19 +598,21 @@ class CapabilityBroker:
         #  * re-apply the recorded non-negative token spend (a negative/absent
         #    value is ignored — the hard cap is not re-enforced on a faithful
         #    replay, so a tampered _tokens must not skew the budget downward).
-        if method == "agent":
-            self._agent_calls += 1
-        elif method == "kanban_agent":
-            self._kanban_calls += 1
-        elif method == "capability":
-            self._capability_calls += 1
-        if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
-            usage = _non_negative_token_usage(entry.value)
-            if usage is not None:
-                self._tokens += usage
-        self._replayed_calls += 1
+        with self._lock:
+            if method == "agent":
+                self._agent_calls += 1
+            elif method == "kanban_agent":
+                self._kanban_calls += 1
+            elif method == "capability":
+                self._capability_calls += 1
+            if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
+                usage = _non_negative_token_usage(entry.value)
+                if usage is not None:
+                    self._tokens += usage
+            self._replayed_calls += 1
+            budget = self._budget_info()
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
-        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": budget}
 
     def _dispatch(self, call_id: Any, method: str, params: dict[str, Any]) -> Any:
         if method == "log":
@@ -1132,6 +1139,10 @@ class CapabilityBroker:
             event["label"] = safe_capability_metadata_value(params.get("label"))
         if "_parallel_index" in params:
             event["parallel_index"] = params.get("_parallel_index")
+        if "_pipeline_item_index" in params:
+            event["pipeline_item_index"] = params.get("_pipeline_item_index")
+        if "_pipeline_stage_index" in params:
+            event["pipeline_stage_index"] = params.get("_pipeline_stage_index")
         if params.get("phase"):
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if error:
