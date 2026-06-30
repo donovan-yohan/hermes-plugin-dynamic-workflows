@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .agents import AgentRunner
+from .agents import AgentRunner, ChildAgentRunner
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .errors import ScriptValidationError
 from .registry import utc_now_iso
@@ -412,6 +412,7 @@ class BackgroundWorkflowRunManager:
         script_name: Optional[str] = None,
         script_version: Optional[int] = None,
         agent_runner: Optional[AgentRunner] = None,
+        child_agent_runner: Optional[ChildAgentRunner] = None,
         limits: Optional[VMLimits] = None,
         validate: bool = True,
         run_id: Optional[str] = None,
@@ -442,6 +443,7 @@ class BackgroundWorkflowRunManager:
                 "script": script,
                 "args": args,
                 "agent_runner": agent_runner,
+                "child_agent_runner": child_agent_runner,
                 "limits": limits,
                 "replay_from": replay_from,
                 "deterministic_runner": deterministic_runner,
@@ -474,6 +476,7 @@ class BackgroundWorkflowRunManager:
                 kwargs["script"],
                 args=kwargs["args"],
                 agent_runner=kwargs["agent_runner"],
+                child_agent_runner=kwargs["child_agent_runner"],
                 limits=kwargs["limits"],
                 validate=False,
                 store=self.script_store,

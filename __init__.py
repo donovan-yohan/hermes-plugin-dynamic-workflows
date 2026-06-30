@@ -445,11 +445,18 @@ def _control_link_resolver(store: FileRunStore, *, session_id: Optional[str] = N
     def resolve(record: Any) -> dict[str, Any]:
         if isinstance(record, BackgroundRunRecord):
             run_dir = _plugin_background_store(session_id=session_id).root / record.run_id
+            script_extras = None
+            if record.journal_path:
+                script_run_dir = Path(record.journal_path).parent
+                script_extras = {
+                    "script_run_journal": record.journal_path,
+                    "script_run_transcripts": str(script_run_dir / "transcripts"),
+                }
             return _controls.run_links(
                 run_id=record.run_id,
                 journal_path=str(run_dir / "journal.jsonl"),
                 result_path=str(run_dir / "run.json"),
-                extra={"script_run_journal": record.journal_path} if record.journal_path else None,
+                extra=script_extras,
             )
         run_dir = store.root / record.run_id
         return _controls.run_links(
@@ -560,12 +567,12 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
             script_record = None
             background_record = None
             if record is None:
+                background_record = _plugin_background_store(session_id=session_id).get(run_id)
+            if record is None and background_record is None:
                 try:
                     script_record = script_store.load_run(run_id)
                 except (ScriptRunStoreError, ValueError):
                     script_record = None
-            if record is None and script_record is None:
-                background_record = _plugin_background_store(session_id=session_id).get(run_id)
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
             waits = [
                 w
@@ -583,7 +590,12 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 phases = None
             elif script_record is not None:
                 events = script_store.journal(run_id, limit=params.get("events_limit", 10))
-                links = _controls.run_links(run_id=run_id, journal_path=str(script_store.journal_path(run_id)))
+                script_run_dir = script_store.journal_path(run_id).parent
+                links = _controls.run_links(
+                    run_id=run_id,
+                    journal_path=str(script_store.journal_path(run_id)),
+                    extra={"script_run_transcripts": str(script_run_dir / "transcripts")},
+                )
                 lifecycle = script_record.status
                 current_phase = _script_current_phase(events)
                 phases = script_record.phases

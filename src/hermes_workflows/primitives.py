@@ -169,6 +169,7 @@ def workflow(
                 script_name=script_name,
                 script_version=script_version,
                 agent_runner=agent_runner,
+                child_agent_runner=child_agent_runner,
                 validate=validate,
                 run_id=run_id,
                 capability_registry=capability_registry,

@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
+from hermes_workflows import ChildAgentRequest
 from hermes_workflows.background import BackgroundRunStore, BackgroundWorkflowRunManager
 from hermes_workflows.script_store import ScriptRunStore
 
@@ -34,6 +35,15 @@ class _SlowRunner:
         self.calls += 1
         time.sleep(self.delay)
         return {"answer": input["value"], "agent_id": agent_id}
+
+
+class _ChildRunner:
+    def __init__(self) -> None:
+        self.requests: list[ChildAgentRequest] = []
+
+    def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+        self.requests.append(request)
+        return {"answer": "child", "_tokens": 4}
 
 
 def _eventually(fn: Callable[[], Any], predicate: Callable[[Any], bool], *, timeout: float = 3.0) -> Any:
@@ -77,6 +87,32 @@ def test_background_launch_returns_before_slow_agent_completes_and_persists_resu
         assert final.journal_path and Path(final.journal_path).exists()
         assert script_store.load_run(record.run_id).status == "succeeded"
         assert runner.calls == 1
+
+
+def test_background_prompt_agent_uses_child_runner_and_persists_transcript_refs():
+    script = 'meta = {"name": "background-child", "description": "d"}\nreturn await agent("summarize", {"label": "bg"})\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        background_store = BackgroundRunStore(Path(tmp) / "background-runs")
+        script_store = ScriptRunStore(Path(tmp) / "script-runs")
+        manager = BackgroundWorkflowRunManager(background_store, script_store)
+        runner = _ChildRunner()
+
+        record = manager.launch_script(
+            script,
+            run_id="wfs_background_child",
+            child_agent_runner=runner,
+            deterministic_runner=True,
+        )
+        final = _eventually(
+            lambda: background_store.get(record.run_id),
+            lambda r: r is not None and r.status == "succeeded",
+        )
+
+        assert final.result == {"answer": "child", "_tokens": 4}
+        assert [request.label for request in runner.requests] == ["bg"]
+        refs = script_store.load_run(record.run_id).transcripts
+        assert refs["agents"][0]["state"] == "succeeded"
+        assert Path(refs["agents"][0]["meta_path"]).exists()
 
 
 def test_background_store_recovers_queued_and_running_snapshots_as_structured_failures():
@@ -165,6 +201,7 @@ def test_plugin_background_run_is_visible_in_workflow_control_status_and_overvie
         )
         assert status["data"]["result"] == {"answer": "plugin"}
         assert status["data"]["links"]["result"].endswith("run.json")
+        assert status["data"]["links"]["script_run_transcripts"].endswith("transcripts")
 
         overview = json.loads(ctl({"action": "overview"}))
         by_id = {r["run_id"]: r for r in overview["data"]["runs"]}

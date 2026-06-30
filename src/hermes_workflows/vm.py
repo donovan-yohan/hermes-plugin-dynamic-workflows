@@ -74,6 +74,7 @@ from .script_store import (
     CallRecorder,
     ReplayCache,
     ScriptRunStore,
+    TranscriptRecorder,
     canonical_hash,
     is_replayable,
     replay_args_hash,
@@ -171,6 +172,7 @@ class ScriptRunResult:
     # are unaffected.
     run_id: Optional[str] = None
     journal_path: Optional[str] = None
+    transcripts: Optional[dict[str, Any]] = None
     replayed_calls: int = 0
 
     def as_dict(self) -> dict[str, Any]:
@@ -185,6 +187,7 @@ class ScriptRunResult:
             "suspended": self.suspended,
             "run_id": self.run_id,
             "journal_path": self.journal_path,
+            "transcripts": self.transcripts,
             "replayed_calls": self.replayed_calls,
         }
 
@@ -209,6 +212,7 @@ class CapabilityBroker:
         journal: Optional[JournalSink] = None,
         redact: bool = True,
         recorder: Optional[CallRecorder] = None,
+        transcripts: Optional[TranscriptRecorder] = None,
         replay: Optional[ReplayCache] = None,
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
@@ -226,6 +230,7 @@ class CapabilityBroker:
         # re-dispatching. Both default off, so the broker is unchanged for
         # in-memory runs and the broker unit tests.
         self._recorder = recorder
+        self._transcripts = transcripts
         self._replay = replay
         self._deterministic_runner = deterministic_runner
         # Durable Kanban awaitable seam (issue #5): when present, kanban_agent
@@ -274,11 +279,82 @@ class CapabilityBroker:
         if self._journal is not None:
             self._journal({"ts": utc_now_iso(), **event})
 
+    def _should_transcribe(self, method: Any, params: dict[str, Any]) -> bool:
+        return self._transcripts is not None and method in {"agent", "kanban_agent"}
+
+    def _transcript_started(self, call_id: Any, method: Any, params: dict[str, Any], started_at: str) -> None:
+        if self._transcripts is None or not isinstance(method, str):
+            return
+        try:
+            self._transcripts.started(call_id, method, params, started_at=started_at)
+        except Exception:  # noqa: BLE001 — transcript artifacts are best-effort.
+            pass
+
+    def _transcript_result(
+        self,
+        call_id: Any,
+        method: Any,
+        params: dict[str, Any],
+        started_at: str,
+        start_time: float,
+        value: Any,
+    ) -> None:
+        if self._transcripts is None or not isinstance(method, str):
+            return
+        try:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._transcripts.result(
+                call_id,
+                method,
+                params,
+                started_at=started_at,
+                completed_at=utc_now_iso(),
+                duration_ms=duration_ms,
+                value=value,
+            )
+        except Exception:  # noqa: BLE001 — transcript artifacts are best-effort.
+            pass
+
+    def _transcript_error(
+        self,
+        call_id: Any,
+        method: Any,
+        params: dict[str, Any],
+        started_at: str,
+        start_time: float,
+        error_code: str,
+    ) -> None:
+        if self._transcripts is None or not isinstance(method, str):
+            return
+        try:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            self._transcripts.error(
+                call_id,
+                method,
+                params,
+                started_at=started_at,
+                completed_at=utc_now_iso(),
+                duration_ms=duration_ms,
+                error_code=error_code,
+            )
+        except Exception:  # noqa: BLE001 — transcript artifacts are best-effort.
+            pass
+
+    def _transcript_cache_hit(self, call_id: Any, method: Any, params: dict[str, Any], value: Any) -> None:
+        if self._transcripts is None or not isinstance(method, str):
+            return
+        try:
+            self._transcripts.cache_hit(call_id, method, params, at=utc_now_iso(), value=value)
+        except Exception:  # noqa: BLE001 — transcript artifacts are best-effort.
+            pass
+
     def handle(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Validate and dispatch one ``call`` frame; return its ``ret`` frame."""
         call_id = frame.get("id")
         method = frame.get("method")
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        transcript_started_at: Optional[str] = None
+        transcript_start = 0.0
 
         try:
             self._rpc_calls += 1
@@ -300,7 +376,13 @@ class CapabilityBroker:
                 if replayed is not _MISS:
                     return replayed
 
+            if self._should_transcribe(method, params):
+                transcript_started_at = utc_now_iso()
+                transcript_start = time.monotonic()
+                self._transcript_started(call_id, method, params, transcript_started_at)
             value = self._dispatch(call_id, method, params)
+            if transcript_started_at is not None:
+                self._transcript_result(call_id, method, params, transcript_started_at, transcript_start, value)
             # The effect has already happened. Persist (replay cache + journal)
             # on a best-effort basis *after* building the success frame so a
             # disk/IO failure here never masquerades as a runner failure for a
@@ -310,6 +392,8 @@ class CapabilityBroker:
             self._persist_success(call_id, method, params, value)
             return ret
         except CapabilityDenied as denied:
+            if transcript_started_at is not None:
+                self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, denied.code)
             self._emit(self._call_event(call_id, method, params, ok=False, error=denied.code))
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
@@ -320,6 +404,8 @@ class CapabilityBroker:
         except BaseException as exc:  # noqa: BLE001 — an AgentRunner (even one raising
             # SystemExit/CancelledError) must NOT escape and crash the parent run; it is
             # contained here and reported to the script as a structured error.
+            if transcript_started_at is not None:
+                self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, "runner_error")
             self._emit(self._call_event(call_id, method, params, ok=False, error="runner_error"))
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
@@ -404,6 +490,8 @@ class CapabilityBroker:
             if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
                 self._tokens += usage
         self._replayed_calls += 1
+        if self._should_transcribe(method, params):
+            self._transcript_cache_hit(call_id, method, params, entry.value)
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
         return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
 
@@ -895,6 +983,7 @@ class WorkflowVM:
         journal: Optional[JournalSink] = None,
         python_executable: Optional[str] = None,
         recorder: Optional[CallRecorder] = None,
+        transcripts: Optional[TranscriptRecorder] = None,
         replay: Optional[ReplayCache] = None,
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
@@ -909,6 +998,7 @@ class WorkflowVM:
         self._python = python_executable or sys.executable
         # Durable-store wiring (issue #3): forwarded to the per-run broker.
         self._recorder = recorder
+        self._transcripts = transcripts
         self._replay = replay
         self._deterministic_runner = deterministic_runner
         # Durable Kanban awaitable wiring (issue #5): forwarded to the broker.
@@ -948,6 +1038,7 @@ class WorkflowVM:
             child_agent_runner=self._child_runner,
             journal=_collect,
             recorder=self._recorder,
+            transcripts=self._transcripts,
             replay=self._replay,
             deterministic_runner=self._deterministic_runner,
             kanban_backend=self._kanban_backend,
@@ -1473,6 +1564,7 @@ def run_script(
 
     # Record cache entries only on a fresh run; a replay consumes the cache.
     recorder = store.recorder(persist_run_id) if replay_cache is None else None
+    transcripts = store.transcript_recorder(persist_run_id)
     # Kanban idempotency root is the *logical* run id: a fresh run uses its own
     # persisted run id; a replay (or replay-of-a-replay) inherits the original
     # run's id so create/reattach converges on the same card instead of opening a
@@ -1484,6 +1576,7 @@ def run_script(
         limits=effective_limits,
         journal=_store_journal,
         recorder=recorder,
+        transcripts=transcripts,
         replay=replay_cache,
         deterministic_runner=deterministic,
         kanban_backend=kanban_backend,
@@ -1511,4 +1604,5 @@ def run_script(
         value=result.value,
         error=result.error,
     )
+    result.transcripts = store.transcript_refs(persist_run_id)
     return result
