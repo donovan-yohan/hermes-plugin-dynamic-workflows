@@ -15,6 +15,7 @@ the runtime against a step's declared ``output_schema``.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -108,11 +109,11 @@ class ChildAgentRequest:
             "prompt": self.prompt,
             "label": self.label,
             "phase": self.phase,
-            "schema": self.schema,
+            "schema": copy.deepcopy(self.schema),
             "model": self.model,
             "effort": self.effort,
             "isolation": self.isolation,
-            "context": dict(self.context),
+            "context": copy.deepcopy(self.context),
         }
 
 
