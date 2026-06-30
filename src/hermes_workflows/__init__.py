@@ -125,6 +125,9 @@ from .background import (
 )
 from .agents import (
     AgentRunner,
+    ChildAgentRequest,
+    ChildAgentRunner,
+    CHILD_AGENT_OPTION_KEYS,
     StubAgentRunner,
     KNOWN_AGENTS,
     is_known_agent,
@@ -342,6 +345,9 @@ __all__ = [
     "Progress",
     # agents
     "AgentRunner",
+    "ChildAgentRequest",
+    "ChildAgentRunner",
+    "CHILD_AGENT_OPTION_KEYS",
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",

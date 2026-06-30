@@ -168,12 +168,33 @@ class _Connection:
         raise CapabilityError(error.get("message", "capability denied"), code=error.get("code"))
 
 
+_AGENT_OPTION_KEYS = frozenset({"label", "phase", "schema", "model", "effort", "isolation", "context"})
+
+
+def _looks_like_legacy_agent_id(value: Any) -> bool:
+    return isinstance(value, str) and "." in value and not any(ch.isspace() for ch in value)
+
+
 def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
     """Construct the restricted global namespace the script executes within."""
 
-    async def agent(agent_id: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
-                     schema: Optional[dict[str, Any]] = None) -> Any:
-        return conn.call("agent", {"agent_id": agent_id, "input": input or {}, "label": label, "schema": schema})
+    async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
+                     phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
+                     model: Optional[str] = None, effort: Optional[str] = None,
+                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None) -> Any:
+        explicit_opts = {
+            "label": label, "phase": phase, "schema": schema, "model": model,
+            "effort": effort, "isolation": isolation, "context": context,
+        }
+        legacy_agent_id = _looks_like_legacy_agent_id(target)
+        opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
+        if opts_from_pos is not None or (input is None and not legacy_agent_id):
+            params: dict[str, Any] = {"prompt": target}
+            if opts_from_pos is not None:
+                params.update(opts_from_pos)
+            params.update({key: value for key, value in explicit_opts.items() if value is not None})
+            return conn.call("agent", params)
+        return conn.call("agent", {"agent_id": target, "input": input or {}, "label": label, "schema": schema})
 
     async def kanban_agent(profile: str, task: Any = None, input: Optional[dict[str, Any]] = None, *,
                            title: Optional[str] = None, prompt: Optional[str] = None,

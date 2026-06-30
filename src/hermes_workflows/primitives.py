@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
-from .agents import AgentRunner, StubAgentRunner
+from .agents import AgentRunner, ChildAgentRunner, StubAgentRunner
 from .background import BackgroundWorkflowRunManager
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
@@ -55,6 +55,7 @@ def workflow(
     script_catalog: Optional[FileWorkflowScriptCatalog] = None,
     script_store: Optional[ScriptRunStore] = None,
     agent_runner: Optional[AgentRunner] = None,
+    child_agent_runner: Optional[ChildAgentRunner] = None,
     validate: bool = True,
     max_parallel: int = 8,
     include_steps: bool = True,
@@ -187,6 +188,7 @@ def workflow(
             catalog=script_catalog,
             store=script_store,
             agent_runner=agent_runner,
+            child_agent_runner=child_agent_runner,
             version=script_version,
             validate=validate,
             capability_registry=capability_registry,
@@ -424,6 +426,7 @@ def workflow_run_script(
     catalog: Optional[FileWorkflowScriptCatalog] = None,
     store: Optional[ScriptRunStore] = None,
     agent_runner: Optional[AgentRunner] = None,
+    child_agent_runner: Optional[ChildAgentRunner] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -442,6 +445,7 @@ def workflow_run_script(
         source,
         args=args,
         agent_runner=agent_runner,
+        child_agent_runner=child_agent_runner,
         limits=limits,
         journal=journal,
         validate=validate,
@@ -471,6 +475,7 @@ def run_workflow_script(
     *,
     args: Any = None,
     agent_runner: Optional[AgentRunner] = None,
+    child_agent_runner: Optional[ChildAgentRunner] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -510,6 +515,7 @@ def run_workflow_script(
         source,
         args=args,
         agent_runner=agent_runner,
+        child_agent_runner=child_agent_runner,
         limits=limits,
         journal=journal,
         validate=validate,
