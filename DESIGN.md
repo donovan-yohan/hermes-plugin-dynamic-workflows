@@ -616,6 +616,114 @@ importantly, where Hermes deliberately differs.
   deterministically rather than truly concurrently, so runs and tests are
   reproducible.
 
+### 2.3 Python-vs-JS workflow script compatibility boundary
+
+The compatibility target is the **workflow product contract**, not source-level
+JavaScript execution. The Claude Dynamic Workflows archive uses JavaScript
+examples such as `loop-until-dry-bughunt.js` (`export const meta`, async
+functions, `agent(prompt, { label, phase, schema })`, `parallel`, `phase`, `log`,
+and `budget`). Hermes currently ships a guarded Python subprocess VM (§5). A
+workflow is considered compatible when the same orchestration can be expressed
+with the same deterministic primitives, status/replay semantics, and sandbox
+guarantees, even if the syntax is Python instead of JavaScript.
+
+Parity primitives that are intentional and product-facing:
+
+| Contract | Current Python VM shape |
+|---|---|
+| Script metadata | First statement is literal `meta = {...}` with required `name` / `description`; optional metadata such as `phases` is preserved in validation and run state. |
+| Agent call | `await agent(agent_id, input, label=..., schema=...)`; every call crosses the parent-owned `AgentRunner` / broker boundary. |
+| Fan-out and pipelines | `await parallel([...])` and `await pipeline(...)`; this slice keeps scheduling deterministic and sequential under the hood, while the contract preserves fan-out/join and pipeline semantics. |
+| Phase markers | `phase("title")` records brokered phase transitions; issue #63 also surfaces declared script phases through status. |
+| Logs, inputs, budget | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()` are injected globals, not imports. |
+| Resume/cache | Stable call ids, deterministic replay cache for replayable calls, metadata-only journals, durable Kanban card reattach, and suspended-await replay form the current resume contract. |
+| Model-facing script facade | The registered `workflow` tool currently exposes saved-script operations with `script_source`, `script_name`, `script_args`, and `script_version`. CamelCase archive aliases such as `scriptPath` or `resumeFromRunId` are compatibility vocabulary for future facade work, not shipped `0.1.0` schema. |
+
+Intentional differences and security boundaries:
+
+- JavaScript syntax support is not present in `0.1.0`; it is future work unless a
+  separate JS guest runtime is designed and added. Core must not claim to execute
+  archive `.js` files directly.
+- Python harnesses cannot import modules, open files, read environment variables,
+  spawn processes, open sockets, read the clock, use randomness, or call ambient
+  dynamic builtins (`open`, `eval`, `exec`, `compile`, `__import__`, `globals`,
+  `locals`, `getattr`, `print`, etc.). The static validator rejects those names
+  before launch, and the guest still runs with restricted builtins and a scrubbed
+  environment.
+- The script receives only the RPC-backed workflow globals (`agent`,
+  `kanban_agent`, `capability`, `parallel`, `pipeline`, `phase`, `log`,
+  `workflow`), read-only `args`, `budget`, `meta`, and curated `json` / `math`
+  proxies. Direct filesystem/network/env/clock/randomness access is absent by
+  design; if a workflow needs a real effect, the host must expose a named
+  capability and policy.
+- All outside effects remain parent-owned. The subprocess writes no journal files
+  itself, holds no Hermes/GitHub credentials, and cannot bypass redaction,
+  output limits, approval checks, replay/idempotency, or side-effect-class policy.
+
+Side-by-side translation of the archive loop-until-dry shape:
+
+```js
+// Claude archive style — illustrates the reference product shape.
+export const meta = { name: "loop-until-dry-bughunt" };
+
+let round = 0;
+let areas = ["runtime", "docs", "tests"];
+
+while (areas.length && budget.remaining() > 0 && round < 4) {
+  phase(`round ${round + 1}`);
+  const results = await parallel(areas.map((area) =>
+    agent(`Find remaining bugs in ${area}`, {
+      label: `bughunt:${area}`,
+      phase: "bughunt",
+      schema: { bugs: "array", followups: "array" }
+    })
+  ));
+
+  areas = results.flatMap((result) => result.followups ?? []);
+  log(`round ${round + 1}: ${areas.length} follow-up areas`);
+  round += 1;
+}
+```
+
+```python
+# Current Hermes shape — validated, then executed by the guarded Python VM.
+meta = {
+    "name": "loop_until_dry_bughunt",
+    "description": "Repeat bughunt passes until no follow-up areas remain",
+    "phases": ["bughunt"],
+}
+
+round_index = 0
+script_args = args or {}
+areas = list(script_args.get("areas", ["runtime", "docs", "tests"]))
+max_rounds = script_args.get("max_rounds", 4)
+
+
+async def scan(area):
+    return await agent(
+        "hermes.bughunter",
+        {"prompt": f"Find remaining bugs in {area}", "area": area},
+        label=f"bughunt:{area}",
+        schema={"bugs": "list", "followups": "list"},
+    )
+
+
+while areas and budget.remaining() > 0 and round_index < max_rounds:
+    phase(f"round {round_index + 1}")
+    results = await parallel([lambda area=area: scan(area) for area in areas])
+
+    next_areas = []
+    for result in results:
+        for followup in result.get("followups", []):
+            if followup not in next_areas:
+                next_areas.append(followup)
+    areas = next_areas
+    log(f"round {round_index + 1}: {len(areas)} follow-up areas")
+    round_index = round_index + 1
+
+return {"remaining_areas": areas, "rounds": round_index}
+```
+
 ---
 
 ## 3. Sandbox security model
