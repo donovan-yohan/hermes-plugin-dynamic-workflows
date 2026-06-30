@@ -23,7 +23,7 @@ if _SRC.exists():
     if src_text not in sys.path:
         sys.path.insert(0, src_text)
 
-from hermes_workflows.errors import ControlError, WorkflowError  # noqa: E402
+from hermes_workflows.errors import ControlError, ScriptRunStoreError, WorkflowError  # noqa: E402
 from hermes_workflows.primitives import (  # noqa: E402
     workflow as _workflow,
     workflow_run as _workflow_run,
@@ -502,13 +502,30 @@ def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
         if _plugin_store(session_id=session_id).get(run_id) is not None:
             return True
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
-        return False
+        pass
     try:
         if _plugin_background_store(session_id=session_id).get(run_id) is not None:
             return True
     except Exception:  # pragma: no cover - defensive; background status is best-effort
-        return False
+        pass
+    try:
+        _plugin_script_run_store(session_id=session_id).load_run(run_id)
+        return True
+    except (ScriptRunStoreError, ValueError):
+        pass
+    except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
+        pass
     return bool(_loop_waits(run_id=run_id))
+
+
+def _script_current_phase(events: list[dict[str, Any]]) -> Optional[str]:
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("method") != "phase" or event.get("ok") is not True:
+            continue
+        title = event.get("phase_title") or event.get("label")
+        if isinstance(title, str) and title:
+            return title
+    return None
 
 
 def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
@@ -540,35 +557,66 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
             run_store = _plugin_store(session_id=session_id)
             record = run_store.get(run_id)
             background_record = None if record is not None else _plugin_background_store(session_id=session_id).get(run_id)
-            status_record = record or background_record
+            script_store = _plugin_script_run_store(session_id=session_id)
+            script_record = None
+            if record is None and background_record is None:
+                try:
+                    script_record = script_store.load_run(run_id)
+                except (ScriptRunStoreError, ValueError):
+                    script_record = None
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
             waits = [
                 w
                 for w in _kanban_waits(_plugin_script_store(), run_id=run_id) + _loop_waits(run_id=run_id)
                 if w.run_id == run_id
             ]
-            links = (
-                _control_link_resolver(run_store, session_id=session_id)(status_record)
-                if status_record is not None
-                else {"run_id": run_id}
-            )
-            last_events = (
-                run_store.journal(run_id, limit=params.get("events_limit", 10))
-                if record is not None
-                else _plugin_background_store(session_id=session_id).journal(run_id, limit=params.get("events_limit", 10))
-                if background_record is not None
-                else []
-            )
+            if record is not None:
+                events = run_store.journal(run_id, limit=params.get("events_limit", 10))
+                links = _control_link_resolver(run_store, session_id=session_id)(record)
+                lifecycle = record.status
+                current_phase = _controls.current_phase(record.steps)
+                progress = record.to_status().progress.as_dict()
+                result = record.result
+                error = record.error
+                phases = None
+            elif background_record is not None:
+                events = _plugin_background_store(session_id=session_id).journal(run_id, limit=params.get("events_limit", 10))
+                links = _control_link_resolver(run_store, session_id=session_id)(background_record)
+                lifecycle = background_record.status
+                current_phase = None
+                progress = None
+                result = background_record.result
+                error = background_record.error
+                phases = None
+            elif script_record is not None:
+                events = script_store.journal(run_id, limit=params.get("events_limit", 10))
+                links = _controls.run_links(run_id=run_id, journal_path=str(script_store.journal_path(run_id)))
+                lifecycle = script_record.status
+                current_phase = _script_current_phase(events)
+                phases = script_record.phases
+                progress = {"phases_total": len(phases)}
+                result = script_record.value
+                error = script_record.error
+            else:
+                events = []
+                links = {"run_id": run_id}
+                lifecycle = "unknown"
+                current_phase = None
+                phases = None
+                progress = None
+                result = None
+                error = None
             report = _controls.inspect_run(
                 run_id,
-                lifecycle=status_record.status if status_record is not None else "unknown",
+                lifecycle=lifecycle,
                 control_state=state,
-                current_phase=_controls.current_phase(record.steps) if record is not None else None,
-                progress=record.to_status().progress.as_dict() if record is not None else None,
+                current_phase=current_phase,
+                progress=progress,
                 waits=waits,
-                result=status_record.result if status_record is not None else None,
-                error=status_record.error if status_record is not None else None,
-                last_events=last_events,
+                result=result,
+                error=error,
+                phases=phases,
+                last_events=events,
                 links=links,
                 events_limit=params.get("events_limit", 10),
             )
