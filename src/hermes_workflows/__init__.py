@@ -178,6 +178,7 @@ from .script_catalog import (
     FileWorkflowScriptCatalog,
     ScriptCatalogEntry,
     safe_script_name,
+    safe_script_path,
     default_script_catalog_roots,
 )
 from .script_store import (
@@ -395,6 +396,7 @@ __all__ = [
     "FileWorkflowScriptCatalog",
     "ScriptCatalogEntry",
     "safe_script_name",
+    "safe_script_path",
     "default_script_catalog_roots",
     # durable script run store + replay cache (issue #3)
     "ScriptRunStore",

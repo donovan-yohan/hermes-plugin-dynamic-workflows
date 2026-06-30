@@ -67,6 +67,11 @@ def workflow(
     include_source: bool = False,
     include_versions: bool = False,
     replace: bool = False,
+    script: Optional[str] = None,
+    script_path: Optional[str] = None,
+    name: Optional[str] = None,
+    args: Any = None,
+    resume_from_run_id: Optional[str] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     execution_mode: Optional[str] = None,
@@ -81,8 +86,15 @@ def workflow(
     operator/debug usage.
     """
     store = registry if registry is not None else get_default_store(session_id=session_id)
+    facade_script_args = args if args is not None else script_args
+    facade_name = name if name is not None else script_name
+    has_facade_script = script is not None or script_path is not None or name is not None
     op = action or (
-        "validate" if dry_run else "run_template" if template_name else "status" if definition is None and run_id else "run"
+        "validate" if dry_run else
+        "run_facade_script" if has_facade_script else
+        "run_template" if template_name else
+        "status" if definition is None and run_id else
+        "run"
     )
     if op == "validate":
         if definition is None:
@@ -135,6 +147,54 @@ def workflow(
         }
     if op == "script_catalog":
         return workflow_script_catalog(catalog=script_catalog, include_versions=include_versions)
+    if op == "run_facade_script":
+        source_count = sum(value is not None for value in (script, script_path, name))
+        if source_count != 1:
+            raise ValueError("workflow script facade requires exactly one of 'script', 'script_path', or 'name'")
+        if script is not None:
+            result = run_workflow_script(
+                script,
+                args=facade_script_args,
+                store=script_store,
+                agent_runner=agent_runner,
+                validate=validate,
+                run_id=run_id,
+                replay_from=resume_from_run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+            )
+            return _script_run_payload("inline_script", result)
+        if script_path is not None:
+            active_catalog = script_catalog if script_catalog is not None else FileWorkflowScriptCatalog()
+            source = active_catalog.load_script_path(script_path)
+            result = run_workflow_script(
+                source,
+                args=facade_script_args,
+                store=script_store,
+                agent_runner=agent_runner,
+                validate=validate,
+                run_id=run_id,
+                replay_from=resume_from_run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+            )
+            return _script_run_payload("script_path", result, script_path=script_path)
+        if facade_name is None:
+            raise ValueError("workflow script facade requires 'name'")
+        result = workflow_run_script(
+            facade_name,
+            args=facade_script_args,
+            catalog=script_catalog,
+            store=script_store,
+            agent_runner=agent_runner,
+            version=script_version,
+            validate=validate,
+            run_id=run_id,
+            replay_from=resume_from_run_id,
+            capability_registry=capability_registry,
+            capability_policy=capability_policy,
+        )
+        return _script_run_payload("saved_script", result, name=facade_name)
     if op == "script_save":
         if not script_name or script_source is None:
             raise ValueError("workflow script_save requires 'script_name' and 'script_source'")
@@ -155,47 +215,51 @@ def workflow(
             include_source=include_source,
         )
     if op == "run_script":
-        if not script_name:
-            raise ValueError("workflow run_script requires 'script_name'")
+        selected_name = facade_name
+        if not selected_name:
+            raise ValueError("workflow run_script requires 'script_name' or 'name'")
         mode = _execution_mode(execution_mode=execution_mode, background=background)
         if mode == "background":
             active_catalog = script_catalog if script_catalog is not None else FileWorkflowScriptCatalog()
-            source = active_catalog.load_script(script_name, version=script_version)
+            source = active_catalog.load_script(selected_name, version=script_version)
             active_store = script_store if script_store is not None else ScriptRunStore(".hermes-workflow-script-runs")
             manager = background_manager or BackgroundWorkflowRunManager.from_script_store(active_store)
             record = manager.launch_script(
                 source,
-                args=script_args,
-                script_name=script_name,
+                args=facade_script_args,
+                script_name=selected_name,
                 script_version=script_version,
                 agent_runner=agent_runner,
                 child_agent_runner=child_agent_runner,
                 validate=validate,
                 run_id=run_id,
+                replay_from=resume_from_run_id,
                 capability_registry=capability_registry,
                 capability_policy=capability_policy,
             )
             return {
                 "operation": "run_script",
-                "script_name": script_name,
+                "script_name": selected_name,
                 "execution_mode": "background",
                 "run_id": record.run_id,
                 "status": record.status,
                 "background": record.to_dict(),
             }
         result = workflow_run_script(
-            script_name,
-            args=script_args,
+            selected_name,
+            args=facade_script_args,
             catalog=script_catalog,
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
             version=script_version,
             validate=validate,
+            run_id=run_id,
+            replay_from=resume_from_run_id,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
         )
-        return {"operation": "run_script", "script_name": script_name, "execution_mode": "foreground", "result": result.as_dict()}
+        return {"operation": "run_script", "script_name": selected_name, "execution_mode": "foreground", "result": result.as_dict()}
     raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
 
 
@@ -207,6 +271,23 @@ def _execution_mode(*, execution_mode: Optional[str], background: bool) -> str:
     if background and execution_mode == "foreground":
         raise ValueError("background=True conflicts with execution_mode='foreground'")
     return mode
+
+
+def _script_run_payload(source: str, result: ScriptRunResult, **extra: Any) -> dict[str, Any]:
+    status = "suspended" if result.suspended else "succeeded" if result.ok else "failed"
+    payload: dict[str, Any] = {
+        "operation": "run_script",
+        "source": source,
+        "run_id": result.run_id,
+        "status": status,
+        "result": result.as_dict(),
+    }
+    if result.journal_path:
+        payload["journal_path"] = result.journal_path
+    if result.replayed_calls:
+        payload["replayed_calls"] = result.replayed_calls
+    payload.update(extra)
+    return payload
 
 
 def _run_and_status(

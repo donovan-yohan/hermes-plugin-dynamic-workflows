@@ -246,6 +246,13 @@ workflow(
 )
 workflow(action="script_catalog", include_versions=True)
 workflow(action="run_script", script_name="issue_lane", script_args={"issue": 123})
+
+# Claude-style facade compatibility: no lower-level action names required.
+workflow(name="issue_lane", args={"issue": 123})
+workflow(script='meta = {"name": "inline", "description": "demo"}\nreturn {"ok": True}\n')
+workflow(script_path="issue_lane/v000001.workflow.py", args={"issue": 123})
+workflow(script='meta = {"name": "inline", "description": "demo"}\nlog("resume")\nreturn args\n',
+         args={"issue": 123}, resume_from_run_id="wfs_previous_run")
 ```
 
 See [examples/README.md](examples/README.md) for runnable script VM, scoped grant, and finalizer examples.

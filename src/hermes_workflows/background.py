@@ -328,7 +328,7 @@ class BackgroundRunStore:
             record = self._load_unlocked(run_id)
             if record is None:
                 raise ValueError(f"background run not found: {run_id!r}")
-            if status == "running" and record.status == "stopped":
+            if record.status in BACKGROUND_TERMINAL_STATES:
                 return record
             record.status = status
             record.updated_at = utc_now_iso()
@@ -454,7 +454,13 @@ class BackgroundWorkflowRunManager:
         )
         with self._threads_lock:
             self._threads[rid] = thread
-        thread.start()
+        try:
+            thread.start()
+        except BaseException as exc:
+            with self._threads_lock:
+                self._threads.pop(rid, None)
+            self.store.fail_launch(rid, exc)
+            raise
         # Give the worker a tiny scheduling window so callers usually see
         # ``running`` for trivial scripts, but never wait on user work.
         time.sleep(0)

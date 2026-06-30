@@ -168,11 +168,13 @@ class _Connection:
         raise CapabilityError(error.get("message", "capability denied"), code=error.get("code"))
 
 
-_AGENT_OPTION_KEYS = frozenset({"label", "phase", "schema", "model", "effort", "isolation", "context"})
-
-
 def _looks_like_legacy_agent_id(value: Any) -> bool:
-    return isinstance(value, str) and "." in value and not any(ch.isspace() for ch in value)
+    return (
+        isinstance(value, str)
+        and (value.startswith("hermes.") or value.startswith("kanban."))
+        and len(value.split(".", 1)[1]) > 0
+        and not any(ch.isspace() for ch in value)
+    )
 
 
 def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
@@ -188,10 +190,12 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
         }
         legacy_agent_id = _looks_like_legacy_agent_id(target)
         opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
-        if opts_from_pos is not None or (input is None and not legacy_agent_id):
+        if opts_from_pos is not None or not legacy_agent_id:
             params: dict[str, Any] = {"prompt": target}
             if opts_from_pos is not None:
                 params.update(opts_from_pos)
+            elif input is not None:
+                params["_invalid_opts_type"] = type(input).__name__
             params.update({key: value for key, value in explicit_opts.items() if value is not None})
             return conn.call("agent", params)
         return conn.call("agent", {"agent_id": target, "input": input or {}, "label": label, "schema": schema})

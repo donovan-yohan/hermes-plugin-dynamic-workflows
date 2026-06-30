@@ -69,6 +69,7 @@ from .kanban import (
     normalize_on_block,
     validate_workflow_result,
 )
+from .grants import redact_credentials
 from .registry import utc_now_iso
 from .script_store import (
     CallRecorder,
@@ -619,7 +620,7 @@ class CapabilityBroker:
             raise CapabilityDenied(
                 f"prompt child agent returned {type(output).__name__}, expected dict", code="bad_output"
             )
-        safe_output = _json_safe(output)
+        safe_output = redact_credentials(_json_safe(output))
         assert isinstance(safe_output, dict)
         _validate_output(safe_output, request.schema)
         usage = safe_output.get("_tokens")

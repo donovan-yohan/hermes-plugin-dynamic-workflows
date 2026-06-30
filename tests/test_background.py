@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -13,6 +14,7 @@ from typing import Any, Callable
 from hermes_workflows import ChildAgentRequest
 from hermes_workflows.background import BackgroundRunStore, BackgroundWorkflowRunManager
 from hermes_workflows.script_store import ScriptRunStore
+from hermes_workflows.vm import ScriptRunResult
 
 SCRIPT = (
     'meta = {"name": "background-demo", "description": "d"}\n'
@@ -150,6 +152,44 @@ def test_background_stop_wins_over_late_worker_completion():
         final = background_store.get(record.run_id)
         assert final.status == "stopped"
         assert final.error["type"] == "BackgroundRunStopped"
+
+
+def test_background_thread_start_failure_marks_failed_and_cleans_tracking(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        background_store = BackgroundRunStore(Path(tmp) / "background-runs")
+        script_store = ScriptRunStore(Path(tmp) / "script-runs")
+        manager = BackgroundWorkflowRunManager(background_store, script_store)
+
+        def fail_start(self):  # noqa: ANN001 - monkeypatch target mirrors threading.Thread.start
+            raise RuntimeError("start failed")
+
+        monkeypatch.setattr(threading.Thread, "start", fail_start)
+
+        try:
+            manager.launch_script(SCRIPT, args={"value": "x"}, run_id="wfs_start_fail")
+        except RuntimeError as exc:
+            assert str(exc) == "start failed"
+        else:  # pragma: no cover - regression guard
+            raise AssertionError("launch should propagate thread.start failure")
+
+        record = background_store.get("wfs_start_fail")
+        assert record.status == "failed"
+        assert record.error == {"type": "RuntimeError", "message": "start failed"}
+        assert "wfs_start_fail" not in manager._threads
+
+
+def test_background_terminal_state_is_not_regressed_by_late_fail_launch():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BackgroundRunStore(Path(tmp) / "background-runs")
+        store.begin("wfs_terminal_final", script=SCRIPT, args={"value": "ok"})
+        succeeded = store.finish("wfs_terminal_final", ScriptRunResult(ok=True, value={"answer": "ok"}))
+        assert succeeded.status == "succeeded"
+
+        late = store.fail_launch("wfs_terminal_final", RuntimeError("late failure"))
+
+        assert late.status == "succeeded"
+        assert late.result == {"answer": "ok"}
+        assert late.error is None
 
 
 class _FakeContext:

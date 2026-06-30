@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from hermes_workflows import ChildAgentRequest, ScriptRunStore, run_workflow_script
+from hermes_workflows import REDACTED, ChildAgentRequest, ScriptRunStore, run_workflow_script
 
 META = 'meta = {"name": "prompt-agent", "description": "d"}\n'
 
@@ -21,8 +21,9 @@ class FakeChildRunner:
         return dict(self.output)
 
 
-def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_metadata():
-    runner = FakeChildRunner()
+def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_outputs():
+    secret = "ghp_should_not_persist_secret"
+    runner = FakeChildRunner({"answer": "ok", "token": secret, "nested": {"detail": secret}, "_tokens": 3})
     script = META + (
         'result = await agent("summarize the latest PR", {\n'
         '    "label": "summary",\n'
@@ -45,7 +46,8 @@ def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_meta
             deterministic_runner=True,
         )
         assert res.ok, res.error
-        assert res.value == {"answer": "ok", "_tokens": 3}
+        expected = {"answer": "ok", "token": REDACTED, "nested": {"detail": REDACTED}, "_tokens": 3}
+        assert res.value == expected
         assert len(runner.requests) == 1
         request = runner.requests[0]
         assert request.prompt == "summarize the latest PR"
@@ -63,8 +65,12 @@ def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_meta
         assert call["phase"] == "analysis"
         assert "prompt" not in call
         assert "params" not in call
-        assert store.load_run("prompt_run").value == {"answer": "ok", "_tokens": 3}
-        assert store.load_cache("prompt_run").get(1).value == {"answer": "ok", "_tokens": 3}
+        assert store.load_run("prompt_run").value == expected
+        assert store.load_cache("prompt_run").get(1).value == expected
+        run_dir = Path(tmp) / "runs" / "prompt_run"
+        assert secret not in (run_dir / "run.json").read_text(encoding="utf-8")
+        assert secret not in (run_dir / "cache.jsonl").read_text(encoding="utf-8")
+        assert secret not in (run_dir / "journal.jsonl").read_text(encoding="utf-8")
 
 
 def test_prompt_agent_without_child_runner_fails_closed_instead_of_using_stub_runner():
@@ -111,3 +117,27 @@ def test_legacy_agent_id_input_compatibility_is_preserved():
     )
     assert res.ok, res.error
     assert res.value == {"greeting": "hello, compat"}
+
+
+def test_prompt_agent_with_dotted_prompt_is_not_misrouted_as_legacy_agent_id():
+    runner = FakeChildRunner({"answer": "dotted prompt"})
+    res = run_workflow_script(META + 'return await agent("summarize.")\n', child_agent_runner=runner)
+    assert res.ok, res.error
+    assert res.value == {"answer": "dotted prompt"}
+    assert runner.requests[0].prompt == "summarize."
+
+
+def test_prompt_agent_rejects_non_dict_positional_options_without_unknown_agent_misroute():
+    runner = FakeChildRunner()
+    script = META + (
+        'try:\n'
+        '    await agent("summarize", "not-an-options-object")\n'
+        'except CapabilityError as e:\n'
+        '    return {"code": e.code, "message": str(e)}\n'
+        'return {"code": "missing"}\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+    assert res.ok, res.error
+    assert res.value["code"] == "bad_request"
+    assert "unknown agent" not in res.value["message"]
+    assert runner.requests == []

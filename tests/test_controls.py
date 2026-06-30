@@ -603,6 +603,58 @@ def test_plugin_workflow_control_end_to_end(monkeypatch):
         assert status2["data"]["control_state"]["desired_state"] == "stopped"
 
 
+def test_plugin_workflow_control_inspects_facade_script_run_ids(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp)
+        monkeypatch.setenv("HERMES_WORKFLOWS_STATE_DIR", str(state_dir / "runs"))
+        monkeypatch.setenv("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR", str(state_dir / "scripts"))
+        plugin = _load_plugin_root()
+        ctx = _FakeContext()
+        plugin.register(ctx)
+        wf = ctx.tools["workflow"]["handler"]
+        ctl = ctx.tools["workflow_control"]["handler"]
+        source = (
+            'meta = {"name": "facade", "description": "control status"}\n'
+            'phase("collect")\n'
+            'log("finished")\n'
+            'return {"value": args["value"]}\n'
+        )
+
+        saved = json.loads(wf({"action": "script_save", "script_name": "saved", "script_source": source}))
+        assert saved["success"] is True
+        runs = [
+            json.loads(wf({"script": source, "args": {"value": 7}}))["data"],
+            json.loads(wf({"name": "saved", "args": {"value": 8}}))["data"],
+            json.loads(wf({"scriptPath": "saved/v000001.workflow.py", "args": {"value": 9}}))["data"],
+        ]
+
+        assert {run["source"] for run in runs} == {"inline_script", "saved_script", "script_path"}
+        for expected, run in zip((7, 8, 9), runs):
+            run_id = run["run_id"]
+            assert run_id.startswith("wfs_")
+            status = json.loads(ctl({"action": "status", "run_id": run_id, "events_limit": 20}))
+            assert status["success"] is True
+            assert status["data"]["lifecycle"] == "succeeded"
+            assert status["data"]["progress"]["total"] == 2
+            assert status["data"]["progress"]["completed"] == 2
+            assert status["data"]["result"] == {"value": expected}
+            assert [event["type"] for event in status["data"]["last_events"]] == ["boot", "call", "call", "done"]
+            assert status["data"]["links"]["kind"] == "script"
+            assert status["data"]["links"]["journal"].endswith("journal.jsonl")
+
+        paused = json.loads(ctl({"action": "pause", "run_id": runs[0]["run_id"], "reason": "inspect"}))
+        assert paused["success"] is True
+        paused_status = json.loads(ctl({"action": "status", "run_id": runs[0]["run_id"]}))
+        assert paused_status["data"]["control_state"]["paused"] is True
+
+        overview = json.loads(ctl({"action": "overview", "limit": 10}))
+        assert overview["success"] is True
+        rows = {row["run_id"]: row for row in overview["data"]["runs"]}
+        assert all(run["run_id"] in rows for run in runs)
+        assert rows[runs[0]["run_id"]]["kind"] == "script"
+        assert rows[runs[0]["run_id"]]["paused"] is True
+
+
 def test_plugin_status_surfaces_persisted_kanban_wait_without_run_id(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         state_dir = Path(tmp)
