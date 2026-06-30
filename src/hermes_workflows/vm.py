@@ -103,6 +103,17 @@ _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "capability", "log", "pha
 # so the broker must fall through to a live dispatch.
 _MISS = object()
 
+_BrokerStatusFlags = tuple[
+    bool,
+    Optional[str],
+    bool,
+    dict[str, Any],
+    bool,
+    dict[str, Any],
+    bool,
+    dict[str, Any],
+]
+
 # Cap on how many distinct result-contract violations one kanban_agent call records
 # (journal marker + card comment). Under on_block="pause" a misbehaving worker can
 # re-complete with bad output rapidly; the await is deadline-bounded, but this keeps
@@ -317,6 +328,20 @@ class CapabilityBroker:
             self.pause_info = info
         raise CapabilityDenied(decision.reason, code=decision.code)
 
+    def _status_flags(self) -> _BrokerStatusFlags:
+        """Return terminal side-channel state under the broker lock."""
+        with self._lock:
+            return (
+                self.should_abort,
+                self.abort_reason,
+                self.should_suspend,
+                dict(self.suspend_info or {}),
+                self.should_stop,
+                dict(self.stop_info or {}),
+                self.should_pause,
+                dict(self.pause_info or {}),
+            )
+
     def _check_run_control(self, call_id: Any, method: str, params: dict[str, Any]) -> None:
         state = self._control_state()
         if state is None:
@@ -448,16 +473,14 @@ class CapabilityBroker:
                 fingerprint = ""
                 args_hash = ""
             if request is not None and isinstance(value, dict):
-                self._prompt_results[fingerprint] = (args_hash, value)
-                if (
-                    self._recorder is not None
-                    and fingerprint not in self._recorded_prompt_fingerprints
-                ):
-                    try:
-                        self._recorder.record_prompt(fingerprint, method, args_hash, value)
-                        self._recorded_prompt_fingerprints.add(fingerprint)
-                    except Exception:  # noqa: BLE001 — persistence is best-effort.
-                        pass
+                with self._lock:
+                    self._prompt_results[fingerprint] = (args_hash, value)
+                    if self._recorder is not None and fingerprint not in self._recorded_prompt_fingerprints:
+                        try:
+                            self._recorder.record_prompt(fingerprint, method, args_hash, value)
+                            self._recorded_prompt_fingerprints.add(fingerprint)
+                        except Exception:  # noqa: BLE001 — persistence is best-effort.
+                            pass
                 try:
                     self._emit_prompt_agent_event(
                         "agent_result", call_id, request, fingerprint, ok=True, has_value=True
@@ -520,7 +543,8 @@ class CapabilityBroker:
         entry_args_hash: Optional[str] = None
         cache_source: Optional[str] = None
 
-        cached = self._prompt_results.get(fingerprint)
+        with self._lock:
+            cached = self._prompt_results.get(fingerprint)
         if cached is not None:
             entry_args_hash, value = cached
             cache_source = "run"
@@ -528,25 +552,31 @@ class CapabilityBroker:
             entry = self._replay.get_prompt(fingerprint)
             if entry is not None:
                 if entry.method != "agent":
-                    self.should_abort = True
-                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: recorded method {entry.method!r}"
-                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                    with self._lock:
+                        self.should_abort = True
+                        self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: recorded method {entry.method!r}"
+                        message = self.abort_reason
+                    raise CapabilityDenied(message, code="replay_mismatch")
                 entry_args_hash = entry.args_hash
                 if not isinstance(entry.value, dict):
-                    self.should_abort = True
-                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: cached value is not an object"
-                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                    with self._lock:
+                        self.should_abort = True
+                        self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: cached value is not an object"
+                        message = self.abort_reason
+                    raise CapabilityDenied(message, code="replay_mismatch")
                 value = entry.value
                 cache_source = "replay"
 
         if value is None or entry_args_hash is None:
             return _MISS
         if entry_args_hash != args_hash:
-            self.should_abort = True
-            self.abort_reason = (
-                f"prompt replay drift at fingerprint {fingerprint}: recorded arguments do not match"
-            )
-            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+            with self._lock:
+                self.should_abort = True
+                self.abort_reason = (
+                    f"prompt replay drift at fingerprint {fingerprint}: recorded arguments do not match"
+                )
+                message = self.abort_reason
+            raise CapabilityDenied(message, code="replay_mismatch")
         _validate_output(value, request.schema)
         with self._lock:
             self._agent_calls += 1
@@ -791,13 +821,14 @@ class CapabilityBroker:
         a failure. The metadata-only journal ``call`` event is emitted by the
         :class:`CapabilityDenied` path in :meth:`handle` (error ``kanban_suspended``).
         """
-        self.should_suspend = True
-        self.suspend_info = {
-            "card_id": card_id,
-            "profile": profile,
-            "call_id": call_id,
-            "on_block": on_block,
-        }
+        with self._lock:
+            self.should_suspend = True
+            self.suspend_info = {
+                "card_id": card_id,
+                "profile": profile,
+                "call_id": call_id,
+                "on_block": on_block,
+            }
 
     def _kanban_idempotency_key(self, call_id: Any) -> str:
         """Stable key for one logical ``kanban_agent`` call.
@@ -1315,15 +1346,30 @@ class WorkflowVM:
 
             ret_executor = ThreadPoolExecutor(max_workers=max(1, int(self._limits.max_parallel or 1)))
             ret_write_lock = threading.Lock()
+            protocol_state_lock = threading.Lock()
             pending_rets: set[Future[Any]] = set()
 
             def _set_protocol_error(message: str) -> None:
                 nonlocal protocol_error
-                if protocol_error is None:
-                    protocol_error = message
+                with protocol_state_lock:
+                    if protocol_error is None:
+                        protocol_error = message
+
+            def _protocol_error() -> Optional[str]:
+                with protocol_state_lock:
+                    return protocol_error
+
+            def _set_suspended(info: dict[str, Any]) -> None:
+                nonlocal suspended
+                with protocol_state_lock:
+                    if suspended is None:
+                        suspended = info
+
+            def _suspended() -> Optional[dict[str, Any]]:
+                with protocol_state_lock:
+                    return suspended
 
             def _handle_and_reply(call_frame: dict[str, Any]) -> None:
-                nonlocal suspended
                 ret = broker.handle(call_frame)
                 try:
                     with ret_write_lock:
@@ -1331,16 +1377,17 @@ class WorkflowVM:
                 except (BrokenPipeError, OSError) as exc:
                     _set_protocol_error(f"child stdin closed: {exc}")
                     return
-                if broker.should_abort:
+                should_abort, abort_reason, should_suspend, suspend_info, *_ = broker._status_flags()
+                if should_abort:
                     _kill(proc)
-                    _set_protocol_error(broker.abort_reason or "aborted: capability hard-limit exceeded")
-                if broker.should_suspend:
+                    _set_protocol_error(abort_reason or "aborted: capability hard-limit exceeded")
+                if should_suspend:
                     # An unresolved paused Kanban await suspended the run: tear
                     # the subprocess down (the script's local state is discarded;
                     # a resume re-runs it from the replay cache) and report a
                     # resumable suspended run rather than a failure.
                     _kill(proc)
-                    suspended = broker.suspend_info or {}
+                    _set_suspended(suspend_info)
 
             try:
                 while booted:
@@ -1351,24 +1398,38 @@ class WorkflowVM:
                         if exc is not None:
                             _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
                             _kill(proc)
-                    if protocol_error is not None or suspended is not None:
+                    if _protocol_error() is not None or _suspended() is not None:
                         break
-                    if broker.should_stop:
+                    (
+                        should_abort,
+                        abort_reason,
+                        should_suspend,
+                        suspend_info,
+                        should_stop,
+                        stop_info,
+                        should_pause,
+                        pause_info,
+                    ) = broker._status_flags()
+                    if should_suspend:
                         _kill(proc)
-                        stopped = broker.stop_info or {}
+                        _set_suspended(suspend_info)
                         break
-                    if broker.should_pause:
+                    if should_stop:
                         _kill(proc)
-                        paused = broker.pause_info or {}
+                        stopped = stop_info
                         break
-                    if broker.should_abort:
+                    if should_pause:
                         _kill(proc)
-                        protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
+                        paused = pause_info
+                        break
+                    if should_abort:
+                        _kill(proc)
+                        _set_protocol_error(abort_reason or "aborted: capability hard-limit exceeded")
                         break
                     try:
                         frame = rpc.read_frame(proc.stdout)
                     except rpc.RPCProtocolError as exc:
-                        protocol_error = str(exc)
+                        _set_protocol_error(str(exc))
                         break
                     if frame is None:
                         break  # EOF: child exited (cleanly after done, or crashed).
