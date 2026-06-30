@@ -32,7 +32,16 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import rpc
-from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_id, is_kanban_runner_id
+from .agents import (
+    CHILD_AGENT_OPTION_KEYS,
+    AgentRunner,
+    ChildAgentRequest,
+    ChildAgentRunner,
+    StubAgentRunner,
+    is_known_agent,
+    is_kanban_runner_id,
+    kanban_runner_id,
+)
 from .capabilities import (
     CapabilityPolicy,
     CapabilityRegistry,
@@ -187,6 +196,7 @@ class CapabilityBroker:
         agent_runner: AgentRunner,
         limits: VMLimits,
         *,
+        child_agent_runner: Optional[ChildAgentRunner] = None,
         journal: Optional[JournalSink] = None,
         redact: bool = True,
         recorder: Optional[CallRecorder] = None,
@@ -198,6 +208,7 @@ class CapabilityBroker:
         capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._runner = agent_runner
+        self._child_runner = child_agent_runner
         self._limits = limits
         self._journal = journal
         self._redact = redact
@@ -455,6 +466,9 @@ class CapabilityBroker:
             raise CapabilityDenied(f"token_budget ({budget}) exhausted", code="limit_token")
 
     def _handle_agent(self, params: dict[str, Any]) -> dict[str, Any]:
+        if "prompt" in params:
+            return self._handle_prompt_agent(params)
+
         agent_id = params.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id:
             raise CapabilityDenied("agent call requires a non-empty 'agent_id'", code="bad_request")
@@ -472,6 +486,49 @@ class CapabilityBroker:
             raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         payload = params.get("input") if isinstance(params.get("input"), dict) else {}
         return self._invoke(agent_id, payload, params.get("schema"))
+
+    def _handle_prompt_agent(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
+
+        prompt = params.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
+        unknown = sorted(set(params) - ({"prompt"} | CHILD_AGENT_OPTION_KEYS))
+        if unknown:
+            raise CapabilityDenied(
+                "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
+            )
+        self._check_token_budget()
+        self._agent_calls += 1
+        if self._agent_calls > self._limits.max_agent_calls:
+            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        if self._child_runner is None:
+            raise CapabilityDenied(
+                "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
+            )
+
+        request = ChildAgentRequest(
+            prompt=prompt,
+            label=_optional_str(params, "label"),
+            phase=_optional_str(params, "phase"),
+            schema=_optional_dict(params, "schema"),
+            model=_optional_str(params, "model"),
+            effort=_optional_str(params, "effort"),
+            isolation=_optional_str(params, "isolation"),
+            context=_optional_dict(params, "context") or {},
+        )
+        output = self._child_runner(request)
+        if not isinstance(output, dict):
+            raise CapabilityDenied(
+                f"prompt child agent returned {type(output).__name__}, expected dict", code="bad_output"
+            )
+        safe_output = _json_safe(output)
+        assert isinstance(safe_output, dict)
+        _validate_output(safe_output, request.schema)
+        usage = safe_output.get("_tokens")
+        if isinstance(usage, int) and not isinstance(usage, bool):
+            self._tokens += usage
+        return safe_output
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         profile = params.get("profile")
@@ -754,6 +811,8 @@ class CapabilityBroker:
             event["capability"] = safe_capability_metadata_value(params.get("name"))
         if params.get("label"):
             event["label"] = safe_capability_metadata_value(params.get("label"))
+        if params.get("phase"):
+            event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if error:
             event["error"] = error
         if replayed:
@@ -782,6 +841,37 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
             )
 
 
+def _optional_str(params: dict[str, Any], key: str) -> Optional[str]:
+    value = params.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    raise CapabilityDenied(f"prompt agent option {key!r} must be a string", code="bad_request")
+
+
+def _optional_dict(params: dict[str, Any], key: str) -> Optional[dict[str, Any]]:
+    value = params.get(key)
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    raise CapabilityDenied(f"prompt agent option {key!r} must be an object", code="bad_request")
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce child-agent output into a deterministic JSON-safe shape."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else {"_unserializable_type": "float"}
+    if isinstance(value, (str, int, bool, type(None))):
+        return value
+    return {"_unserializable_type": type(value).__name__}
+
+
 class WorkflowVM:
     """Launches and drives one workflow subprocess under a capability broker."""
 
@@ -789,6 +879,7 @@ class WorkflowVM:
         self,
         *,
         agent_runner: Optional[AgentRunner] = None,
+        child_agent_runner: Optional[ChildAgentRunner] = None,
         limits: Optional[VMLimits] = None,
         journal: Optional[JournalSink] = None,
         python_executable: Optional[str] = None,
@@ -801,6 +892,7 @@ class WorkflowVM:
         capability_policy: Optional[CapabilityPolicy] = None,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
+        self._child_runner = child_agent_runner
         self._limits = limits if limits is not None else VMLimits()
         self._journal = journal
         self._python = python_executable or sys.executable
@@ -842,6 +934,7 @@ class WorkflowVM:
         broker = CapabilityBroker(
             self._runner,
             self._limits,
+            child_agent_runner=self._child_runner,
             journal=_collect,
             recorder=self._recorder,
             replay=self._replay,
@@ -1211,6 +1304,7 @@ def run_script(
     *,
     args: Any = None,
     agent_runner: Optional[AgentRunner] = None,
+    child_agent_runner: Optional[ChildAgentRunner] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -1249,7 +1343,7 @@ def run_script(
     deterministic = (
         deterministic_runner
         if deterministic_runner is not None
-        else isinstance(runner, StubAgentRunner)
+        else isinstance(runner, StubAgentRunner) and child_agent_runner is None
     )
 
     # Resolve replay up front, before touching the subprocess, so every failure
@@ -1320,6 +1414,7 @@ def run_script(
         idempotency_root = f"mem_{script_sha256(script)[:12]}_{canonical_hash(args)[:8]}"
         vm = WorkflowVM(
             agent_runner=runner,
+            child_agent_runner=child_agent_runner,
             limits=effective_limits,
             journal=journal,
             replay=replay_cache,
@@ -1362,6 +1457,7 @@ def run_script(
     idempotency_root = replay_idempotency_root if replay_idempotency_root is not None else persist_run_id
     vm = WorkflowVM(
         agent_runner=runner,
+        child_agent_runner=child_agent_runner,
         limits=effective_limits,
         journal=_store_journal,
         recorder=recorder,
