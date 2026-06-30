@@ -352,6 +352,130 @@ def test_pipeline_failure_waits_for_in_flight_parent_runner_work():
     assert elapsed >= 0.20
 
 
+def test_parallel_running_sibling_return_does_not_mask_original_failure():
+    started = []
+    lock = threading.Lock()
+    first_two_started = threading.Event()
+    release_slow = threading.Event()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    first_two_started.set()
+            if index == 0:
+                if not first_two_started.wait(2.0):
+                    raise RuntimeError("parallel did not start the slow sibling")
+                release_slow.set()
+                raise RuntimeError("boom")
+            if index == 1:
+                if not release_slow.wait(2.0):
+                    raise RuntimeError("failure did not release slow sibling")
+                threading.Event().wait(0.05)
+                return {"i": index}
+            raise RuntimeError(f"queued child {index} should not have started")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "    lambda: agent('hermes.echo', {'i': 3}),\n"
+        "])\n"
+        "return outs\n"
+    )
+
+    for _ in range(20):
+        started.clear()
+        first_two_started.clear()
+        release_slow.clear()
+        res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2))
+        assert res.ok is False
+        assert res.error["type"] == "CapabilityError"
+        assert res.error.get("code") == "runner_error"
+        assert "Broken pipe" not in str(res.error)
+        assert sorted(started) == [0, 1]
+
+
+def test_parallel_failure_waits_for_already_started_parent_work_before_returning():
+    started = []
+    finished = []
+    lock = threading.Lock()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.35)
+                with lock:
+                    finished.append(index)
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    started_at = time.perf_counter()
+    res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=5.0))
+    elapsed = time.perf_counter() - started_at
+
+    assert res.ok is False
+    assert res.error["type"] == "CapabilityError"
+    assert "Broken pipe" not in str(res.error)
+    assert sorted(started) == [0, 1]
+    assert finished == [1]
+    assert elapsed >= 0.30
+
+
+def test_parallel_failure_reports_parent_work_still_running_after_deadline():
+    started = []
+    finished = threading.Event()
+    lock = threading.Lock()
+
+    class TooSlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.45)
+                finished.set()
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=TooSlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=0.1))
+
+    assert res.ok is False
+    assert res.error["type"] == "WorkflowSubprocessError"
+    assert "cannot be cancelled" in res.error["message"]
+    assert res.error["parent_calls_still_running"] == [
+        {"call_id": 2, "method": "agent", "parallel_index": 1, "agent_id": "hermes.echo"}
+    ]
+    assert sorted(started) == [0, 1]
+    assert finished.wait(1.0)
+
+
 def test_kanban_agent_routes_through_reserved_runner():
     script = META + (
         'r = await kanban_agent("relayplanner", {"goal": "plan"}, {"repo": "x"})\n'

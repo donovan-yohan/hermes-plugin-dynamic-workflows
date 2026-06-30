@@ -118,6 +118,11 @@ from .vm import (
     WorkflowVM,
     run_script,
 )
+from .background import (
+    BackgroundRunRecord,
+    BackgroundRunStore,
+    BackgroundWorkflowRunManager,
+)
 from .agents import (
     AgentRunner,
     ChildAgentRequest,
@@ -181,6 +186,7 @@ from .script_store import (
     ScriptRunMeta,
     ReplayCache,
     ReplayEntry,
+    PromptReplayEntry,
     CallRecorder,
     SCRIPT_SCHEMA_VERSION,
     script_run_id,
@@ -330,6 +336,9 @@ __all__ = [
     "VMLimits",
     "ScriptRunResult",
     "run_script",
+    "BackgroundRunRecord",
+    "BackgroundRunStore",
+    "BackgroundWorkflowRunManager",
     # models
     "Diagnostic",
     "ValidationResult",
@@ -396,6 +405,7 @@ __all__ = [
     "ScriptRunMeta",
     "ReplayCache",
     "ReplayEntry",
+    "PromptReplayEntry",
     "CallRecorder",
     "SCRIPT_SCHEMA_VERSION",
     "script_run_id",
