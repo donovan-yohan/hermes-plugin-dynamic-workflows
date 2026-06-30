@@ -268,6 +268,11 @@ class CapabilityBroker:
         self._capability_calls = 0
         self._tokens = 0
         self._replayed_calls = 0
+        # Prompt-agent result cache for this process/run. Durable replays load the
+        # same shape from ReplayCache; this in-memory map avoids respawning a child
+        # twice for identical prompt/options within one live run.
+        self._prompt_results: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._recorded_prompt_fingerprints: set[str] = set()
         self.should_abort = False
         self.abort_reason: Optional[str] = None
         # Durable suspend signal (issue #5): set when an unresolved paused Kanban
@@ -375,6 +380,14 @@ class CapabilityBroker:
                 raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
             self._check_run_control(call_id, method, params)
 
+            # Prompt-agent calls are resumable by a semantic fingerprint over the
+            # prompt/options. Prefer that cache over ordinal call-id replay so a
+            # matching completed live child call can be reused without respawning.
+            if method == "agent" and "prompt" in params:
+                prompt_replayed = self._maybe_prompt_cache_hit(call_id, params)
+                if prompt_replayed is not _MISS:
+                    return prompt_replayed
+
             # Replay: serve a deterministic call from the cache instead of
             # re-dispatching. A hit returns the recorded value without touching
             # the runner; a method/args drift fails closed; a miss falls through
@@ -425,6 +438,31 @@ class CapabilityBroker:
                 self._recorder.record(call_id, method, replay_args_hash(method, params), value)
             except Exception:  # noqa: BLE001 — persistence is best-effort.
                 pass
+        if method == "agent" and "prompt" in params:
+            try:
+                request = _prompt_agent_request(params)
+                fingerprint, args_hash = _prompt_agent_cache_identity(request)
+            except Exception:  # noqa: BLE001 — prompt metadata is best-effort after success.
+                request = None
+                fingerprint = ""
+                args_hash = ""
+            if request is not None and isinstance(value, dict):
+                self._prompt_results[fingerprint] = (args_hash, value)
+                if (
+                    self._recorder is not None
+                    and fingerprint not in self._recorded_prompt_fingerprints
+                ):
+                    try:
+                        self._recorder.record_prompt(fingerprint, method, args_hash, value)
+                        self._recorded_prompt_fingerprints.add(fingerprint)
+                    except Exception:  # noqa: BLE001 — persistence is best-effort.
+                        pass
+                try:
+                    self._emit_prompt_agent_event(
+                        "agent_result", call_id, request, fingerprint, ok=True, has_value=True
+                    )
+                except Exception:  # noqa: BLE001 — journaling is best-effort.
+                    pass
         try:
             self._emit(self._call_event(call_id, method, params, ok=True))
         except Exception:  # noqa: BLE001 — journaling is best-effort.
@@ -450,6 +488,57 @@ class CapabilityBroker:
             except (CapabilityDenied, ValueError):
                 return False
         return is_replayable(method, deterministic_runner=self._deterministic_runner)
+
+    def _maybe_prompt_cache_hit(self, call_id: Any, params: dict[str, Any]) -> Any:
+        """Serve a completed ``agent(prompt, opts)`` result by semantic fingerprint."""
+        request = _prompt_agent_request(params)
+        fingerprint, args_hash = _prompt_agent_cache_identity(request)
+        value: Optional[dict[str, Any]] = None
+        entry_args_hash: Optional[str] = None
+        cache_source: Optional[str] = None
+
+        cached = self._prompt_results.get(fingerprint)
+        if cached is not None:
+            entry_args_hash, value = cached
+            cache_source = "run"
+        elif self._replay is not None:
+            entry = self._replay.get_prompt(fingerprint)
+            if entry is not None:
+                if entry.method != "agent":
+                    self.should_abort = True
+                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: recorded method {entry.method!r}"
+                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                entry_args_hash = entry.args_hash
+                if not isinstance(entry.value, dict):
+                    self.should_abort = True
+                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: cached value is not an object"
+                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                value = entry.value
+                cache_source = "replay"
+
+        if value is None or entry_args_hash is None:
+            return _MISS
+        if entry_args_hash != args_hash:
+            self.should_abort = True
+            self.abort_reason = (
+                f"prompt replay drift at fingerprint {fingerprint}: recorded arguments do not match"
+            )
+            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+        _validate_output(value, request.schema)
+        self._check_start_control(call_id, "agent", params)
+        self._check_token_budget()
+        self._agent_calls += 1
+        if self._agent_calls > self._limits.max_agent_calls:
+            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        usage = _non_negative_token_usage(value)
+        if usage is not None:
+            self._tokens += usage
+        self._replayed_calls += 1
+        self._emit_prompt_agent_event(
+            "agent_cache_hit", call_id, request, fingerprint, ok=True, cache=cache_source
+        )
+        self._emit(self._call_event(call_id, "agent", params, ok=True, replayed=True))
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": value, "budget": self._budget_info()}
 
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
@@ -484,8 +573,8 @@ class CapabilityBroker:
         elif method == "capability":
             self._capability_calls += 1
         if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
-            usage = entry.value.get("_tokens")
-            if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+            usage = _non_negative_token_usage(entry.value)
+            if usage is not None:
                 self._tokens += usage
         self._replayed_calls += 1
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
@@ -546,8 +635,8 @@ class CapabilityBroker:
                 "replay": self._replay is not None,
             },
         )
-        usage = result.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        usage = _non_negative_token_usage(result)
+        if usage is not None:
             self._tokens += usage
         _validate_output(result, params.get("schema"))
         return result
@@ -586,14 +675,7 @@ class CapabilityBroker:
     def _handle_prompt_agent(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
-        prompt = params.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
-        unknown = sorted(set(params) - ({"prompt"} | CHILD_AGENT_OPTION_KEYS))
-        if unknown:
-            raise CapabilityDenied(
-                "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
-            )
+        request = _prompt_agent_request(params)
         self._check_token_budget()
         # Count the script-visible prompt agent call once; schema retries below may
         # cross the child-runner boundary again but remain bounded by max_schema_retries.
@@ -605,16 +687,8 @@ class CapabilityBroker:
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
             )
 
-        request = ChildAgentRequest(
-            prompt=prompt,
-            label=_optional_str(params, "label"),
-            phase=_optional_str(params, "phase"),
-            schema=_optional_dict(params, "schema"),
-            model=_optional_str(params, "model"),
-            effort=_optional_str(params, "effort"),
-            isolation=_optional_str(params, "isolation"),
-            context=_optional_dict(params, "context") or {},
-        )
+        fingerprint, _args_hash = _prompt_agent_cache_identity(request)
+        self._emit_prompt_agent_event("agent_started", call_id, request, fingerprint, ok=True)
         return self._invoke_prompt_agent_with_schema_retry(call_id, request)
 
     def _invoke_prompt_agent_with_schema_retry(
@@ -658,8 +732,8 @@ class CapabilityBroker:
                 last_error = exc
                 continue
 
-            usage = safe_output.get("_tokens")
-            if isinstance(usage, int) and not isinstance(usage, bool):
+            usage = _non_negative_token_usage(safe_output)
+            if usage is not None:
                 self._tokens += usage
             return safe_output
 
@@ -810,8 +884,8 @@ class CapabilityBroker:
             result["reason"] = resolution.reason
         if diagnostics:
             result["diagnostics"] = diagnostics
-        usage = (resolution.result or {}).get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        usage = _non_negative_token_usage(resolution.result or {})
+        if usage is not None:
             self._tokens += usage
         return result
 
@@ -942,10 +1016,38 @@ class CapabilityBroker:
                 f"agent {agent_id!r} returned {type(output).__name__}, expected dict", code="bad_output"
             )
         _validate_output(output, schema)
-        usage = output.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
+        usage = _non_negative_token_usage(output)
+        if usage is not None:
             self._tokens += usage
         return output
+
+    def _emit_prompt_agent_event(
+        self,
+        event_type: str,
+        call_id: Any,
+        request: ChildAgentRequest,
+        fingerprint: str,
+        *,
+        ok: bool,
+        cache: Optional[str] = None,
+        has_value: Optional[bool] = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "type": event_type,
+            "call_id": call_id,
+            "method": "agent",
+            "fingerprint": fingerprint,
+            "ok": ok,
+        }
+        if request.label:
+            event["label"] = safe_capability_metadata_value(request.label)
+        if request.phase:
+            event["phase"] = safe_capability_metadata_value(request.phase)
+        if cache is not None:
+            event["cache"] = cache
+        if has_value is not None:
+            event["has_value"] = has_value
+        self._emit(event)
 
     def _call_event(
         self,
@@ -960,6 +1062,12 @@ class CapabilityBroker:
         event: dict[str, Any] = {"type": "rpc_call", "call_id": call_id, "method": method, "ok": ok}
         if method in ("agent",):
             event["agent_id"] = params.get("agent_id")
+            if "prompt" in params:
+                try:
+                    request = _prompt_agent_request(params)
+                    event["fingerprint"] = _prompt_agent_cache_identity(request)[0]
+                except CapabilityDenied:
+                    pass
         if method in ("kanban_agent",):
             event["profile"] = params.get("profile")
         if method in ("capability",):
@@ -998,6 +1106,14 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
             )
 
 
+def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
+    """Return valid broker token usage, ignoring bools and negative values."""
+    usage = output.get("_tokens")
+    if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        return usage
+    return None
+
+
 def _optional_str(params: dict[str, Any], key: str) -> Optional[str]:
     value = params.get(key)
     if value is None:
@@ -1014,6 +1130,57 @@ def _optional_dict(params: dict[str, Any], key: str) -> Optional[dict[str, Any]]
     if isinstance(value, dict):
         return value
     raise CapabilityDenied(f"prompt agent option {key!r} must be an object", code="bad_request")
+
+
+def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
+    """Validate and normalize the parent-side prompt-agent request."""
+    prompt = params.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
+    unknown = sorted(set(params) - ({"prompt"} | CHILD_AGENT_OPTION_KEYS))
+    if unknown:
+        raise CapabilityDenied(
+            "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
+        )
+    return ChildAgentRequest(
+        prompt=prompt,
+        label=_optional_str(params, "label"),
+        phase=_optional_str(params, "phase"),
+        schema=_optional_dict(params, "schema"),
+        model=_optional_str(params, "model"),
+        effort=_optional_str(params, "effort"),
+        isolation=_optional_str(params, "isolation"),
+        context=_optional_dict(params, "context") or {},
+    )
+
+
+def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, Any]:
+    """Semantic prompt-agent identity payload.
+
+    All currently supported options are semantic for child-agent dispatch, so none
+    are excluded: label, phase, schema, model, effort, isolation, and context all
+    participate alongside the prompt. Omitted and explicit ``None`` normalize to
+    the same JSON ``null`` value.
+    """
+    return {
+        "prompt": request.prompt,
+        "label": request.label,
+        "phase": request.phase,
+        "schema": request.schema,
+        "model": request.model,
+        "effort": request.effort,
+        "isolation": request.isolation,
+        "context": request.context,
+    }
+
+
+def _prompt_agent_cache_identity(request: ChildAgentRequest) -> tuple[str, str]:
+    payload = _prompt_agent_fingerprint_payload(request)
+    fingerprint = "v2:" + canonical_hash(
+        {"kind": "agent(prompt,opts)", "version": 2, "request": payload}
+    )
+    args_hash = canonical_hash({"method": "agent", "fingerprint": fingerprint, "request": payload})
+    return fingerprint, args_hash
 
 
 def _request_with_schema_retry_context(
