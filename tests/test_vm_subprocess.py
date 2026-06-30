@@ -183,6 +183,53 @@ def test_parallel_width_prevents_dispatching_queued_children_after_failure():
     assert started == [0]
 
 
+def test_parallel_running_sibling_return_does_not_mask_original_failure():
+    started = []
+    lock = threading.Lock()
+    first_two_started = threading.Event()
+    release_slow = threading.Event()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    first_two_started.set()
+            if index == 0:
+                if not first_two_started.wait(2.0):
+                    raise RuntimeError("parallel did not start the slow sibling")
+                release_slow.set()
+                raise RuntimeError("boom")
+            if index == 1:
+                if not release_slow.wait(2.0):
+                    raise RuntimeError("failure did not release slow sibling")
+                threading.Event().wait(0.05)
+                return {"i": index}
+            raise RuntimeError(f"queued child {index} should not have started")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "    lambda: agent('hermes.echo', {'i': 3}),\n"
+        "])\n"
+        "return outs\n"
+    )
+
+    for _ in range(20):
+        started.clear()
+        first_two_started.clear()
+        release_slow.clear()
+        res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2))
+        assert res.ok is False
+        assert res.error["type"] == "CapabilityError"
+        assert res.error.get("code") == "runner_error"
+        assert "Broken pipe" not in str(res.error)
+        assert sorted(started) == [0, 1]
+
+
 def test_kanban_agent_routes_through_reserved_runner():
     script = META + (
         'r = await kanban_agent("relayplanner", {"goal": "plan"}, {"repo": "x"})\n'

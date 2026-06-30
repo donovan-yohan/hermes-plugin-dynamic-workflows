@@ -933,6 +933,7 @@ class WorkflowVM:
         meta: Optional[dict[str, Any]] = None
         done: Optional[dict[str, Any]] = None
         protocol_error: Optional[str] = None
+        reply_write_error: Optional[str] = None
         suspended: Optional[dict[str, Any]] = None
 
         try:
@@ -967,6 +968,11 @@ class WorkflowVM:
                 if protocol_error is None:
                     protocol_error = message
 
+            def _set_reply_write_error(message: str) -> None:
+                nonlocal reply_write_error
+                if reply_write_error is None:
+                    reply_write_error = message
+
             def _handle_and_reply(call_frame: dict[str, Any]) -> None:
                 nonlocal suspended
                 ret = broker.handle(call_frame)
@@ -974,7 +980,14 @@ class WorkflowVM:
                     with ret_write_lock:
                         rpc.write_frame(proc.stdin, ret)
                 except (BrokenPipeError, OSError) as exc:
-                    _set_protocol_error(f"child stdin closed: {exc}")
+                    # In concurrent ``parallel()`` runs, one child can fail and make
+                    # the guest finish while an already-running sibling is still in
+                    # the parent broker. A late reply then races a legitimate
+                    # ``done`` frame and may see a closed stdin. Keep that as a
+                    # fallback subprocess error only if the guest never reports its
+                    # script-level result; do not let it mask the original
+                    # CapabilityError.
+                    _set_reply_write_error(f"child stdin closed: {exc}")
                     return
                 if broker.should_abort:
                     _kill(proc)
@@ -1061,10 +1074,15 @@ class WorkflowVM:
                 exit_code=exit_code, stderr=stderr_text,
                 error={"type": "KanbanSuspended", **suspended},
             )
-        if protocol_error is not None:
+        if protocol_error is not None and done is None:
             return ScriptRunResult(
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
                 error={"type": "WorkflowSubprocessError", "message": protocol_error},
+            )
+        if reply_write_error is not None and done is None:
+            return ScriptRunResult(
+                ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
+                error={"type": "WorkflowSubprocessError", "message": reply_write_error},
             )
         if done is None:
             return ScriptRunResult(
