@@ -144,8 +144,24 @@ Expected: terminal `converged` state and two succeeded finalizer results. The
 example only retires the declared automation/listener records; child-session or
 process termination remains the responsibility of the host adapter.
 
+## Archive parity fixtures
+
+`tests/fixtures/loop_until_dry/` contains the sanitized loop-until-dry parity fixture used by
+issue #77. It includes:
+
+- `cart.js` — a tiny credential-free subject file inspired by the archive bughunt target.
+- `loop_until_dry.workflow` — the guarded Python workflow-script translation of the archive topology.
+- `fake_child_responses.json` — deterministic finder/verifier outputs used by unit tests.
+
+Those tests are not a live-agent benchmark. They prove topology and durability semantics with fake
+responses: round loop, three concurrent finders, deduplication, verifier fan-out, dry counter,
+max-round fallback, progress rows, and prompt/options fingerprint replay. Optional live-agent smoke
+runs may reuse the script with a real `child_agent_runner`, but their findings are expected to differ
+from the fixture and should not replace the deterministic regression.
+
 ## Notes
 
-- Swap in a real Hermes fan-out by passing `agent_runner=` to `workflow_run`.
+- Swap in a real Hermes fan-out by passing `agent_runner=` to `workflow_run` or `child_agent_runner=`
+  to `run_workflow_script` for prompt-shaped child-agent scripts.
 - Swap the run-status backend by passing `registry=` (e.g. an in-memory store
   per call, or the optional pluggable Kanban backend described in `DESIGN.md`).

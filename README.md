@@ -345,6 +345,16 @@ while areas and budget.remaining() > 0 and round_index < max_rounds:
 return {"remaining_areas": areas, "rounds": round_index}
 ```
 
+The archive-parity regression under `tests/fixtures/loop_until_dry/` is intentionally
+deterministic. It uses a sanitized `cart.js` subject file plus `fake_child_responses.json`
+instead of replaying the original Claude transcript or contacting live agents. That fixture
+proves the runtime topology: round loop, three concurrent finder child agents, candidate
+deduplication, N verifier child agents, dry-counter termination, max-round fallback, progress
+rows, and prompt/options fingerprint resume. A live-agent smoke can reuse the same Python
+harness by injecting a real `child_agent_runner`, but live findings are expected to diverge
+from the fake fixture and should be treated as optional smoke evidence rather than a stable
+unit-test oracle.
+
 ## Event-driven workflows, not timer-owned phase control
 
 The big rule: **cron may start a workflow, but cron should not own workflow phase control**.
