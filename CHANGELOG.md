@@ -19,6 +19,21 @@ First public alpha release line for `hermes-plugin-dynamic-workflows`.
 - Operator control/status surface for pause/resume/stop/task_stop/retry intent and blocked-wait inspection.
 - Public README landing-page rewrite, examples, and Baoyu-style infographic asset for the `0.1.0` release line.
 
+#### Claude-style dynamic-workflow parity
+
+- Prompt-shaped child agents — `agent(prompt, opts)` (label/phase/schema/model/effort/isolation/context) with schema-constrained structured output and bounded retry-on-mismatch before a typed failure.
+- Resumable prompt-agent fingerprint cache keyed by a `v2` prompt/options hash, so a duplicate prompt/options call dedups to one child and replays without respawning.
+- Bounded concurrent `parallel()` and no-barrier `pipeline()` item flow with operator-configurable `max_parallel` (wired through the `workflow(action="run_script")` facade) and lifecycle-safe failure: a failed run waits for already-started parent-side runner work and reports any work still running past the deadline instead of returning terminal while it is alive.
+- Local background workflow-script run manager: scripts launch/run/inspect/stop outside the main turn with fail-closed stop/terminal-state lifecycle and operator-visible status.
+- Per-subagent transcript artifacts — per-call journal plus redacted metadata refs (including replay/cache-hit refs), surfaced in background run links.
+- Archive-backed loop-until-dry parity fixture exercising parallel fan-out plus prompt/options replay.
+
+### Fixed
+
+- Replay/cache-hit accounting no longer deadlocks when a journal callback re-enters the broker: shared-state mutations are taken under the broker lock in a short scope and journal/transcript writes happen after the lock is released.
+- `parallel()`/`pipeline()` dispatch indices (`_parallel_index`, `_pipeline_item_index`, `_pipeline_stage_index`) are treated as internal scheduling metadata, so prompt-agent calls inside concurrent fan-out are no longer rejected as unsupported options.
+- Concurrent identical prompt-agent calls record a single cache fingerprint (no duplicate-fingerprint corruption of the replay cache).
+
 ### Known limits
 
 - Public alpha: useful for local Hermes/plugin experiments and adapter prototyping, not a hardened production sandbox for arbitrary untrusted users.
