@@ -637,7 +637,7 @@ Parity primitives that are intentional and product-facing:
 | Phase markers | `phase("title")` records brokered phase transitions; issue #63 also surfaces declared script phases through status. |
 | Logs, inputs, budget | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()` are injected globals, not imports. |
 | Resume/cache | Stable call ids, deterministic replay cache for replayable calls, metadata-only journals, durable Kanban card reattach, and suspended-await replay form the current resume contract. |
-| Model-facing script facade | After the facade compatibility slices, model callers use inline `script`, catalog `scriptPath`, saved `name`, runtime `args`, and `resumeFromRunId`; lower-level Python parameter names remain internal/library spelling. |
+| Model-facing script facade | The registered `workflow` tool currently exposes saved-script operations with `script_source`, `script_name`, and `script_args`. CamelCase archive aliases such as `scriptPath` or `resumeFromRunId` are compatibility vocabulary for future facade work, not shipped `0.1.0` schema. |
 
 Intentional differences and security boundaries:
 
@@ -694,8 +694,9 @@ meta = {
 }
 
 round_index = 0
-areas = list(args.get("areas", ["runtime", "docs", "tests"]))
-max_rounds = args.get("max_rounds", 4)
+script_args = args or {}
+areas = list(script_args.get("areas", ["runtime", "docs", "tests"]))
+max_rounds = script_args.get("max_rounds", 4)
 
 
 async def scan(area):

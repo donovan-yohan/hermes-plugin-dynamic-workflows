@@ -160,10 +160,11 @@ The plugin registers tools in the `dynamic_workflows` toolset:
 | `workflow` | Model-facing facade for validate/run/status/catalog/script operations. |
 | `workflow_control` | Operator surface for overview/status/pause/resume/stop/task_stop/retry. |
 
-The shipped script facade accepts inline `script`, catalog `scriptPath`, saved script `name`,
-runtime `args`, and `resumeFromRunId` for replay/resume flows; the lower-level Python
-library names (`script_source`, `script_name`, `script_args`, `replay_from`) are implementation
-details behind that model-facing compatibility shape.
+The shipped `workflow` tool currently exposes saved-script operations with
+snake_case parameters: `script_source` for `script_save`, `script_name` for
+`script_inspect` / `run_script`, and `script_args` for runtime inputs. CamelCase
+archive aliases such as `scriptPath` or `resumeFromRunId` are not part of the
+registered Hermes tool schema in `0.1.0`.
 
 If Hermes does not show `workflow` after restart, check:
 
@@ -266,7 +267,7 @@ Intended parity:
 | `parallel(...)` / `pipeline(...)` / `phase(...)` | `await parallel([...])`, `await pipeline(...)`, and `phase("title")` with deterministic, brokered execution. |
 | `log(...)`, script inputs, and budget checks | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()`. |
 | Journal/cache/resume semantics | Stable call ids, metadata-only journals, deterministic replay cache, and durable Kanban reattach/resume where supported. |
-| Facade entrypoints | Inline `script`, catalog `scriptPath`, saved `name`, `args`, and `resumeFromRunId`; declared `meta.phases` appear in script run status. |
+| Facade entrypoints | Current `workflow` tool parameters are `script_source`, `script_name`, and `script_args`; declared `meta.phases` appear in script run status. CamelCase archive aliases are future compatibility vocabulary, not shipped schema. |
 
 Intentional differences in `0.1.0`:
 
@@ -313,8 +314,9 @@ meta = {
 }
 
 round_index = 0
-areas = list(args.get("areas", ["runtime", "docs", "tests"]))
-max_rounds = args.get("max_rounds", 4)
+script_args = args or {}
+areas = list(script_args.get("areas", ["runtime", "docs", "tests"]))
+max_rounds = script_args.get("max_rounds", 4)
 
 
 async def scan(area):
