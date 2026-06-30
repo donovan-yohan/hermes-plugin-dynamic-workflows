@@ -1,7 +1,15 @@
 meta = {
     "name": "generic_issue_lifecycle_harness",
     "description": "Argument-bound GitHub issue lifecycle harness with exact-head review, QA, fix-loop, and release closeout gates",
-    "phases": ["inventory", "plan", "implement", "verify", "fix", "release", "closeout"],
+    "phases": [
+        {"title": "inventory", "detail": "collect issue, branch, workspace, and profile bindings"},
+        {"title": "plan", "detail": "route planning work and produce implementation context"},
+        {"title": "implement", "detail": "apply the planned code changes"},
+        {"title": "verify", "detail": "run exact-head review and QA gates"},
+        {"title": "fix", "detail": "remediate gate blockers when needed"},
+        {"title": "release", "detail": "prepare and validate release handoff"},
+        {"title": "closeout", "detail": "finish issue lifecycle bookkeeping"},
+    ],
 }
 
 repo = args["repo"]
