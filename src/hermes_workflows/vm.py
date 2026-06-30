@@ -567,13 +567,20 @@ class CapabilityBroker:
         a failure. The metadata-only journal ``call`` event is emitted by the
         :class:`CapabilityDenied` path in :meth:`handle` (error ``kanban_suspended``).
         """
-        self.should_suspend = True
-        self.suspend_info = {
-            "card_id": card_id,
-            "profile": profile,
-            "call_id": call_id,
-            "on_block": on_block,
-        }
+        with self._lock:
+            self.should_suspend = True
+            self.suspend_info = {
+                "card_id": card_id,
+                "profile": profile,
+                "call_id": call_id,
+                "on_block": on_block,
+            }
+
+    def control_state(self) -> tuple[bool, Optional[str], bool, Optional[dict[str, Any]]]:
+        """Return broker abort/suspend flags under one lock for driver threads."""
+        with self._lock:
+            suspend_info = dict(self.suspend_info) if self.suspend_info is not None else None
+            return self.should_abort, self.abort_reason, self.should_suspend, suspend_info
 
     def _kanban_idempotency_key(self, call_id: Any) -> str:
         """Stable key for one logical ``kanban_agent`` call.
@@ -933,8 +940,41 @@ class WorkflowVM:
         meta: Optional[dict[str, Any]] = None
         done: Optional[dict[str, Any]] = None
         protocol_error: Optional[str] = None
-        reply_write_error: Optional[str] = None
         suspended: Optional[dict[str, Any]] = None
+        parent_calls_still_running: list[dict[str, Any]] = []
+        parent_calls_cancelled_before_start: list[dict[str, Any]] = []
+        state_lock = threading.Lock()
+        child_terminal = threading.Event()
+        run_deadline = time.monotonic() + self._limits.max_runtime_s
+
+        def _call_info(frame: dict[str, Any]) -> dict[str, Any]:
+            params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+            info: dict[str, Any] = {"call_id": frame.get("id"), "method": frame.get("method")}
+            if "_parallel_index" in params:
+                info["parallel_index"] = params.get("_parallel_index")
+            if frame.get("method") == "agent":
+                info["agent_id"] = params.get("agent_id")
+            elif frame.get("method") == "kanban_agent":
+                info["profile"] = params.get("profile")
+            elif frame.get("method") == "capability":
+                info["capability"] = safe_capability_metadata_value(params.get("name"))
+            return info
+
+        def _set_protocol_error(message: str) -> None:
+            nonlocal protocol_error
+            with state_lock:
+                if protocol_error is None and not child_terminal.is_set():
+                    protocol_error = message
+
+        def _set_suspended(info: dict[str, Any]) -> None:
+            nonlocal suspended
+            with state_lock:
+                if suspended is None and not child_terminal.is_set():
+                    suspended = dict(info)
+
+        def _state_snapshot() -> tuple[Optional[str], Optional[dict[str, Any]]]:
+            with state_lock:
+                return protocol_error, dict(suspended) if suspended is not None else None
 
         try:
             assert proc.stdin is not None and proc.stdout is not None
@@ -955,66 +995,54 @@ class WorkflowVM:
             booted = True
             try:
                 rpc.write_frame(proc.stdin, boot)
-            except (BrokenPipeError, OSError) as exc:
-                protocol_error = f"child closed stdin before boot: {exc}"
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                _set_protocol_error(f"child closed stdin before boot: {exc}")
                 booted = False
 
             ret_executor = ThreadPoolExecutor(max_workers=max(1, int(self._limits.max_parallel or 1)))
             ret_write_lock = threading.Lock()
             pending_rets: set[Future[Any]] = set()
-
-            def _set_protocol_error(message: str) -> None:
-                nonlocal protocol_error
-                if protocol_error is None:
-                    protocol_error = message
-
-            def _set_reply_write_error(message: str) -> None:
-                nonlocal reply_write_error
-                if reply_write_error is None:
-                    reply_write_error = message
+            pending_info: dict[Future[Any], dict[str, Any]] = {}
 
             def _handle_and_reply(call_frame: dict[str, Any]) -> None:
-                nonlocal suspended
                 ret = broker.handle(call_frame)
                 try:
                     with ret_write_lock:
                         rpc.write_frame(proc.stdin, ret)
-                except (BrokenPipeError, OSError) as exc:
-                    # In concurrent ``parallel()`` runs, one child can fail and make
-                    # the guest finish while an already-running sibling is still in
-                    # the parent broker. A late reply then races a legitimate
-                    # ``done`` frame and may see a closed stdin. Keep that as a
-                    # fallback subprocess error only if the guest never reports its
-                    # script-level result; do not let it mask the original
-                    # CapabilityError.
-                    _set_reply_write_error(f"child stdin closed: {exc}")
+                except (BrokenPipeError, OSError, ValueError) as exc:
+                    _set_protocol_error(f"child stdin closed: {exc}")
                     return
-                if broker.should_abort:
+                should_abort, abort_reason, should_suspend, suspend_info = broker.control_state()
+                if should_abort:
                     _kill(proc)
-                    _set_protocol_error(broker.abort_reason or "aborted: capability hard-limit exceeded")
-                if broker.should_suspend:
+                    _set_protocol_error(abort_reason or "aborted: capability hard-limit exceeded")
+                if should_suspend:
                     # An unresolved paused Kanban await suspended the run: tear
                     # the subprocess down (the script's local state is discarded;
                     # a resume re-runs it from the replay cache) and report a
                     # resumable suspended run rather than a failure.
                     _kill(proc)
-                    suspended = broker.suspend_info or {}
+                    _set_suspended(suspend_info or {})
+
+            def _collect_done_futures(futures: set[Future[Any]]) -> None:
+                for fut in futures:
+                    exc = fut.exception()
+                    if exc is not None:
+                        _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
+                        _kill(proc)
 
             try:
                 while booted:
                     done_futures = {fut for fut in pending_rets if fut.done()}
                     pending_rets.difference_update(done_futures)
-                    for fut in done_futures:
-                        exc = fut.exception()
-                        if exc is not None:
-                            _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
-                            _kill(proc)
-                    if protocol_error is not None or suspended is not None:
+                    _collect_done_futures(done_futures)
+                    state_error, state_suspended = _state_snapshot()
+                    if state_error is not None or state_suspended is not None:
                         break
                     try:
                         frame = rpc.read_frame(proc.stdout)
                     except rpc.RPCProtocolError as exc:
-                        protocol_error = str(exc)
+                        _set_protocol_error(str(exc))
                         break
                     if frame is None:
                         break  # EOF: child exited (cleanly after done, or crashed).
@@ -1025,21 +1053,25 @@ class WorkflowVM:
                         started = broker.started_event(frame)
                         if started is not None:
                             broker._emit(started)
-                        pending_rets.add(ret_executor.submit(_handle_and_reply, frame))
+                        fut = ret_executor.submit(_handle_and_reply, frame)
+                        pending_rets.add(fut)
+                        pending_info[fut] = _call_info(frame)
                     elif kind == rpc.T_DONE:
                         done = frame
+                        child_terminal.set()
                         break
                     # Unknown frame types are ignored (forward-compatible).
             finally:
                 if pending_rets:
-                    wait(pending_rets, timeout=5)
-                    for fut in list(pending_rets):
-                        if fut.done():
-                            exc = fut.exception()
-                            if exc is not None:
-                                _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
+                    remaining = max(0.0, run_deadline - time.monotonic())
+                    finished, unfinished = wait(pending_rets, timeout=remaining)
+                    _collect_done_futures(finished)
+                    for fut in unfinished:
+                        info = pending_info.get(fut, {"call_id": None, "method": "unknown"})
+                        if fut.cancel():
+                            parent_calls_cancelled_before_start.append(info)
                         else:
-                            fut.cancel()
+                            parent_calls_still_running.append(info)
                 ret_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             timer.cancel()
@@ -1059,30 +1091,42 @@ class WorkflowVM:
         stderr_text = "".join(stderr_chunks)[-4000:]
         exit_code = proc.returncode
 
-        if timed_out.is_set():
+        state_protocol_error, state_suspended = _state_snapshot()
+        if parent_calls_still_running:
+            error: dict[str, Any] = {
+                "type": "WorkflowSubprocessError",
+                "message": (
+                    "parent-side RPC work is still running after workflow terminal state; "
+                    "running ThreadPoolExecutor calls cannot be cancelled"
+                ),
+                "parent_calls_still_running": parent_calls_still_running,
+            }
+            if parent_calls_cancelled_before_start:
+                error["parent_calls_cancelled_before_start"] = parent_calls_cancelled_before_start
+            if isinstance(done, dict) and done.get("error") is not None:
+                error["child_error"] = done.get("error")
+            return ScriptRunResult(
+                ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text, error=error,
+            )
+        if timed_out.is_set() and done is None and state_suspended is None:
             return ScriptRunResult(
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
                 error={"type": "WorkflowSubprocessError",
                        "message": f"workflow timed out after {self._limits.max_runtime_s}s"},
             )
-        if suspended is not None:
+        if state_suspended is not None:
             # Durable, resumable suspension (issue #5) — not a failure. The error
             # payload is metadata-safe (card id is a content-address, profile is a
             # role name) so it can live on the operator-facing run.json.
             return ScriptRunResult(
                 ok=False, suspended=True, meta=meta, calls=calls,
                 exit_code=exit_code, stderr=stderr_text,
-                error={"type": "KanbanSuspended", **suspended},
+                error={"type": "KanbanSuspended", **state_suspended},
             )
-        if protocol_error is not None and done is None:
+        if state_protocol_error is not None:
             return ScriptRunResult(
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
-                error={"type": "WorkflowSubprocessError", "message": protocol_error},
-            )
-        if reply_write_error is not None and done is None:
-            return ScriptRunResult(
-                ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
-                error={"type": "WorkflowSubprocessError", "message": reply_write_error},
+                error={"type": "WorkflowSubprocessError", "message": state_protocol_error},
             )
         if done is None:
             return ScriptRunResult(

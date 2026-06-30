@@ -1,6 +1,8 @@
 """Tests for versioned saved workflow-script harness catalog (#29)."""
 
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -116,6 +118,51 @@ def test_workflow_facade_script_actions_cover_saved_harness_lifecycle():
     assert ran["operation"] == "run_script"
     assert ran["result"]["ok"] is True
     assert ran["result"]["value"] == {"planned": "plan", "qa_profile": "reviewer"}
+
+
+def test_workflow_facade_run_script_max_parallel_serializes_saved_script():
+    active = 0
+    max_active = 0
+    started = []
+    lock = threading.Lock()
+
+    class DelayedRunner:
+        def __call__(self, agent_id, input):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                started.append(input["i"])
+            time.sleep(0.15)
+            with lock:
+                active -= 1
+            return {"i": input["i"]}
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "])\n"
+        "return {'order': [o['i'] for o in outs]}\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        catalog = FileWorkflowScriptCatalog([Path(d) / "scripts"])
+        catalog.save_script("parallel_width", script)
+        started_at = time.perf_counter()
+        ran = workflow(
+            action="run_script",
+            script_name="parallel_width",
+            script_catalog=catalog,
+            agent_runner=DelayedRunner(),
+            max_parallel=1,
+        )
+        elapsed = time.perf_counter() - started_at
+
+    assert ran["result"]["ok"] is True
+    assert ran["result"]["value"] == {"order": [0, 1]}
+    assert started == [0, 1]
+    assert max_active == 1
+    assert elapsed >= 0.25
 
 
 def test_bundled_generic_issue_lifecycle_script_harness_lists_and_runs():

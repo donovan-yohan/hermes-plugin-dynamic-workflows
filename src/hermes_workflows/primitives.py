@@ -8,6 +8,7 @@ and free of network/filesystem effects.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from . import schema as _schema
@@ -160,6 +161,7 @@ def workflow(
             agent_runner=agent_runner,
             version=script_version,
             validate=validate,
+            max_parallel=max_parallel,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
         )
@@ -254,6 +256,23 @@ def _effective_max_parallel(definition: dict[str, Any], override: int) -> int:
     if isinstance(policy_value, int) and not isinstance(policy_value, bool) and policy_value > 0:
         candidates.append(policy_value)
     return max(1, min(candidates))
+
+
+def _coerce_max_parallel(value: int) -> int:
+    """Normalize an operator-provided script-VM parallel width."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return VMLimits().max_parallel
+    return max(1, value)
+
+
+def _limits_with_max_parallel(limits: Optional[VMLimits], max_parallel: Optional[int]) -> Optional[VMLimits]:
+    """Apply a facade/operator max_parallel override without dropping other caps."""
+    if max_parallel is None:
+        return limits
+    requested = _coerce_max_parallel(max_parallel)
+    if limits is None:
+        return VMLimits(max_parallel=requested)
+    return replace(limits, max_parallel=max(1, min(limits.max_parallel, requested)))
 
 
 def workflow_run(
@@ -395,6 +414,7 @@ def workflow_run_script(
     kanban_backend: Optional["KanbanBackend"] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Load and run a saved Python workflow-script harness by catalog name."""
     active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
@@ -403,7 +423,7 @@ def workflow_run_script(
         source,
         args=args,
         agent_runner=agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,
@@ -442,6 +462,7 @@ def run_workflow_script(
     kanban_backend: Optional["KanbanBackend"] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -471,7 +492,7 @@ def run_workflow_script(
         source,
         args=args,
         agent_runner=agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,
