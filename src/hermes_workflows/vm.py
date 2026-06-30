@@ -588,20 +588,16 @@ class CapabilityBroker:
         max_retries: int,
     ) -> None:
         """Journal a redacted schema-retry attempt for progress/status consumers."""
-        self._emit(
-            {
-                "type": "rpc_call",
-                "call_id": call_id,
-                "method": "agent",
-                "agent_id": "prompt",
-                "ok": False,
-                "label": request.label,
-                "phase": request.phase,
-                "error": "schema_retry",
-                "attempt": attempt,
-                "max_retries": max_retries,
-            }
+        event = self._call_event(
+            call_id,
+            "agent",
+            {"agent_id": "prompt", "label": request.label, "phase": request.phase},
+            ok=False,
+            error="schema_retry",
         )
+        event["attempt"] = attempt
+        event["max_retries"] = max_retries
+        self._emit(event)
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         profile = params.get("profile")

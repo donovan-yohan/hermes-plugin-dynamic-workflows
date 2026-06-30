@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from hermes_workflows import ChildAgentRequest, ScriptRunStore, VMLimits, run_workflow_script
+from hermes_workflows import REDACTED, ChildAgentRequest, ScriptRunStore, VMLimits, run_workflow_script
 
 META = 'meta = {"name": "prompt-agent", "description": "d"}\n'
 
@@ -77,6 +77,19 @@ def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_meta
         assert "params" not in call
         assert store.load_run("prompt_run").value == {"answer": "ok", "_tokens": 3}
         assert store.load_cache("prompt_run").get(1).value == {"answer": "ok", "_tokens": 3}
+
+
+def test_prompt_agent_period_sentence_routes_to_child_runner_not_legacy_agent_id():
+    runner = FakeChildRunner()
+    res = run_workflow_script(
+        META + 'return await agent("Summarize.")\n',
+        child_agent_runner=runner,
+    )
+
+    assert res.ok, res.error
+    assert res.value == {"answer": "ok", "_tokens": 3}
+    assert len(runner.requests) == 1
+    assert runner.requests[0].prompt == "Summarize."
 
 
 def test_prompt_agent_without_child_runner_fails_closed_instead_of_using_stub_runner():
@@ -166,6 +179,43 @@ def test_prompt_agent_schema_invalid_output_retries_with_validation_context_and_
         assert journal_retry[0]["attempt"] == 1
         assert journal_retry[0]["max_retries"] == 2
         assert store.load_cache("schema_retry_run").get(1).value == {"answer": "ok", "_tokens": 5}
+
+
+def test_prompt_agent_schema_retry_redacts_label_and_phase_metadata():
+    runner = SequenceChildRunner([
+        {"answer": 7},
+        {"answer": "ok"},
+    ])
+    script = META + (
+        'result = await agent("summarize", {\n'
+        '    "label": "token=not-a-real-secret",\n'
+        '    "phase": "secret=not-a-real-secret",\n'
+        '    "schema": {"answer": "string"},\n'
+        '})\n'
+        'return result\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script,
+            store=store,
+            run_id="schema_retry_redacts_metadata",
+            child_agent_runner=runner,
+            deterministic_runner=True,
+        )
+
+        assert res.ok, res.error
+        retry_event = next(event for event in res.calls if event.get("error") == "schema_retry")
+        assert retry_event["label"] == REDACTED
+        assert retry_event["phase"] == REDACTED
+        assert "not-a-real-secret" not in repr(retry_event)
+        journal_retry = next(
+            event for event in store.journal("schema_retry_redacts_metadata")
+            if event.get("error") == "schema_retry"
+        )
+        assert journal_retry["label"] == REDACTED
+        assert journal_retry["phase"] == REDACTED
+        assert "not-a-real-secret" not in repr(journal_retry)
 
 
 def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():

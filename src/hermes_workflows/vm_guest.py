@@ -28,6 +28,7 @@ import asyncio
 import builtins as _builtins
 import json as _json
 import math as _math
+import re
 import sys
 import traceback
 from typing import Any, Optional
@@ -169,10 +170,11 @@ class _Connection:
 
 
 _AGENT_OPTION_KEYS = frozenset({"label", "phase", "schema", "model", "effort", "isolation", "context"})
+_LEGACY_AGENT_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
 
 
 def _looks_like_legacy_agent_id(value: Any) -> bool:
-    return isinstance(value, str) and "." in value and not any(ch.isspace() for ch in value)
+    return isinstance(value, str) and bool(_LEGACY_AGENT_ID_RE.fullmatch(value))
 
 
 def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
