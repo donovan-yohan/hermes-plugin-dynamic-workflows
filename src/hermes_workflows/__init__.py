@@ -125,6 +125,9 @@ from .background import (
 )
 from .agents import (
     AgentRunner,
+    ChildAgentRequest,
+    ChildAgentRunner,
+    CHILD_AGENT_OPTION_KEYS,
     StubAgentRunner,
     KNOWN_AGENTS,
     is_known_agent,
@@ -175,6 +178,7 @@ from .script_catalog import (
     FileWorkflowScriptCatalog,
     ScriptCatalogEntry,
     safe_script_name,
+    safe_script_path,
     default_script_catalog_roots,
 )
 from .script_store import (
@@ -342,6 +346,9 @@ __all__ = [
     "Progress",
     # agents
     "AgentRunner",
+    "ChildAgentRequest",
+    "ChildAgentRunner",
+    "CHILD_AGENT_OPTION_KEYS",
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
@@ -389,6 +396,7 @@ __all__ = [
     "FileWorkflowScriptCatalog",
     "ScriptCatalogEntry",
     "safe_script_name",
+    "safe_script_path",
     "default_script_catalog_roots",
     # durable script run store + replay cache (issue #3)
     "ScriptRunStore",

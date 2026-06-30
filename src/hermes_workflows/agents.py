@@ -16,16 +16,24 @@ the runtime against a step's declared ``output_schema``.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol, runtime_checkable
 
 __all__ = [
     "AgentRunner",
+    "ChildAgentRequest",
+    "ChildAgentRunner",
+    "CHILD_AGENT_OPTION_KEYS",
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
     "kanban_runner_id",
     "is_kanban_runner_id",
 ]
+
+CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
+    {"label", "phase", "schema", "model", "effort", "isolation", "context"}
+)
 
 
 # A small, fixed roster of agent ids the static linter recognises. A real
@@ -75,7 +83,50 @@ class AgentRunner(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class ChildAgentRequest:
+    """Prompt-shaped request handed to a host-owned workflow child-agent runner.
+
+    The subprocess guest never receives parent chat history or credentials. It can
+    only send the natural-language ``prompt`` plus options explicitly provided in
+    the script. The parent normalizes that into this JSON-friendly contract before
+    crossing the injected runner boundary.
+    """
+
+    prompt: str
+    label: Optional[str] = None
+    phase: Optional[str] = None
+    schema: Optional[dict[str, Any]] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    isolation: Optional[str] = None
+    context: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the runner contract as a plain JSON-friendly dict."""
+        return {
+            "prompt": self.prompt,
+            "label": self.label,
+            "phase": self.phase,
+            "schema": self.schema,
+            "model": self.model,
+            "effort": self.effort,
+            "isolation": self.isolation,
+            "context": dict(self.context),
+        }
+
+
+@runtime_checkable
+class ChildAgentRunner(Protocol):
+    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``."""
+
+    def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+        """Run one isolated child agent and return its final structured result."""
+        ...
+
+
 class StubAgentRunner:
+
     """Deterministic, network-free default :class:`AgentRunner`.
 
     Produces stub structured output derived only from its inputs, so identical
