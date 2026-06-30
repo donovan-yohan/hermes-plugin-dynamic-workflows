@@ -395,7 +395,7 @@ class ScriptRunStore:
             "method": event.get("method"),
             "ok": event.get("ok"),
         }
-        for key in ("agent_id", "profile", "label", "phase_title", "error", "replayed"):
+        for key in ("agent_id", "profile", "label", "phase", "phase_title", "error", "replayed"):
             if event.get(key) is not None:
                 data[key] = event.get(key)
         with self._lock:
