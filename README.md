@@ -162,7 +162,8 @@ The plugin registers tools in the `dynamic_workflows` toolset:
 
 The shipped `workflow` tool currently exposes saved-script operations with
 snake_case parameters: `script_source` for `script_save`, `script_name` for
-`script_inspect` / `run_script`, and `script_args` for runtime inputs. CamelCase
+`script_inspect` / `run_script`, `script_args` for runtime inputs, and
+`script_version` for selecting a saved version. CamelCase
 archive aliases such as `scriptPath` or `resumeFromRunId` are not part of the
 registered Hermes tool schema in `0.1.0`.
 
@@ -267,7 +268,7 @@ Intended parity:
 | `parallel(...)` / `pipeline(...)` / `phase(...)` | `await parallel([...])`, `await pipeline(...)`, and `phase("title")` with deterministic, brokered execution. |
 | `log(...)`, script inputs, and budget checks | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()`. |
 | Journal/cache/resume semantics | Stable call ids, metadata-only journals, deterministic replay cache, and durable Kanban reattach/resume where supported. |
-| Facade entrypoints | Current `workflow` tool parameters are `script_source`, `script_name`, and `script_args`; declared `meta.phases` appear in script run status. CamelCase archive aliases are future compatibility vocabulary, not shipped schema. |
+| Facade entrypoints | Current `workflow` tool parameters are `script_source`, `script_name`, `script_args`, and `script_version`; declared `meta.phases` appear in script run status. CamelCase archive aliases are future compatibility vocabulary, not shipped schema. |
 
 Intentional differences in `0.1.0`:
 

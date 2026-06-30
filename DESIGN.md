@@ -637,7 +637,7 @@ Parity primitives that are intentional and product-facing:
 | Phase markers | `phase("title")` records brokered phase transitions; issue #63 also surfaces declared script phases through status. |
 | Logs, inputs, budget | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()` are injected globals, not imports. |
 | Resume/cache | Stable call ids, deterministic replay cache for replayable calls, metadata-only journals, durable Kanban card reattach, and suspended-await replay form the current resume contract. |
-| Model-facing script facade | The registered `workflow` tool currently exposes saved-script operations with `script_source`, `script_name`, and `script_args`. CamelCase archive aliases such as `scriptPath` or `resumeFromRunId` are compatibility vocabulary for future facade work, not shipped `0.1.0` schema. |
+| Model-facing script facade | The registered `workflow` tool currently exposes saved-script operations with `script_source`, `script_name`, `script_args`, and `script_version`. CamelCase archive aliases such as `scriptPath` or `resumeFromRunId` are compatibility vocabulary for future facade work, not shipped `0.1.0` schema. |
 
 Intentional differences and security boundaries:
 
