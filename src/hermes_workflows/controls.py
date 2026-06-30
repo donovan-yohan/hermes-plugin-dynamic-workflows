@@ -888,6 +888,7 @@ def inspect_run(
     child_task_refs: Optional[Iterable[str]] = None,
     result: Any = None,
     error: Optional[dict[str, Any]] = None,
+    phases: Optional[Iterable[dict[str, Any]]] = None,
     last_events: Optional[Iterable[dict[str, Any]]] = None,
     links: Optional[dict[str, Any]] = None,
     events_limit: int = 10,
@@ -920,6 +921,7 @@ def inspect_run(
             "check_run": evaluate_control_state(state, "check_run").to_dict(),
         },
         "current_phase": current_phase,
+        "phases": _phase_progress_rows(phases or [], current_phase=current_phase, lifecycle=lifecycle, events=events),
         "progress": progress,
         "waits": wait_rows,
         "child_task_refs": child_refs,
@@ -1112,6 +1114,64 @@ def current_phase(steps: Iterable[Any]) -> Optional[str]:
     running = [s for s in step_list if getattr(s, "status", None) == "running"]
     pick = running[-1] if running else step_list[-1]
     return getattr(pick, "workflow_phase_title", None) or getattr(pick, "workflow_phase_id", None)
+
+
+def _phase_progress_rows(
+    phases: Iterable[dict[str, Any]],
+    *,
+    current_phase: Optional[str],
+    lifecycle: str,
+    events: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    declared: list[dict[str, Any]] = []
+    for index, phase in enumerate(phases):
+        if not isinstance(phase, dict) or not phase.get("title"):
+            continue
+        declared.append(
+            {
+                "id": str(phase.get("id") or f"phase_{index + 1}"),
+                "title": str(phase.get("title")),
+                "detail": str(phase.get("detail") or ""),
+            }
+        )
+    if not declared:
+        return []
+
+    seen: list[str] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("method") != "phase" or event.get("ok") is not True:
+            continue
+        title = event.get("phase_title") or event.get("label")
+        if isinstance(title, str) and title:
+            seen.append(title)
+
+    active = current_phase or (seen[-1] if seen else None)
+    active_index = _phase_index(declared, active)
+    seen_indexes = {_phase_index(declared, title) for title in seen}
+    seen_indexes.discard(None)
+    terminal = lifecycle in {"succeeded", "failed", "cancelled"}
+
+    out: list[dict[str, Any]] = []
+    for index, row in enumerate(declared):
+        status = "queued"
+        if active_index is not None:
+            if index < active_index:
+                status = "succeeded"
+            elif index == active_index:
+                status = "succeeded" if terminal else "running"
+        elif index in seen_indexes:
+            status = "succeeded" if terminal else "running"
+        out.append({**row, "status": status})
+    return out
+
+
+def _phase_index(rows: list[dict[str, Any]], value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    for index, row in enumerate(rows):
+        if value in {row.get("id"), row.get("title")}:
+            return index
+    return None
 
 
 def _child_task_refs(
