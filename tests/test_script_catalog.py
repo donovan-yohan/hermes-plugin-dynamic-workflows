@@ -14,7 +14,7 @@ from hermes_workflows import (
     workflow_save_script,
     workflow_script_catalog,
 )
-from hermes_workflows.script_catalog import safe_script_name
+from hermes_workflows.script_catalog import safe_script_name, safe_script_path
 from hermes_workflows.script_store import ScriptRunStore
 
 META = 'meta = {"name": "issue_lifecycle", "description": "generic issue lifecycle harness"}\n'
@@ -116,6 +116,90 @@ def test_workflow_facade_script_actions_cover_saved_harness_lifecycle():
     assert ran["operation"] == "run_script"
     assert ran["result"]["ok"] is True
     assert ran["result"]["value"] == {"planned": "plan", "qa_profile": "reviewer"}
+
+
+def test_workflow_facade_accepts_claude_style_script_name_path_args_and_resume():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        catalog = FileWorkflowScriptCatalog([root / "scripts"])
+        store = ScriptRunStore(root / "runs")
+        catalog.save_script("issue_lifecycle", HARNESS)
+        inline_source = META + 'log("inline")\nreturn {"issue": args["issue"]}\n'
+
+        inline = workflow(script=inline_source, args={"issue": 1}, script_store=store)
+        by_name = workflow(
+            name="issue_lifecycle",
+            args={"repo": "owner/repo", "issue": 2, "qa_profile": "qa"},
+            script_catalog=catalog,
+            script_store=store,
+        )
+        by_path = workflow(
+            script_path="issue_lifecycle/v000001.workflow.py",
+            args={"repo": "owner/repo", "issue": 3, "qa_profile": "reviewer"},
+            script_catalog=catalog,
+            script_store=store,
+        )
+        recorded = workflow(script=inline_source, args={"issue": 4}, script_store=store, run_id="source_run")
+        replayed = workflow(
+            script=inline_source,
+            args={"issue": 4},
+            script_store=store,
+            run_id="replay_run",
+            resume_from_run_id="source_run",
+        )
+
+    assert inline["source"] == "inline_script"
+    assert inline["status"] == "succeeded"
+    assert inline["run_id"]
+    assert inline["result"]["value"] == {"issue": 1}
+    assert by_name["source"] == "saved_script"
+    assert by_name["name"] == "issue_lifecycle"
+    assert by_name["result"]["value"] == {"planned": "plan", "qa_profile": "qa"}
+    assert by_path["source"] == "script_path"
+    assert by_path["script_path"] == "issue_lifecycle/v000001.workflow.py"
+    assert by_path["result"]["value"] == {"planned": "plan", "qa_profile": "reviewer"}
+    assert recorded["run_id"] == "source_run"
+    assert replayed["run_id"] == "replay_run"
+    assert replayed["replayed_calls"] == 1
+
+
+def test_workflow_facade_resume_fails_closed_on_identity_mismatch():
+    source = META + 'log("inline")\nreturn {"issue": args["issue"]}\n'
+    with tempfile.TemporaryDirectory() as d:
+        store = ScriptRunStore(Path(d) / "runs")
+        workflow(script=source, args={"issue": 1}, script_store=store, run_id="source_run")
+
+        with pytest.raises(ValueError, match="does not match"):
+            workflow(
+                script=source,
+                args={"issue": 2},
+                script_store=store,
+                run_id="replay_run",
+                resume_from_run_id="source_run",
+            )
+
+
+def test_script_path_facade_is_catalog_relative_and_safe():
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside_dir:
+        root = Path(d) / "scripts"
+        catalog = FileWorkflowScriptCatalog([root])
+        catalog.save_script("safe", HARNESS)
+        outside = Path(outside_dir) / "v000001.workflow.py"
+        outside.write_text(HARNESS, encoding="utf-8")
+        escape_dir = root / "escape"
+        escape_dir.mkdir(parents=True)
+        try:
+            (escape_dir / "v000001.workflow.py").symlink_to(outside)
+        except OSError:
+            pytest.skip("symlinks are not supported or allowed on this platform")
+
+        assert safe_script_path("safe/v000001.workflow.py") == "safe/v000001.workflow.py"
+        assert catalog.load_script_path("safe/v000001.workflow.py") == HARNESS
+        for bad_path in ("../safe/v000001.workflow.py", "/tmp/x.workflow.py", "safe/../x.workflow.py", "safe.txt"):
+            with pytest.raises(ValueError):
+                safe_script_path(bad_path)
+        with pytest.raises(FileNotFoundError):
+            catalog.load_script_path("escape/v000001.workflow.py")
 
 
 def test_bundled_generic_issue_lifecycle_script_harness_lists_and_runs():

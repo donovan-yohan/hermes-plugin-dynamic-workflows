@@ -77,7 +77,10 @@ def workflow_status(
   saved catalog template, `action='catalog'` lists saved JSON templates,
   `action='script_catalog'` / `script_save` / `script_inspect` / `run_script`
   operate the saved Python script-harness catalog, and `run_id` without a
-  definition reads status. It is the tool shape meant for model use.
+  definition reads status. The same facade also accepts the Claude-style
+  `script` / `script_path` / `name` + `args` + `resume_from_run_id` shape, mapping
+  it onto inline script execution, catalog-relative script loading, saved script
+  lookup, and replay/resume respectively. It is the tool shape meant for model use.
 
 - **`workflow_validate`** parses (`definition` may be a parsed `dict` or a JSON
   string), validates the schema, and runs the sandbox-policy lint. It has **no
@@ -999,6 +1002,14 @@ The `workflow` facade exposes the catalog as model-facing operations:
 - `script_save` — validate and persist generated harness source;
 - `script_inspect` — return metadata and optional source for a saved version;
 - `run_script` — load a saved version and execute it through `run_workflow_script`.
+
+For model-authored calls that follow the observed Claude-style contract, the same
+facade also accepts `script`, `scriptPath`, `name`, `args`, and
+`resumeFromRunId`: inline `script` runs directly in the VM, `name` selects a saved
+catalog harness, `scriptPath` is resolved only as a safe catalog-relative
+`.workflow` / `.workflow.py` path, `args` feeds the script's `args` global, and
+`resumeFromRunId` maps to `replay_from` so script/args identity mismatches fail
+closed before launch.
 
 This gives loop-engineering agents a generic "save this capability harness and
 reuse it by name" substrate without granting scripts direct filesystem/network

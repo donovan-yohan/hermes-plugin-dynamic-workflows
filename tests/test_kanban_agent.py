@@ -37,18 +37,20 @@ from hermes_workflows.kanban import (
     normalize_on_block,
 )
 from hermes_workflows.script_store import ScriptRunStore
+from hermes_workflows.controls import InMemoryControlStore, stop_run, stop_task
 from hermes_workflows.vm import CapabilityBroker, VMLimits
 
 META = 'meta = {"name": "k5", "description": "d"}\n'
 
 
-def _broker(backend, *, root="root", limits=None):
+def _broker(backend, *, root="root", limits=None, control_store=None):
     return CapabilityBroker(
         # A stub runner is present but unused on the durable Kanban path.
         agent_runner=lambda agent_id, input: {},
         limits=limits or VMLimits(),
         kanban_backend=backend,
         idempotency_root=root,
+        control_store=control_store,
     )
 
 
@@ -215,6 +217,19 @@ def test_broker_unknown_profile_is_rejected_with_diagnostic():
     assert backend.created_cards == []  # nothing opened for an unknown assignee.
 
 
+def test_control_task_stop_blocks_kanban_child_before_card_create():
+    controls = InMemoryControlStore()
+    stop_task(controls, "root", "qa-label", reason="cancel just this child")
+    backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+    broker = _broker(backend, root="root", control_store=controls)
+
+    ret = broker.handle(_kanban_frame(1, labels=["qa-label"], on_block="return"))
+
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "task_stopped"
+    assert backend.created_cards == []
+
+
 def test_broker_await_timeout_is_bounded_by_runtime_limit():
     # A card that never resolves must not hang the broker forever: the await is
     # bounded by the run's wall-clock limit and surfaces a structured denial.
@@ -321,6 +336,72 @@ def test_e2e_replay_reattaches_and_creates_no_duplicate_card():
         assert rep.value["reattached"] is True
         assert len(backend.created_cards) == 1  # no duplicate card.
         assert backend.reattachments == 1
+
+
+def test_control_stop_active_replay_blocks_kanban_dispatch_before_reattach():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+        rec = run_workflow_script(
+            _E2E_SCRIPT,
+            args={"i": "#42"},
+            store=store,
+            run_id="src",
+            kanban_backend=backend,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_run(controls, "replay", reason="active replay stop")
+        rep = run_workflow_script(
+            _E2E_SCRIPT,
+            args={"i": "#42"},
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            kanban_backend=backend,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.stopped is True
+    assert rep.error["code"] == "run_stopped"
+    assert persisted.status == "stopped"
+    assert len(backend.created_cards) == 1
+    assert backend.reattachments == 0
+
+
+def test_control_task_stop_active_replay_blocks_kanban_dispatch_before_reattach():
+    script = META + (
+        'r = await kanban_agent("planner", title="plan", prompt="go", labels=["qa-label"], on_block="return")\n'
+        'return {"status": r["status"], "card_id": r["card_id"], "reattached": r["reattached"]}\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            kanban_backend=backend,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_task(controls, "replay", "qa-label", reason="skip replay child")
+        rep = run_workflow_script(
+            script,
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            kanban_backend=backend,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.ok is False
+    assert rep.error["code"] == "task_stopped"
+    assert persisted.status == "failed"
+    assert len(backend.created_cards) == 1
+    assert backend.reattachments == 0
 
 
 def test_e2e_chained_replay_reattaches_the_original_card():

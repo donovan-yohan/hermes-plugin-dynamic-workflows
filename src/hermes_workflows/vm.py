@@ -49,6 +49,7 @@ from .capabilities import (
     normalize_capability_name,
     safe_capability_metadata_value,
 )
+from .controls import ControlStore, may_check_run, may_continue_task, may_start_work, project_control_state
 from .errors import (
     CapabilityDenied,
     CorruptScriptRunError,
@@ -67,6 +68,7 @@ from .kanban import (
     KanbanResolution,
     KanbanTimeout,
     KanbanUnknownProfile,
+    kanban_card_id,
     normalize_on_block,
     validate_workflow_result,
 )
@@ -169,6 +171,8 @@ class ScriptRunResult:
     # (``type="KanbanSuspended"``, ``card_id``, ``profile``, ``on_block``); the run
     # is resumable in a fresh process via ``replay_from`` once the card resolves.
     suspended: bool = False
+    paused: bool = False
+    stopped: bool = False
     # Durable-store fields (issue #3); populated only when a ScriptRunStore is
     # supplied to run_script. Left None/0 for in-memory runs so existing callers
     # are unaffected.
@@ -186,6 +190,8 @@ class ScriptRunResult:
             "exit_code": self.exit_code,
             "stderr": self.stderr,
             "suspended": self.suspended,
+            "paused": self.paused,
+            "stopped": self.stopped,
             "run_id": self.run_id,
             "journal_path": self.journal_path,
             "replayed_calls": self.replayed_calls,
@@ -216,8 +222,10 @@ class CapabilityBroker:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        active_run_id: Optional[str] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
+        control_store: Optional[ControlStore] = None,
     ) -> None:
         self._runner = agent_runner
         self._child_runner = child_agent_runner
@@ -238,8 +246,13 @@ class CapabilityBroker:
         # a replay reattaches the same card rather than opening a duplicate.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        # Operator controls are scoped to the run currently being driven. Replays
+        # intentionally keep the original run as idempotency_root for card/cache
+        # convergence, but pause/stop/task_stop must read the fresh replay run id.
+        self._active_run_id = active_run_id or idempotency_root
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
+        self._control_store = control_store
         # Absolute wall-clock deadline for this run, set at construction (a few ms
         # before the subprocess spawns and the _drive watchdog arms). A durable
         # Kanban await is bounded by *this* shared deadline rather than a fresh
@@ -267,6 +280,10 @@ class CapabilityBroker:
         # a failure; ``suspend_info`` carries the metadata-safe card details.
         self.should_suspend = False
         self.suspend_info: Optional[dict[str, Any]] = None
+        self.should_pause = False
+        self.pause_info: Optional[dict[str, Any]] = None
+        self.should_stop = False
+        self.stop_info: Optional[dict[str, Any]] = None
 
     @property
     def replayed_calls(self) -> int:
@@ -278,6 +295,67 @@ class CapabilityBroker:
         total = self._limits.token_budget
         remaining = None if total is None else max(0, total - self._tokens)
         return {"total": total, "spent": self._tokens, "remaining": remaining}
+
+    def _control_state(self):
+        if self._control_store is None:
+            return None
+        return project_control_state(self._active_run_id, self._control_store.list_for(self._active_run_id))
+
+    def _deny_for_control(self, decision, *, call_id: Any, method: str) -> None:
+        info = {
+            "code": decision.code,
+            "reason": decision.reason,
+            "control_id": decision.control_id,
+            "call_id": call_id,
+            "method": method,
+        }
+        if decision.code == "run_stopped":
+            self.should_stop = True
+            self.stop_info = info
+        elif decision.code == "run_paused":
+            self.should_pause = True
+            self.pause_info = info
+        raise CapabilityDenied(decision.reason, code=decision.code)
+
+    def _check_run_control(self, call_id: Any, method: str, params: dict[str, Any]) -> None:
+        state = self._control_state()
+        if state is None:
+            return
+        decision = may_check_run(state)
+        if not decision.allowed:
+            self._deny_for_control(decision, call_id=call_id, method=method)
+
+    def _check_start_control(self, call_id: Any, method: str, params: dict[str, Any]) -> None:
+        state = self._control_state()
+        if state is None:
+            return
+        decision = may_start_work(state)
+        if not decision.allowed:
+            self._deny_for_control(decision, call_id=call_id, method=method)
+        for target_ref in self._call_control_refs(call_id, method, params):
+            target_decision = may_continue_task(state, target_ref)
+            if not target_decision.allowed:
+                self._deny_for_control(target_decision, call_id=call_id, method=method)
+
+    def _call_control_refs(self, call_id: Any, method: str, params: dict[str, Any]) -> tuple[str, ...]:
+        refs: list[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str) and value and value not in refs:
+                refs.append(value)
+
+        add(str(call_id) if call_id is not None else "")
+        add(f"{method}:{call_id}" if call_id is not None else "")
+        for key in ("label", "agent_id", "profile", "name", "title", "prompt"):
+            add(params.get(key))
+        labels = params.get("labels")
+        if isinstance(labels, (list, tuple)):
+            for label in labels:
+                add(label)
+        if method == "kanban_agent" and call_id is not None:
+            add(self._kanban_idempotency_key(call_id))
+            add(kanban_card_id(self._kanban_idempotency_key(call_id)))
+        return tuple(refs)
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self._journal is not None:
@@ -300,6 +378,7 @@ class CapabilityBroker:
                     )
                 if method not in _ALLOWED_METHODS:
                     raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
+                self._check_run_control(call_id, method, params)
 
             # Prompt-agent calls are resumable by a semantic fingerprint over the
             # prompt/options. Prefer that cache over ordinal call-id replay so a
@@ -541,6 +620,7 @@ class CapabilityBroker:
     def _handle_capability(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatch one generic host-owned capability through the registry."""
 
+        self._check_start_control(call_id, "capability", params)
         raw_name = params.get("name")
         if not isinstance(raw_name, str) or not raw_name:
             raise CapabilityDenied("capability call requires a non-empty 'name'", code="bad_request")
@@ -592,6 +672,8 @@ class CapabilityBroker:
 
     def _handle_agent(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         if "prompt" in params:
+            with self._lock:
+                self._check_start_control(call_id, "agent", params)
             return self._handle_prompt_agent(call_id, params)
 
         agent_id = params.get("agent_id")
@@ -604,6 +686,7 @@ class CapabilityBroker:
         if not is_known_agent(agent_id):
             raise CapabilityDenied(f"unknown agent id {agent_id!r}", code="unknown_agent")
         with self._lock:
+            self._check_start_control(call_id, "agent", params)
             self._check_token_budget()
             self._agent_calls += 1
             if self._agent_calls > self._limits.max_agent_calls:
@@ -617,10 +700,11 @@ class CapabilityBroker:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
         request = _prompt_agent_request(params)
-        self._check_token_budget()
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         if self._child_runner is None:
             raise CapabilityDenied(
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
@@ -638,7 +722,8 @@ class CapabilityBroker:
         _validate_output(safe_output, request.schema)
         usage = safe_output.get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool):
-            self._tokens += usage
+            with self._lock:
+                self._tokens += usage
         return safe_output
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -650,6 +735,7 @@ class CapabilityBroker:
         except ValueError as exc:
             raise CapabilityDenied(str(exc), code="bad_request") from exc
         with self._lock:
+            self._check_start_control(call_id, "kanban_agent", params)
             self._check_token_budget()
             self._kanban_calls += 1
             if self._kanban_calls > self._limits.max_kanban_calls:
@@ -1092,8 +1178,10 @@ class WorkflowVM:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        active_run_id: Optional[str] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
+        control_store: Optional[ControlStore] = None,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._child_runner = child_agent_runner
@@ -1107,9 +1195,11 @@ class WorkflowVM:
         # Durable Kanban awaitable wiring (issue #5): forwarded to the broker.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        self._active_run_id = active_run_id or idempotency_root
         # Generic host-owned capability API wiring (issue #29): forwarded to the broker.
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy
+        self._control_store = control_store
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -1145,8 +1235,10 @@ class WorkflowVM:
             deterministic_runner=self._deterministic_runner,
             kanban_backend=self._kanban_backend,
             idempotency_root=self._idempotency_root,
+            active_run_id=self._active_run_id,
             capability_registry=self._capability_registry,
             capability_policy=self._capability_policy,
+            control_store=self._control_store,
         )
         try:
             result = self._drive(script, args, broker, calls)
@@ -1195,6 +1287,8 @@ class WorkflowVM:
         done: Optional[dict[str, Any]] = None
         protocol_error: Optional[str] = None
         suspended: Optional[dict[str, Any]] = None
+        paused: Optional[dict[str, Any]] = None
+        stopped: Optional[dict[str, Any]] = None
 
         try:
             assert proc.stdin is not None and proc.stdout is not None
@@ -1259,6 +1353,18 @@ class WorkflowVM:
                             _kill(proc)
                     if protocol_error is not None or suspended is not None:
                         break
+                    if broker.should_stop:
+                        _kill(proc)
+                        stopped = broker.stop_info or {}
+                        break
+                    if broker.should_pause:
+                        _kill(proc)
+                        paused = broker.pause_info or {}
+                        break
+                    if broker.should_abort:
+                        _kill(proc)
+                        protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
+                        break
                     try:
                         frame = rpc.read_frame(proc.stdout)
                     except rpc.RPCProtocolError as exc:
@@ -1312,6 +1418,18 @@ class WorkflowVM:
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
                 error={"type": "WorkflowSubprocessError",
                        "message": f"workflow timed out after {self._limits.max_runtime_s}s"},
+            )
+        if stopped is not None:
+            return ScriptRunResult(
+                ok=False, stopped=True, meta=meta, calls=calls,
+                exit_code=exit_code, stderr=stderr_text,
+                error={"type": "WorkflowStopped", **stopped},
+            )
+        if paused is not None:
+            return ScriptRunResult(
+                ok=False, paused=True, meta=meta, calls=calls,
+                exit_code=exit_code, stderr=stderr_text,
+                error={"type": "WorkflowPaused", **paused},
             )
         if suspended is not None:
             # Durable, resumable suspension (issue #5) — not a failure. The error
@@ -1567,6 +1685,7 @@ def run_script(
     kanban_backend: Optional[KanbanBackend] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    control_store: Optional[ControlStore] = None,
 ) -> ScriptRunResult:
     """Construct a :class:`WorkflowVM` and run one script, optionally durable.
 
@@ -1673,8 +1792,10 @@ def run_script(
             deterministic_runner=deterministic,
             kanban_backend=kanban_backend,
             idempotency_root=idempotency_root,
+            active_run_id=idempotency_root,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
+            control_store=control_store,
         )
         return vm.run(script, args=args, validate=validate)
 
@@ -1720,8 +1841,10 @@ def run_script(
         deterministic_runner=deterministic,
         kanban_backend=kanban_backend,
         idempotency_root=idempotency_root,
+        active_run_id=persist_run_id,
         capability_registry=capability_registry,
         capability_policy=capability_policy,
+        control_store=control_store,
     )
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id
@@ -1730,7 +1853,11 @@ def run_script(
     # an operator/resumer can discover it (store.suspended_runs) and resume it with
     # replay_from once the awaited card produces an event. It is neither succeeded
     # nor failed.
-    if result.suspended:
+    if result.stopped:
+        status = "stopped"
+    elif result.paused:
+        status = "paused"
+    elif result.suspended:
         status = "suspended"
     elif result.ok:
         status = "succeeded"
