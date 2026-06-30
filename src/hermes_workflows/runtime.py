@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .agents import AgentRunner, StubAgentRunner, kanban_runner_id
-from .errors import SandboxPolicyError
+from .controls import ControlStore, may_check_run, may_continue_task, may_start_work, project_control_state
+from .errors import ControlDispatchDenied, SandboxPolicyError
 from .models import StepStatus
 from .registry import RunStore, utc_now_iso
 from .sandbox import parse_ref
@@ -84,6 +85,7 @@ class RunContext:
     workflow_id: Optional[str] = None
     phase_id: Optional[str] = None
     phase_title: Optional[str] = None
+    control_store: Optional[ControlStore] = None
 
 
 def _optional_nonnegative_int(value: Any) -> Optional[int]:
@@ -129,6 +131,37 @@ def _check_effect_budget(ctx: RunContext, *, kind: str, profile: Optional[str] =
     ctx.agent_calls += 1
     if kind == "kanban_agent":
         ctx.kanban_cards += 1
+
+
+def _enforce_run_control(ctx: RunContext, *, step: Optional[dict[str, Any]] = None) -> None:
+    """Fail closed if workflow_control state denies the next dispatch."""
+
+    if ctx.control_store is None:
+        return
+    state = project_control_state(ctx.run_id, ctx.control_store.list_for(ctx.run_id))
+    run_decision = may_check_run(state)
+    if not run_decision.allowed:
+        raise ControlDispatchDenied(run_decision)
+    if step is None:
+        return
+    start_decision = may_start_work(state)
+    if not start_decision.allowed:
+        raise ControlDispatchDenied(start_decision)
+    for target_ref in _step_control_refs(step):
+        target_decision = may_continue_task(state, target_ref)
+        if not target_decision.allowed:
+            raise ControlDispatchDenied(target_decision)
+
+
+def _step_control_refs(step: dict[str, Any]) -> tuple[str, ...]:
+    """Candidate child refs a task_stop may name before a step dispatches."""
+
+    refs: list[str] = []
+    for key in ("id", "label", "title", "task_title", "agent", "profile"):
+        value = step.get(key)
+        if isinstance(value, str) and value and value not in refs:
+            refs.append(value)
+    return tuple(refs)
 
 
 def _waiting_kanban_count(step: dict[str, Any]) -> int:
@@ -195,6 +228,7 @@ def execute(steps: list[dict[str, Any]], ctx: RunContext) -> dict[str, Any]:
 def _exec_sequence(steps: list[dict[str, Any]], ctx: RunContext) -> None:
     """Run ``steps`` in order, streaming each output to the next (no barrier)."""
     for step in steps:
+        _enforce_run_control(ctx)
         _exec_step(step, ctx)
 
 
@@ -230,6 +264,7 @@ def _check_depends_on(step: dict[str, Any], ctx: RunContext) -> None:
 def _exec_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     """Execute an ``agent`` step through the injected runner and record it."""
     agent_id = step["agent"]
+    _enforce_run_control(ctx, step=step)
     _check_effect_budget(ctx, kind="agent")
     return _exec_effect_step(
         step,
@@ -250,6 +285,7 @@ def _exec_kanban_agent(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
     deterministic with :class:`StubAgentRunner`.
     """
     profile = step["profile"]
+    _enforce_run_control(ctx, step=step)
     _check_effect_budget(ctx, kind="kanban_agent", profile=profile)
     agent_id = kanban_runner_id(profile)
     return _exec_effect_step(
@@ -444,6 +480,7 @@ def _exec_phase(step: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
         workflow_id=ctx.workflow_id,
         phase_id=phase_id,
         phase_title=phase_title,
+        control_store=ctx.control_store,
     )
 
     try:

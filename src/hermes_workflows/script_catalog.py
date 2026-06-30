@@ -38,6 +38,7 @@ __all__ = [
     "FileWorkflowScriptCatalog",
     "default_script_catalog_roots",
     "safe_script_name",
+    "safe_script_path",
 ]
 
 _SCRIPT_VERSION_RE = re.compile(r"^v(?P<n>[0-9]{6})\.workflow(?:\.py)?$")
@@ -56,6 +57,25 @@ def safe_script_name(name: str) -> str:
     if not name or name.startswith("."):
         raise ValueError(f"unsafe script_name: {name!r}")
     return name
+
+
+def safe_script_path(path: str) -> str:
+    """Return a safe catalog-relative script path, else raise ``ValueError``."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("script_path must be a non-empty string")
+    if "\\" in path:
+        raise ValueError(f"unsafe script_path: {path!r}")
+    candidate = Path(path)
+    if candidate.is_absolute():
+        raise ValueError(f"unsafe script_path: {path!r}")
+    parts = candidate.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"unsafe script_path: {path!r}")
+    if any(part.startswith(".") for part in parts):
+        raise ValueError(f"unsafe script_path: {path!r}")
+    if not candidate.name.endswith((".workflow", ".workflow.py")):
+        raise ValueError("script_path must point to a .workflow or .workflow.py file")
+    return "/".join(parts)
 
 
 def default_script_catalog_roots() -> list[Path]:
@@ -187,6 +207,10 @@ class FileWorkflowScriptCatalog:
         """Load one saved script source by name/version."""
         return self._resolve_script_path(name, version=version).read_text(encoding="utf-8")
 
+    def load_script_path(self, path: str) -> str:
+        """Load one catalog-relative script file without allowing root escape."""
+        return self._resolve_relative_script_path(path).read_text(encoding="utf-8")
+
     def save_script(
         self,
         name: str,
@@ -257,6 +281,18 @@ class FileWorkflowScriptCatalog:
             return path
         suffix = "latest" if version is None else str(version)
         raise FileNotFoundError(f"workflow script not found: {safe}@{suffix}")
+
+    def _resolve_relative_script_path(self, path: str) -> Path:
+        rel = Path(safe_script_path(path))
+        for root in self.roots:
+            candidate = root / rel
+            try:
+                self._ensure_within_root(root, candidate)
+            except ValueError:
+                continue
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        raise FileNotFoundError(f"workflow script path not found: {rel.as_posix()}")
 
     def _script_path_for_version(self, root: Path, script_dir: Path, version: int) -> Path:
         token = _version_token(version)

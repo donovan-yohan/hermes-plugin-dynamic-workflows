@@ -16,7 +16,8 @@ from . import runtime as _runtime
 from .agents import AgentRunner, ChildAgentRunner, StubAgentRunner
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
-from .errors import WorkflowValidationError
+from .controls import ControlStore
+from .errors import ControlDispatchDenied, WorkflowValidationError
 from .models import Diagnostic, RunHandle, RunStatus, ValidationResult, Progress
 from .registry import RunStore, get_default_store
 from .script_catalog import FileWorkflowScriptCatalog
@@ -66,8 +67,14 @@ def workflow(
     include_source: bool = False,
     include_versions: bool = False,
     replace: bool = False,
+    script: Optional[str] = None,
+    script_path: Optional[str] = None,
+    name: Optional[str] = None,
+    args: Any = None,
+    resume_from_run_id: Optional[str] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    control_store: Optional[ControlStore] = None,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
 
@@ -77,8 +84,15 @@ def workflow(
     operator/debug usage.
     """
     store = registry if registry is not None else get_default_store(session_id=session_id)
+    facade_script_args = args if args is not None else script_args
+    facade_name = name if name is not None else script_name
+    has_facade_script = script is not None or script_path is not None or name is not None
     op = action or (
-        "validate" if dry_run else "run_template" if template_name else "status" if definition is None and run_id else "run"
+        "validate" if dry_run else
+        "run_facade_script" if has_facade_script else
+        "run_template" if template_name else
+        "status" if definition is None and run_id else
+        "run"
     )
     if op == "validate":
         if definition is None:
@@ -102,6 +116,7 @@ def workflow(
             max_parallel=max_parallel,
             run_id=run_id,
             include_steps=include_steps,
+            control_store=control_store,
         )
         return {"operation": "run", "handle": handle.as_dict(), "status": status.as_dict()}
     if op == "catalog":
@@ -121,6 +136,7 @@ def workflow(
             max_parallel=max_parallel,
             run_id=run_id,
             include_steps=include_steps,
+            control_store=control_store,
         )
         return {
             "operation": "run_template",
@@ -131,6 +147,54 @@ def workflow(
         }
     if op == "script_catalog":
         return workflow_script_catalog(catalog=script_catalog, include_versions=include_versions)
+    if op == "run_facade_script":
+        source_count = sum(value is not None for value in (script, script_path, name))
+        if source_count != 1:
+            raise ValueError("workflow script facade requires exactly one of 'script', 'script_path', or 'name'")
+        if script is not None:
+            result = run_workflow_script(
+                script,
+                args=facade_script_args,
+                store=script_store,
+                agent_runner=agent_runner,
+                validate=validate,
+                run_id=run_id,
+                replay_from=resume_from_run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+            )
+            return _script_run_payload("inline_script", result)
+        if script_path is not None:
+            active_catalog = script_catalog if script_catalog is not None else FileWorkflowScriptCatalog()
+            source = active_catalog.load_script_path(script_path)
+            result = run_workflow_script(
+                source,
+                args=facade_script_args,
+                store=script_store,
+                agent_runner=agent_runner,
+                validate=validate,
+                run_id=run_id,
+                replay_from=resume_from_run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+            )
+            return _script_run_payload("script_path", result, script_path=script_path)
+        if facade_name is None:
+            raise ValueError("workflow script facade requires 'name'")
+        result = workflow_run_script(
+            facade_name,
+            args=facade_script_args,
+            catalog=script_catalog,
+            store=script_store,
+            agent_runner=agent_runner,
+            version=script_version,
+            validate=validate,
+            run_id=run_id,
+            replay_from=resume_from_run_id,
+            capability_registry=capability_registry,
+            capability_policy=capability_policy,
+        )
+        return _script_run_payload("saved_script", result, name=facade_name)
     if op == "script_save":
         if not script_name or script_source is None:
             raise ValueError("workflow script_save requires 'script_name' and 'script_source'")
@@ -151,22 +215,43 @@ def workflow(
             include_source=include_source,
         )
     if op == "run_script":
-        if not script_name:
-            raise ValueError("workflow run_script requires 'script_name'")
+        selected_name = facade_name
+        if not selected_name:
+            raise ValueError("workflow run_script requires 'script_name' or 'name'")
         result = workflow_run_script(
-            script_name,
-            args=script_args,
+            selected_name,
+            args=facade_script_args,
             catalog=script_catalog,
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
             version=script_version,
             validate=validate,
+            run_id=run_id,
+            replay_from=resume_from_run_id,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
+            control_store=control_store,
         )
-        return {"operation": "run_script", "script_name": script_name, "result": result.as_dict()}
+        return {"operation": "run_script", "script_name": selected_name, "result": result.as_dict()}
     raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
+
+
+def _script_run_payload(source: str, result: ScriptRunResult, **extra: Any) -> dict[str, Any]:
+    status = "suspended" if result.suspended else "succeeded" if result.ok else "failed"
+    payload: dict[str, Any] = {
+        "operation": "run_script",
+        "source": source,
+        "run_id": result.run_id,
+        "status": status,
+        "result": result.as_dict(),
+    }
+    if result.journal_path:
+        payload["journal_path"] = result.journal_path
+    if result.replayed_calls:
+        payload["replayed_calls"] = result.replayed_calls
+    payload.update(extra)
+    return payload
 
 
 def _run_and_status(
@@ -179,6 +264,7 @@ def _run_and_status(
     max_parallel: int,
     run_id: Optional[str],
     include_steps: bool,
+    control_store: Optional[ControlStore],
 ) -> tuple[RunHandle, RunStatus]:
     handle = workflow_run(
         definition,
@@ -188,6 +274,7 @@ def _run_and_status(
         validate=validate,
         max_parallel=max_parallel,
         run_id=run_id,
+        control_store=control_store,
     )
     status = workflow_status(handle.run_id, registry=registry, include_steps=include_steps)
     return handle, status
@@ -258,6 +345,14 @@ def _effective_max_parallel(definition: dict[str, Any], override: int) -> int:
     return max(1, min(candidates))
 
 
+def _run_lifecycle_for_control_code(code: str) -> str:
+    if code == "run_stopped":
+        return "stopped"
+    if code == "run_paused":
+        return "paused"
+    return "failed"
+
+
 def workflow_run(
     definition: dict[str, Any] | str,
     *,
@@ -268,6 +363,7 @@ def workflow_run(
     max_parallel: int = 8,
     run_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    control_store: Optional[ControlStore] = None,
 ) -> RunHandle:
     """Execute a workflow definition in the deterministic sandboxed runtime.
 
@@ -326,8 +422,18 @@ def workflow_run(
             max_parallel=_effective_max_parallel(normalized, max_parallel),
             governance=_runtime.GovernancePolicy.from_definition(normalized),
             workflow_id=rid,
+            control_store=control_store,
         )
         final = _runtime.execute(list(normalized.get("steps", [])), ctx)
+    except ControlDispatchDenied as exc:
+        decision = exc.decision.to_dict()
+        status = _run_lifecycle_for_control_code(exc.code)
+        store.set_status(
+            rid,
+            status,  # type: ignore[arg-type]
+            error={"type": "ControlDispatchDenied", "code": exc.code, "message": str(exc), "decision": decision},
+        )
+        return RunHandle(run_id=rid, status=status, created_at=record.created_at, def_hash=h)  # type: ignore[arg-type]
     except Exception as exc:
         store.set_status(
             rid, "failed", error={"type": type(exc).__name__, "message": str(exc)}
@@ -398,6 +504,7 @@ def workflow_run_script(
     kanban_backend: Optional["KanbanBackend"] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    control_store: Optional[ControlStore] = None,
 ) -> ScriptRunResult:
     """Load and run a saved Python workflow-script harness by catalog name."""
     active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
@@ -417,6 +524,7 @@ def workflow_run_script(
         kanban_backend=kanban_backend,
         capability_registry=capability_registry,
         capability_policy=capability_policy,
+        control_store=control_store,
     )
 
 
@@ -447,6 +555,7 @@ def run_workflow_script(
     kanban_backend: Optional["KanbanBackend"] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    control_store: Optional[ControlStore] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -487,6 +596,7 @@ def run_workflow_script(
         kanban_backend=kanban_backend,
         capability_registry=capability_registry,
         capability_policy=capability_policy,
+        control_store=control_store,
     )
 
 

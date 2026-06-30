@@ -100,13 +100,16 @@ def _plugin_control_store(session_id: Optional[str] = None) -> FileControlStore:
     return FileControlStore(str(root))
 
 
-def _plugin_script_store() -> Optional[ScriptRunStore]:
+def _plugin_script_store(session_id: Optional[str] = None) -> Optional[ScriptRunStore]:
     """Return the script-run store iff its directory already exists (best-effort).
 
-    Used only to surface durable Kanban waits in the operator overview; absent a
-    script-runs dir there is simply nothing to inspect, never an error.
+    Used only to surface durable script-run state and Kanban waits in the
+    operator surfaces; absent a script-runs dir there is simply nothing to
+    inspect, never an error.
     """
     path = _state_root() / "script-runs"
+    if session_id:
+        path = path / session_id
     if not path.exists():
         return None
     return ScriptRunStore(str(path))
@@ -163,6 +166,7 @@ WORKFLOW_SCHEMA = {
                     "script_save",
                     "script_inspect",
                     "run_script",
+                    "run_facade_script",
                     None,
                 ],
                 "description": "Optional explicit operation. Defaults from supplied fields.",
@@ -208,6 +212,38 @@ WORKFLOW_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "null"},
                 ],
+                "default": None,
+            },
+            "script": {
+                "type": ["string", "null"],
+                "description": "Inline workflow-script source for the Claude-style facade.",
+                "default": None,
+            },
+            "scriptPath": {
+                "type": ["string", "null"],
+                "description": "Catalog-relative .workflow/.workflow.py script path for the Claude-style facade.",
+                "default": None,
+            },
+            "name": {
+                "type": ["string", "null"],
+                "description": "Saved script harness name for the Claude-style facade.",
+                "default": None,
+            },
+            "args": {
+                "description": "Arguments passed to script/name/scriptPath facade runs.",
+                "oneOf": [
+                    {"type": "object"},
+                    {"type": "array"},
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ],
+                "default": None,
+            },
+            "resumeFromRunId": {
+                "type": ["string", "null"],
+                "description": "Prior script run id to replay/resume from; identity mismatches fail closed.",
                 "default": None,
             },
             "script_version": {
@@ -349,8 +385,9 @@ WORKFLOW_CONTROL_SCHEMA = {
         "the run continue) an adapter would consult; pause/resume/stop/task_stop/"
         "retry record an append-only control intent (the audit trail is never "
         "deleted). Retry is idempotent per target_ref with explicit replacement "
-        "lineage. This surface records and decides intent; it does not itself kill "
-        "processes or replay tasks — a backend adapter enforces the decisions."
+        "lineage. The workflow runtime and script broker enforce these decisions "
+        "at child dispatch boundaries; backend adapters still own any external "
+        "process kill/replay mechanics."
     ),
     "parameters": {
         "type": "object",
@@ -457,6 +494,139 @@ def _loop_waits(*, run_id: Optional[str] = None) -> list:
     return waits
 
 
+def _script_run_records(script_store: Optional[ScriptRunStore]) -> list[Any]:
+    if script_store is None or not script_store.root.exists():
+        return []
+    records: list[Any] = []
+    for child in sorted(script_store.root.iterdir()):
+        if not child.is_dir() or not _is_safe_segment(child.name):
+            continue
+        try:
+            records.append(script_store.load_run(child.name))
+        except Exception:  # pragma: no cover - best-effort operator overview
+            continue
+    return records
+
+
+def _script_run_progress(record: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
+    calls = [e for e in events if isinstance(e, dict) and e.get("type") == "call"]
+    completed = sum(1 for e in calls if e.get("ok") is True)
+    failed = sum(1 for e in calls if e.get("ok") is False)
+    total = len(calls)
+    status = getattr(record, "status", "unknown")
+    running = 1 if status == "running" else 0
+    if status == "failed" and failed == 0 and total == 0:
+        failed = 1
+        total = 1
+    pct = 0.0
+    if status in {"succeeded", "failed", "suspended"}:
+        pct = 100.0
+    elif total:
+        pct = round((completed + failed) / total * 100, 2)
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "queued": 0,
+        "cancelled": 0,
+        "pct": pct,
+    }
+
+
+def _script_run_links(script_store: ScriptRunStore, record: Any) -> dict[str, Any]:
+    run_id = getattr(record, "run_id", "")
+    run_dir = script_store.root / run_id
+    return _controls.run_links(
+        run_id=run_id,
+        script_path=str(run_dir / "run.json"),
+        journal_path=str(run_dir / "journal.jsonl"),
+        extra={"kind": "script"},
+    )
+
+
+def _inspect_script_run(
+    run_id: str,
+    *,
+    script_store: Optional[ScriptRunStore],
+    control_store: FileControlStore,
+    events_limit: int,
+) -> Optional[dict[str, Any]]:
+    if script_store is None:
+        return None
+    try:
+        record = script_store.load_run(run_id)
+    except Exception:
+        return None
+    state = _controls.project_control_state(run_id, control_store.list_for(run_id))
+    events = script_store.journal(run_id, limit=events_limit)
+    progress_events = script_store.journal(run_id, limit=200)
+    waits = [
+        w
+        for w in _kanban_waits(script_store, run_id=run_id) + _loop_waits(run_id=run_id)
+        if w.run_id == run_id
+    ]
+    return _controls.inspect_run(
+        run_id,
+        lifecycle=record.status,
+        control_state=state,
+        current_phase=_script_current_phase(events)
+        or ((record.meta or {}).get("name") if isinstance(record.meta, dict) else None),
+        phases=record.phases,
+        progress=_script_run_progress(record, progress_events),
+        waits=waits,
+        result=record.value,
+        error=record.error,
+        last_events=events,
+        links=_script_run_links(script_store, record),
+        events_limit=events_limit,
+    )
+
+
+def _merge_script_runs_into_overview(
+    overview: dict[str, Any],
+    *,
+    script_store: Optional[ScriptRunStore],
+    control_store: FileControlStore,
+    waits: list[Any],
+    limit: int,
+) -> dict[str, Any]:
+    records = _script_run_records(script_store)
+    if not records or script_store is None:
+        return overview
+    waits_by_run: dict[str, int] = {}
+    for wait in waits:
+        waits_by_run[wait.run_id] = waits_by_run.get(wait.run_id, 0) + 1
+
+    rows = list(overview.get("runs") or [])
+    active = set(overview.get("active") or [])
+    counts = dict(overview.get("counts") or {})
+    for record in records:
+        run_id = record.run_id
+        state = _controls.project_control_state(run_id, control_store.list_for(run_id))
+        progress_events = script_store.journal(run_id, limit=200)
+        row = _controls.summarize_run(
+            record,
+            kind="script",
+            control_state=state,
+            wait_count=waits_by_run.get(run_id, 0),
+            links=_script_run_links(script_store, record),
+        ).to_dict()
+        row["progress"] = _script_run_progress(record, progress_events)
+        rows.append(row)
+        counts["total"] = counts.get("total", 0) + 1
+        if state.stopped:
+            counts["stopped"] = counts.get("stopped", 0) + 1
+        elif state.paused:
+            counts["paused"] = counts.get("paused", 0) + 1
+        if row["status"] in ("running", "succeeded", "failed"):
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        if not state.stopped and (state.paused or row["status"] in ("running", "suspended")):
+            active.add(run_id)
+    rows.sort(key=lambda r: (str(r.get("updated_at") or ""), str(r.get("run_id") or "")), reverse=True)
+    return {**overview, "runs": rows[: max(0, limit)], "active": sorted(active), "counts": counts}
+
+
 def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
     if not _is_safe_segment(run_id):
         return False
@@ -494,13 +664,22 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
 
         if action == "overview":
             run_store = _plugin_store(session_id=session_id)
-            waits = _kanban_waits(_plugin_script_store()) + _loop_waits()
+            script_store = _plugin_script_store(session_id=session_id)
+            waits = _kanban_waits(script_store) + _loop_waits()
+            limit = params.get("limit", 20)
             overview = _controls.list_runs(
                 run_store.list(),
                 control_store,
                 waits=waits,
                 link_resolver=_control_link_resolver(run_store),
-                limit=params.get("limit", 20),
+                limit=limit,
+            )
+            overview = _merge_script_runs_into_overview(
+                overview,
+                script_store=script_store,
+                control_store=control_store,
+                waits=waits,
+                limit=limit,
             )
             return _ok({"operation": "overview", **overview})
 
@@ -512,59 +691,36 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         if action == "status":
             run_store = _plugin_store(session_id=session_id)
             record = run_store.get(run_id)
-            script_store = _plugin_script_run_store(session_id=session_id)
-            script_record = None
-            if record is None:
-                try:
-                    script_record = script_store.load_run(run_id)
-                except (ScriptRunStoreError, ValueError):
-                    script_record = None
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
+            events_limit = params.get("events_limit", 10)
+            if record is None:
+                script_report = _inspect_script_run(
+                    run_id,
+                    script_store=_plugin_script_store(session_id=session_id),
+                    control_store=control_store,
+                    events_limit=events_limit,
+                )
+                if script_report is not None:
+                    return _ok({"operation": "status", **script_report})
             waits = [
                 w
-                for w in _kanban_waits(_plugin_script_store(), run_id=run_id) + _loop_waits(run_id=run_id)
+                for w in _kanban_waits(_plugin_script_store(session_id=session_id), run_id=run_id) + _loop_waits(run_id=run_id)
                 if w.run_id == run_id
             ]
-            if record is not None:
-                events = run_store.journal(run_id, limit=params.get("events_limit", 10))
-                links = _control_link_resolver(run_store)(record)
-                lifecycle = record.status
-                current_phase = _controls.current_phase(record.steps)
-                progress = record.to_status().progress.as_dict()
-                result = record.result
-                error = record.error
-                phases = None
-            elif script_record is not None:
-                events = script_store.journal(run_id, limit=params.get("events_limit", 10))
-                links = _controls.run_links(run_id=run_id, journal_path=str(script_store.journal_path(run_id)))
-                lifecycle = script_record.status
-                current_phase = _script_current_phase(events)
-                phases = script_record.phases
-                progress = {"phases_total": len(phases)}
-                result = script_record.value
-                error = script_record.error
-            else:
-                events = []
-                links = {"run_id": run_id}
-                lifecycle = "unknown"
-                current_phase = None
-                phases = None
-                progress = None
-                result = None
-                error = None
+            events = run_store.journal(run_id, limit=events_limit) if record is not None else []
+            links = _control_link_resolver(run_store)(record) if record is not None else {"run_id": run_id}
             report = _controls.inspect_run(
                 run_id,
-                lifecycle=lifecycle,
+                lifecycle=record.status if record is not None else "unknown",
                 control_state=state,
-                current_phase=current_phase,
-                progress=progress,
+                current_phase=_controls.current_phase(record.steps) if record is not None else None,
+                progress=record.to_status().progress.as_dict() if record is not None else None,
                 waits=waits,
-                result=result,
-                error=error,
-                phases=phases,
+                result=record.result if record is not None else None,
+                error=record.error if record is not None else None,
                 last_events=events,
                 links=links,
-                events_limit=params.get("events_limit", 10),
+                events_limit=events_limit,
             )
             return _ok({"operation": "status", **report})
 
@@ -612,6 +768,11 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             script_source=params.get("script_source"),
             script_args=params.get("script_args"),
             script_version=params.get("script_version"),
+            script=params.get("script"),
+            script_path=params.get("scriptPath"),
+            name=params.get("name"),
+            args=params.get("args"),
+            resume_from_run_id=params.get("resumeFromRunId"),
             include_source=params.get("include_source", False),
             include_versions=params.get("include_versions", False),
             replace=params.get("replace", False),
@@ -624,6 +785,7 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),
             session_id=session_id,
+            control_store=_plugin_control_store(session_id=session_id),
         )
         if params.get("include_journal") and params.get("run_id"):
             result["journal"] = store.journal(params["run_id"], limit=params.get("journal_limit", 100))
@@ -648,6 +810,7 @@ def _handle_run(params: dict[str, Any], **kwargs: Any) -> str:
             max_parallel=params.get("max_parallel", 8),
             run_id=params.get("run_id"),
             session_id=session_id,
+            control_store=_plugin_control_store(session_id=session_id),
         )
         return _ok(handle)
     except WorkflowError as exc:
