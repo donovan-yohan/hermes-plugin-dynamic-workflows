@@ -10,7 +10,7 @@ primitives for sandboxed, script-led orchestration over Hermes agents:
 
 This document describes the architecture, the design decisions behind it, what we
 borrow from Claude Dynamic Workflows and how we differ, the sandbox security
-model, the optional Kanban run-status backend, and the roadmap.
+model, the Kanban/task-event adapter boundaries, and the roadmap.
 
 The package is **pure Python 3.11 stdlib** (`json`, `dataclasses`, `hashlib`,
 `uuid`, `datetime`, `typing`, `threading`, `pathlib`). It has **zero runtime dependencies**
@@ -147,7 +147,7 @@ def workflow_status(
 | `schema.py` | Parse JSON, validate top-level shape, step kinds, references; emit `Diagnostic`s with stable codes and JSON-Pointer `pointer`s. |
 | `sandbox.py` | Documents and **enforces** the capability policy (default-deny). Static lint only; not a JS engine. |
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
-| `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; `FileRunStore` snapshots/journals; `KanbanRunStore` documented/stubbed. |
+| `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; file-backed run state for embedders; board-backed stores remain adapter work. |
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
 | `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
 | `grants.py` | Backend-neutral scoped actuator grants: `GrantRequest` / `SessionGrant` / `GrantHandle` models, in-memory/file `GrantStore`, `StaticPolicyGrantBroker`, `request_grant` / `resolve_grant` / `validate_grant`, and a credential-leak guard. Wired into `loop_run` for fail-closed session-launch authorization. |
@@ -698,9 +698,13 @@ one injected callable, the trust boundary is small, auditable, and easy to mock.
 
 ---
 
-## 4. Kanban backend option (pluggable run-status store)
+## 4. Run stores, task adapters, and notification boundaries
 
-### 4.1 The `RunStore` seam
+The project has three adjacent but different persistence/visibility seams. Keep
+them separate: workflow state, board/task execution, and chat notification have
+different consistency, authorization, and lifecycle constraints.
+
+### 4.1 `RunStore`: workflow-owned run state
 
 `registry.py` defines a `RunStore` Protocol and injects it into both
 `workflow_run` and `workflow_status` via the `registry=` parameter:
@@ -717,43 +721,72 @@ class RunStore(Protocol):
 ```
 
 The default is `InMemoryRunStore`, a thread-safe (`threading.Lock`) process-global
-implementation. Because the primitives accept `registry=` injection, downstream
-can swap the store **without touching the primitives**.
+implementation. `FileRunStore` gives embedders local snapshot/journal persistence.
+Because the primitives accept `registry=` injection, downstream can swap the store
+without touching the public primitives.
 
-### 4.2 Board / columns / cards mapping
+A Kanban-shaped run-status board remains a valid **store adapter** idea: board =
+workflow, card = run, checklist = steps. But that is not the same as the shipped
+`kanban_agent` task adapter. A board-backed `RunStore` should visualize workflow
+state; it should not execute worker tasks, dispatch agents, or define generic
+workflow semantics.
 
-A Kanban board is a natural visual model for run lifecycle, so `KanbanRunStore` is
-**documented and stubbed** here as an alternative store. The mapping:
+### 4.2 `kanban_agent`: durable task/work adapter
 
-| Kanban concept | Workflow concept |
-|----------------|------------------|
-| **Board** | A workflow (grouped by `name` / `def_hash`). |
-| **Columns** | The run lifecycle states: `queued` → `running` → `succeeded` / `failed` / `cancelled`. |
-| **Cards** | Runs (one card per `run_id`), optionally with sub-cards/checklist items per `StepStatus`. |
-| **Card moves** | `set_status` transitions move a card between columns. |
-| **Card fields** | `created_at`, `updated_at`, `def_hash`, `Progress`, and per-step `output`/`error`. |
+`kanban_agent` is the durable multi-agent awaitable, not the generic workflow
+abstraction. The shipped implementation path is now:
 
-The `RunStore` operations map cleanly onto board operations: `create` opens a card
-in the `queued` column, `update_step` updates a card's checklist, `set_status`
-moves the card to the next column, and `get` reconstructs a `RunStatus` from the
-card.
+| Piece | Responsibility |
+| --- | --- |
+| `KanbanBackend` | Create/reattach one idempotent task and await a terminal resolution. |
+| `DurableKanbanBackend` | Persist card state/outcomes so replay/restart does not duplicate cards or lose completed work. |
+| `EventLogKanbanBackend` + notifier | Resolve from a durable task-event log, using notifications as wakeup hints. |
+| `HermesKanbanBackend` | Production-shaped Hermes CLI adapter: create/comment only, never dispatch. |
+| `publish_hermes_kanban_event` | Worker/gateway-side bridge from real terminal task states into the workflow event log. |
 
-### 4.3 Pluggable vs in-memory — trade-offs
+The design rule is intentionally narrow: Dynamic Workflows creates or awaits
+cards; gateway/Kanban dispatch owns claiming and executing those cards. The
+adapter must not shell out to `dispatch`, run a daemon, spawn workers, or poll a
+board to rediscover the phase. It translates workflow-owned state into board work
+and translates terminal board events back into workflow results.
 
-| | `InMemoryRunStore` (default) | `KanbanRunStore` (optional, stubbed) |
-|---|---|---|
-| **Dependencies** | None (stdlib only). | External Kanban service/API. Out of scope for the skeleton. |
-| **Durability** | Process-lifetime only; lost on restart. | Durable, externally backed. |
-| **Visibility** | Programmatic (`workflow_status`). | Human-facing board UI for free. |
-| **Latency** | In-process, microseconds. | Network round-trips per transition. |
-| **Concurrency** | `threading.Lock`-guarded, single process. | Multi-process / multi-host observers. |
-| **Failure modes** | None beyond the process. | Must handle network errors, retries, eventual consistency. |
+### 4.3 ATH/source bindings: notification and control ingress
 
-**`KanbanRunStore` is intentionally NOT implemented** in the skeleton (it would
-require an external dependency and network access, both prohibited). It is
-described and stubbed so the seam is proven and the contract is documented; a
-downstream integrator implements the Protocol against their board of choice and
-injects it via `registry=`.
+ATH is the operator wakeup surface: signed events, listener/source-binding routing,
+thread continuity, compact status updates, and approval prompts. It is not a
+workflow executor. A typical long-lived run should look like:
+
+```text
+workflow/controller state
+  -> task/event wait
+  -> Kanban source binding or producer emits signed ATH event
+  -> gateway wakes the original Discord/Telegram thread
+  -> operator inspects workflow_control status or records approval/stop/retry intent
+```
+
+Core modules therefore expose backend-neutral seams (`LoopEventSink`, workflow
+events, `workflow_control`, resource finalizer action strings such as
+`ath.listener.retire`) rather than importing gateway or ATH internals. Host
+adapters own delivery, auth, redaction, retries, and listener lifecycle.
+
+### 4.4 AsyncSessionDB-era implication
+
+Upstream Hermes now routes gateway `SessionDB` access through `AsyncSessionDB`, an
+async facade that offloads synchronous SQLite calls with `asyncio.to_thread(...)`.
+That improves liveness for the event-driven operator path above: ATH/source-binding
+wakeups are less likely to be delayed by unrelated gateway `state.db` contention.
+
+It does **not** move any workflow responsibility into the gateway. Dynamic
+Workflows still owns run state, waits, approvals, cancellation intent, retries,
+resources, artifacts, and finalizer contracts. ATH still owns signed event ingress
+and conversation continuity. Kanban still owns durable worker/task graph state.
+Cron remains only for calendar starts, heartbeats, or emergency compatibility — not
+phase advancement.
+
+Also note the blast radius: AsyncSessionDB protects Hermes gateway `state.db`
+access, not plugin-owned JSONL/file stores, FIFO notifiers, Kanban registries, or
+future shared databases. High-volume workflow/event ingestion still needs explicit
+store/adapter concurrency design.
 
 ---
 
@@ -1351,9 +1384,19 @@ Near-term and future work, roughly in priority order:
    general resume from a *partial* run (arbitrary mid-step interruption) and dedup
    of durable side effects (e.g. no-duplicate Kanban task creation) on rerun.
 
-4. **Durable & Kanban stores.** Provide at least one durable `RunStore`
-   implementation and a concrete `KanbanRunStore` against a real board, validating
-   the board/columns/cards mapping in §4.
+4. **Host adapter hardening and shared stores.** The core seams now exist; the next
+   production work is adapter glue, not more hidden runtime authority:
+   - ATH event sink/source-binding adapters for compact `workflow.started`,
+     `phase.finished`, `approval.required`, `resource.cleanup.failed`, and
+     `workflow.finished` notifications;
+   - a Kanban terminal-event producer that calls `publish_hermes_kanban_event`
+     from trusted worker/gateway events instead of a poll loop;
+   - a resume trigger that replays suspended script runs when a matching durable
+     task/event arrives;
+   - concrete finalizer handlers such as `ath.listener.retire`, process/session
+     cleanup, and workspace cleanup behind the action registry;
+   - a shared store/notifier adapter (`LISTEN/NOTIFY`, broker topic, or similar)
+     for multi-host event waits once the local JSONL/FIFO path is too small.
 
 5. **Richer schema & references.** Nested/typed `output_schema`, conditional
    steps, map-over-collection fan-out, and additional `$ref` forms — each gated
@@ -1374,4 +1417,5 @@ Near-term and future work, roughly in priority order:
 
 8. **Observability.** Structured event emission per step transition, metrics
    (durations, fan-out width, failure rates), and trace correlation by `run_id` /
-   `def_hash`.
+   `def_hash`. Observability must emit compact typed facts; raw transcripts,
+   secrets, and backend-specific task payloads stay behind adapter-owned stores.
