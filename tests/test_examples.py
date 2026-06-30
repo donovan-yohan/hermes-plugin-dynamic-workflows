@@ -7,6 +7,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from hermes_workflows import run_workflow_script
+
 
 def _load_release_ops_example():
     root = Path(__file__).resolve().parents[1]
@@ -18,6 +20,20 @@ def _load_release_ops_example():
     sys.modules["release_ops_resource_closeout"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _extract_python_block_after(path: Path, marker: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    marker_pos = text.index(marker)
+    block_start = text.index("```python", marker_pos) + len("```python")
+    block_end = text.index("```", block_start)
+    return text[block_start:block_end].strip() + "\n"
+
+
+def _bughunter_agent_runner(agent_id, input):
+    if agent_id == "hermes.bughunter":
+        return {"bugs": [], "followups": []}
+    return {"echo": dict(input)}
 
 
 class ExamplesTests(unittest.TestCase):
@@ -46,6 +62,21 @@ class ExamplesTests(unittest.TestCase):
         dumped = str(status.as_dict())
         self.assertNotIn("hermes_workflows", dumped)
         self.assertNotIn("secret", dumped.lower())
+
+    def test_loop_until_dry_docs_examples_run_without_args(self):
+        root = Path(__file__).resolve().parents[1]
+        cases = [
+            (root / "README.md", "Side-by-side translation"),
+            (root / "DESIGN.md", "Side-by-side translation"),
+        ]
+
+        for path, marker in cases:
+            with self.subTest(path=path.name):
+                source = _extract_python_block_after(path, marker)
+                result = run_workflow_script(source, agent_runner=_bughunter_agent_runner)
+
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.value, {"remaining_areas": [], "rounds": 1})
 
 
 if __name__ == "__main__":

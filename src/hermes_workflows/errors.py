@@ -26,6 +26,7 @@ __all__ = [
     "GrantError",
     "GrantDenied",
     "ControlError",
+    "ControlDispatchDenied",
     # Diagnostic codes.
     "E_PARSE",
     "E_SCHEMA_TOPLEVEL",
@@ -93,6 +94,7 @@ E_SCRIPT_TOO_LARGE = "E_SCRIPT_TOO_LARGE"  # source/AST exceeds the size bound.
 E_SCRIPT_META_POSITION = "E_SCRIPT_META_POSITION"  # 'meta' is not the first statement.
 E_SCRIPT_META_SHAPE = "E_SCRIPT_META_SHAPE"  # 'meta' is not a pure literal dict.
 E_SCRIPT_META_FIELDS = "E_SCRIPT_META_FIELDS"  # 'meta' lacks name/description.
+E_SCRIPT_META_PHASES = "E_SCRIPT_META_PHASES"  # 'meta.phases' has an invalid shape.
 E_SCRIPT_IMPORT = "E_SCRIPT_IMPORT"  # import / from-import is forbidden.
 E_SCRIPT_CLASSDEF = "E_SCRIPT_CLASSDEF"  # class definitions are forbidden.
 E_SCRIPT_SCOPE = "E_SCRIPT_SCOPE"  # global / nonlocal is forbidden.
@@ -259,3 +261,18 @@ class ControlError(WorkflowError):
     is for shape problems at record/mint time, surfaced rather than silently
     accepted.
     """
+
+
+class ControlDispatchDenied(WorkflowError):
+    """Raised when runtime dispatch is denied by a workflow_control decision.
+
+    The control module records and projects operator intent; this exception is
+    the runtime-side enforcement signal raised at the actual child-work boundary.
+    It carries the original decision so callers can persist a compact, auditable
+    status without exposing child inputs.
+    """
+
+    def __init__(self, decision) -> None:
+        self.decision = decision
+        self.code = getattr(decision, "code", "control_denied")
+        super().__init__(getattr(decision, "reason", "workflow control denied dispatch"))

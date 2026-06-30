@@ -227,6 +227,15 @@ class _Connection:
                 fut.set_exception(exc)
 
 
+def _looks_like_legacy_agent_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and (value.startswith("hermes.") or value.startswith("kanban."))
+        and len(value.split(".", 1)[1]) > 0
+        and not any(ch.isspace() for ch in value)
+    )
+
+
 def _build_script_globals(
     conn: _Connection,
     args: Any,
@@ -249,11 +258,27 @@ def _build_script_globals(
             params["_parallel_index"] = index
         return params
 
-    async def agent(agent_id: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
-                     schema: Optional[dict[str, Any]] = None) -> Any:
+    async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
+                     phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
+                     model: Optional[str] = None, effort: Optional[str] = None,
+                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None) -> Any:
+        explicit_opts = {
+            "label": label, "phase": phase, "schema": schema, "model": model,
+            "effort": effort, "isolation": isolation, "context": context,
+        }
+        legacy_agent_id = _looks_like_legacy_agent_id(target)
+        opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
+        if opts_from_pos is not None or not legacy_agent_id:
+            params: dict[str, Any] = {"prompt": target}
+            if opts_from_pos is not None:
+                params.update(opts_from_pos)
+            elif input is not None:
+                params["_invalid_opts_type"] = type(input).__name__
+            params.update({key: value for key, value in explicit_opts.items() if value is not None})
+            return await conn.acall("agent", _annotate_parallel(params))
         return await conn.acall(
             "agent",
-            _annotate_parallel({"agent_id": agent_id, "input": input or {}, "label": label, "schema": schema}),
+            _annotate_parallel({"agent_id": target, "input": input or {}, "label": label, "schema": schema}),
         )
 
     async def kanban_agent(profile: str, task: Any = None, input: Optional[dict[str, Any]] = None, *,
