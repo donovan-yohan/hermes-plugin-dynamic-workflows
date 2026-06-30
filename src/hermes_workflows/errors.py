@@ -26,6 +26,7 @@ __all__ = [
     "GrantError",
     "GrantDenied",
     "ControlError",
+    "ControlDispatchDenied",
     # Diagnostic codes.
     "E_PARSE",
     "E_SCHEMA_TOPLEVEL",
@@ -260,3 +261,18 @@ class ControlError(WorkflowError):
     is for shape problems at record/mint time, surfaced rather than silently
     accepted.
     """
+
+
+class ControlDispatchDenied(WorkflowError):
+    """Raised when runtime dispatch is denied by a workflow_control decision.
+
+    The control module records and projects operator intent; this exception is
+    the runtime-side enforcement signal raised at the actual child-work boundary.
+    It carries the original decision so callers can persist a compact, auditable
+    status without exposing child inputs.
+    """
+
+    def __init__(self, decision) -> None:
+        self.decision = decision
+        self.code = getattr(decision, "code", "control_denied")
+        super().__init__(getattr(decision, "reason", "workflow control denied dispatch"))

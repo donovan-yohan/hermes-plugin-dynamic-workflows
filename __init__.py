@@ -415,8 +415,9 @@ WORKFLOW_CONTROL_SCHEMA = {
         "the run continue) an adapter would consult; pause/resume/stop/task_stop/"
         "retry record an append-only control intent (the audit trail is never "
         "deleted). Retry is idempotent per target_ref with explicit replacement "
-        "lineage. This surface records and decides intent; it does not itself kill "
-        "processes or replay tasks — a backend adapter enforces the decisions."
+        "lineage. The workflow runtime and script broker enforce these decisions "
+        "at child dispatch boundaries; backend adapters still own any external "
+        "process kill/replay mechanics."
     ),
     "parameters": {
         "type": "object",
@@ -865,6 +866,7 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),
             session_id=session_id,
+            control_store=_plugin_control_store(session_id=session_id),
         )
         if params.get("include_journal") and params.get("run_id"):
             result["journal"] = store.journal(params["run_id"], limit=params.get("journal_limit", 100))
@@ -889,6 +891,7 @@ def _handle_run(params: dict[str, Any], **kwargs: Any) -> str:
             max_parallel=params.get("max_parallel", 8),
             run_id=params.get("run_id"),
             session_id=session_id,
+            control_store=_plugin_control_store(session_id=session_id),
         )
         return _ok(handle)
     except WorkflowError as exc:

@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from .agents import AgentRunner, ChildAgentRunner
 from .capabilities import CapabilityPolicy, CapabilityRegistry
+from .controls import ControlStore
 from .errors import ScriptValidationError
 from .registry import utc_now_iso
 from .script_store import ScriptRunStore, canonical_hash, script_run_id, script_sha256
@@ -426,6 +427,7 @@ class BackgroundWorkflowRunManager:
         kanban_backend: Any = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
+        control_store: Optional[ControlStore] = None,
     ) -> BackgroundRunRecord:
         if validate:
             validation = validate_script(script)
@@ -455,6 +457,7 @@ class BackgroundWorkflowRunManager:
                 "kanban_backend": kanban_backend,
                 "capability_registry": capability_registry,
                 "capability_policy": capability_policy,
+                "control_store": control_store,
             },
         )
         with self._threads_lock:
@@ -500,6 +503,7 @@ class BackgroundWorkflowRunManager:
                 kanban_backend=kwargs["kanban_backend"],
                 capability_registry=kwargs["capability_registry"],
                 capability_policy=kwargs["capability_policy"],
+                control_store=kwargs["control_store"],
             )
             self.store.finish(run_id, result)
         except BaseException as exc:  # defensive boundary: never let a worker vanish silently.

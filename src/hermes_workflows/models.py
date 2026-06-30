@@ -31,7 +31,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 Severity = Literal["error", "warning"]
-RunState = Literal["queued", "running", "succeeded", "failed", "cancelled", "unknown"]
+RunState = Literal["queued", "running", "paused", "suspended", "stopped", "succeeded", "failed", "cancelled", "unknown"]
 StepKind = Literal["agent", "kanban_agent", "parallel", "pipeline", "phase", "if"]
 
 

@@ -11,9 +11,10 @@ Stdlib only.
 from hermes_workflows.primitives import workflow_run, workflow_status
 from hermes_workflows.registry import InMemoryRunStore
 from hermes_workflows.errors import WorkflowValidationError
+from hermes_workflows.controls import InMemoryControlStore, pause_run, stop_run, stop_task
 
 
-TERMINAL = {"succeeded", "failed", "cancelled"}
+TERMINAL = {"succeeded", "failed", "cancelled", "stopped"}
 
 
 def hello_definition() -> dict:
@@ -233,6 +234,93 @@ def test_default_registry_is_process_global_when_omitted():
     status = workflow_status(handle.run_id)
     assert status.run_id == handle.run_id
     assert status.status in TERMINAL
+
+
+# --------------------------------------------------------------------------- #
+# workflow_control enforcement (#67)
+# --------------------------------------------------------------------------- #
+
+class ControlRecordingRunner:
+    def __init__(self, control_store=None, run_id=None, stop_after_first=False):
+        self.calls = []
+        self.control_store = control_store
+        self.run_id = run_id
+        self.stop_after_first = stop_after_first
+
+    def __call__(self, agent_id, input):
+        self.calls.append((agent_id, input))
+        if self.stop_after_first and len(self.calls) == 1:
+            stop_run(self.control_store, self.run_id, reason="operator stop")
+        if agent_id == "hermes.greeter":
+            return {"greeting": "hello, world"}
+        if agent_id == "hermes.uppercaser":
+            return {"result": "HELLO, WORLD"}
+        return {"echo": dict(input)}
+
+
+def test_control_pause_before_fanout_blocks_new_child_work():
+    store = InMemoryRunStore()
+    controls = InMemoryControlStore()
+    pause_run(controls, "wf_pause", reason="hold before fan-out")
+    runner = ControlRecordingRunner()
+
+    handle = workflow_run(
+        hello_definition(),
+        inputs={"name": "world"},
+        registry=store,
+        agent_runner=runner,
+        run_id="wf_pause",
+        control_store=controls,
+    )
+    status = workflow_status("wf_pause", registry=store)
+
+    assert handle.status == "paused"
+    assert status.status == "paused"
+    assert status.error["code"] == "run_paused"
+    assert runner.calls == []
+
+
+def test_control_stop_mid_run_exits_with_stopped_status():
+    store = InMemoryRunStore()
+    controls = InMemoryControlStore()
+    runner = ControlRecordingRunner(controls, "wf_stop_mid", stop_after_first=True)
+
+    handle = workflow_run(
+        hello_definition(),
+        inputs={"name": "world"},
+        registry=store,
+        agent_runner=runner,
+        run_id="wf_stop_mid",
+        control_store=controls,
+    )
+    status = workflow_status("wf_stop_mid", registry=store)
+
+    assert handle.status == "stopped"
+    assert status.status == "stopped"
+    assert status.error["code"] == "run_stopped"
+    assert [agent for agent, _ in runner.calls] == ["hermes.greeter"]
+    assert {step.step_id: step.status for step in status.steps}["greet"] == "succeeded"
+
+
+def test_control_task_stop_blocks_only_matching_child_ref():
+    store = InMemoryRunStore()
+    controls = InMemoryControlStore()
+    stop_task(controls, "wf_task_stop", "shout", reason="skip this child")
+    runner = ControlRecordingRunner()
+
+    handle = workflow_run(
+        hello_definition(),
+        inputs={"name": "world"},
+        registry=store,
+        agent_runner=runner,
+        run_id="wf_task_stop",
+        control_store=controls,
+    )
+    status = workflow_status("wf_task_stop", registry=store)
+
+    assert handle.status == "failed"
+    assert status.error["code"] == "task_stopped"
+    assert [agent for agent, _ in runner.calls] == ["hermes.greeter"]
 
 
 # --------------------------------------------------------------------------- #
