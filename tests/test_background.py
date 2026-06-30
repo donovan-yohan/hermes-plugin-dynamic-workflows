@@ -10,8 +10,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
+import hermes_workflows.background as background_module
 from hermes_workflows.background import BackgroundRunStore, BackgroundWorkflowRunManager
 from hermes_workflows.script_store import ScriptRunStore
+from hermes_workflows.vm import ScriptRunResult
 
 SCRIPT = (
     'meta = {"name": "background-demo", "description": "d"}\n'
@@ -114,6 +116,63 @@ def test_background_stop_wins_over_late_worker_completion():
         final = background_store.get(record.run_id)
         assert final.status == "stopped"
         assert final.error["type"] == "BackgroundRunStopped"
+
+
+def test_background_finish_does_not_resurrect_stopped_run_when_stop_races_after_read(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BackgroundRunStore(Path(tmp) / "background-runs")
+        store.begin("wfs_finish_race", script=SCRIPT, args={"value": "late"})
+        original_get = store.get
+        injected_stop = False
+
+        def racing_get(run_id: str):
+            nonlocal injected_stop
+            record = original_get(run_id)
+            if not injected_stop:
+                injected_stop = True
+                store.stop(run_id, reason="operator cancelled during finish race")
+            return record
+
+        monkeypatch.setattr(store, "get", racing_get)
+
+        returned = store.finish("wfs_finish_race", ScriptRunResult(ok=True, value={"answer": "late"}))
+
+        final = original_get("wfs_finish_race")
+        assert returned.status == "stopped"
+        assert final.status == "stopped"
+        assert final.result is None
+        assert final.error == {
+            "type": "BackgroundRunStopped",
+            "message": "operator cancelled during finish race",
+        }
+
+
+def test_background_launch_thread_start_failure_cleans_thread_registry_and_marks_failed(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        background_store = BackgroundRunStore(Path(tmp) / "background-runs")
+        script_store = ScriptRunStore(Path(tmp) / "script-runs")
+        manager = BackgroundWorkflowRunManager(background_store, script_store)
+        run_id = "wfs_start_failure"
+
+        def fail_start(self):  # noqa: ANN001
+            raise RuntimeError("qa injected thread start failure")
+
+        monkeypatch.setattr(background_module.threading.Thread, "start", fail_start)
+        with manager._threads_lock:
+            manager._threads.pop(run_id, None)
+
+        try:
+            manager.launch_script(SCRIPT, args={"value": "never"}, run_id=run_id, agent_runner=_SlowRunner())
+        except RuntimeError as exc:
+            assert str(exc) == "qa injected thread start failure"
+        else:  # pragma: no cover - defensive assertion clarity
+            raise AssertionError("thread.start failure did not propagate")
+
+        with manager._threads_lock:
+            assert run_id not in manager._threads
+        stored = background_store.get(run_id)
+        assert stored.status == "failed"
+        assert stored.error == {"type": "RuntimeError", "message": "qa injected thread start failure"}
 
 
 class _FakeContext:
