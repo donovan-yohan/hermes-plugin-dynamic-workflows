@@ -261,6 +261,18 @@ def test_legacy_agent_id_input_compatibility_is_preserved():
     assert res.value == {"greeting": "hello, compat"}
 
 
+def test_legacy_agent_id_option_key_payloads_stay_legacy_input_data():
+    for payload in (
+        {"label": "as data"},
+        {"phase": "as data"},
+        {"schema": {"x": "y"}},
+        {"context": {"x": 1}},
+    ):
+        res = run_workflow_script(META + f"return await agent(\"hermes.echo\", {payload!r})\n")
+        assert res.ok, res.error
+        assert res.value["echo"] == payload
+
+
 def test_prompt_agent_with_dotted_prompt_is_not_misrouted_as_legacy_agent_id():
     runner = FakeChildRunner({"answer": "dotted prompt"})
     res = run_workflow_script(META + 'return await agent("summarize.")\n', child_agent_runner=runner)
