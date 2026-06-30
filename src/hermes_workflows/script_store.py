@@ -61,6 +61,7 @@ __all__ = [
     "SCRIPT_SCHEMA_VERSION",
     "ScriptRunMeta",
     "ReplayEntry",
+    "PromptReplayEntry",
     "ReplayCache",
     "CallRecorder",
     "ScriptRunStore",
@@ -253,6 +254,16 @@ class ReplayEntry:
     value: Any
 
 
+@dataclass(frozen=True)
+class PromptReplayEntry:
+    """One completed prompt-agent result, addressed by its semantic fingerprint."""
+
+    fingerprint: str
+    method: str
+    args_hash: str
+    value: Any
+
+
 class ReplayCache:
     """Immutable, in-memory view of a run's ``cache.jsonl`` for replay.
 
@@ -263,8 +274,15 @@ class ReplayCache:
     re-runs live).
     """
 
-    def __init__(self, entries: dict[int, ReplayEntry], *, source_run_id: str) -> None:
+    def __init__(
+        self,
+        entries: dict[int, ReplayEntry],
+        *,
+        source_run_id: str,
+        prompt_entries: Optional[dict[str, PromptReplayEntry]] = None,
+    ) -> None:
         self._entries = entries
+        self._prompt_entries = prompt_entries or {}
         self.source_run_id = source_run_id
 
     def get(self, call_id: Any) -> Optional[ReplayEntry]:
@@ -274,8 +292,14 @@ class ReplayCache:
             return None
         return self._entries.get(call_id)
 
+    def get_prompt(self, fingerprint: Any) -> Optional[PromptReplayEntry]:
+        """Return a prompt-agent cache entry by ``v2:<hash>`` fingerprint."""
+        if not isinstance(fingerprint, str):
+            return None
+        return self._prompt_entries.get(fingerprint)
+
     def __len__(self) -> int:
-        return len(self._entries)
+        return len(self._entries) + len(self._prompt_entries)
 
 
 class CallRecorder:
@@ -295,6 +319,20 @@ class CallRecorder:
     def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
         line = json.dumps(
             {"call_id": call_id, "method": method, "args_hash": args_hash, "value": value},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def record_prompt(self, fingerprint: str, method: str, args_hash: str, value: Any) -> None:
+        """Append one prompt-agent fingerprint cache entry."""
+        line = json.dumps(
+            {"fingerprint": fingerprint, "method": method, "args_hash": args_hash, "value": value},
             ensure_ascii=False,
             separators=(",", ":"),
             default=str,
@@ -390,16 +428,23 @@ class ScriptRunStore:
         vocabulary is ``boot`` / ``call`` / ``done`` (a separate ``return`` line
         would carry no extra information). Raw ``params`` are never written.
         """
+        event_type = event.get("type")
         data = {
             "call_id": event.get("call_id"),
             "method": event.get("method"),
             "ok": event.get("ok"),
         }
-        for key in ("agent_id", "profile", "label", "phase", "phase_title", "error", "replayed"):
+        for key in (
+            "agent_id", "profile", "capability", "label", "phase", "phase_title", "fingerprint",
+            "error", "replayed", "cache", "has_value",
+        ):
             if event.get(key) is not None:
                 data[key] = event.get(key)
         with self._lock:
-            self._append_journal(run_id, "call", data)
+            if event_type in ("agent_started", "agent_result", "agent_cache_hit"):
+                self._append_journal(run_id, event_type, data)
+            else:
+                self._append_journal(run_id, "call", data)
 
     def recorder(self, run_id: str) -> CallRecorder:
         """Return the append-only replay-cache writer for ``run_id``."""
@@ -473,8 +518,9 @@ class ScriptRunStore:
             raise ScriptRunNotFound(run_id)
         path = self._cache_path(run_id)
         entries: dict[int, ReplayEntry] = {}
+        prompt_entries: dict[str, PromptReplayEntry] = {}
         if not path.exists():
-            return ReplayCache(entries, source_run_id=run_id)
+            return ReplayCache(entries, source_run_id=run_id, prompt_entries=prompt_entries)
         with path.open("r", encoding="utf-8") as f:
             for lineno, raw in enumerate(f, start=1):
                 raw = raw.strip()
@@ -486,17 +532,9 @@ class ScriptRunStore:
                     raise CorruptScriptRunError(
                         run_id, "corrupt_cache", f"cache.jsonl line {lineno}: {exc.msg}"
                     ) from exc
-                call_id_raw = obj.get("call_id") if isinstance(obj, dict) else None
-                # ``isinstance(True, int)`` is True, so exclude bools explicitly:
-                # a forged ``call_id: true`` must not be accepted as call id 1.
-                if not isinstance(obj, dict) or not isinstance(call_id_raw, int) or isinstance(call_id_raw, bool):
+                if not isinstance(obj, dict):
                     raise CorruptScriptRunError(
                         run_id, "corrupt_cache", f"cache.jsonl line {lineno}: bad entry shape"
-                    )
-                call_id = obj["call_id"]
-                if call_id in entries:
-                    raise CorruptScriptRunError(
-                        run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
                     )
                 method = obj.get("method")
                 args_hash = obj.get("args_hash")
@@ -509,13 +547,42 @@ class ScriptRunStore:
                         "corrupt_cache",
                         f"cache.jsonl line {lineno}: method/args_hash must be strings",
                     )
-                entries[call_id] = ReplayEntry(
-                    call_id=call_id,
+                if "call_id" in obj:
+                    call_id_raw = obj.get("call_id")
+                    # ``isinstance(True, int)`` is True, so exclude bools explicitly:
+                    # a forged ``call_id: true`` must not be accepted as call id 1.
+                    if not isinstance(call_id_raw, int) or isinstance(call_id_raw, bool):
+                        raise CorruptScriptRunError(
+                            run_id, "corrupt_cache", f"cache.jsonl line {lineno}: bad entry shape"
+                        )
+                    call_id = obj["call_id"]
+                    if call_id in entries:
+                        raise CorruptScriptRunError(
+                            run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
+                        )
+                    entries[call_id] = ReplayEntry(
+                        call_id=call_id,
+                        method=method,
+                        args_hash=args_hash,
+                        value=obj.get("value"),
+                    )
+                    continue
+                fingerprint = obj.get("fingerprint")
+                if not isinstance(fingerprint, str) or not fingerprint.startswith("v2:"):
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"cache.jsonl line {lineno}: bad entry shape"
+                    )
+                if fingerprint in prompt_entries:
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"duplicate cached prompt fingerprint {fingerprint}"
+                    )
+                prompt_entries[fingerprint] = PromptReplayEntry(
+                    fingerprint=fingerprint,
                     method=method,
                     args_hash=args_hash,
                     value=obj.get("value"),
                 )
-        return ReplayCache(entries, source_run_id=run_id)
+        return ReplayCache(entries, source_run_id=run_id, prompt_entries=prompt_entries)
 
     def journal(self, run_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         """Return the most recent metadata-only journal events for ``run_id``."""
