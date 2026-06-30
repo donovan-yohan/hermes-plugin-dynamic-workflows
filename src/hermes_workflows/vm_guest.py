@@ -175,8 +175,6 @@ def _looks_like_legacy_agent_id(value: Any) -> bool:
         and len(value.split(".", 1)[1]) > 0
         and not any(ch.isspace() for ch in value)
     )
-
-
 def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
     """Construct the restricted global namespace the script executes within."""
 
