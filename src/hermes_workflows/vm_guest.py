@@ -258,6 +258,7 @@ def _build_script_globals(
             params["_parallel_index"] = index
         return params
 
+
     async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                      phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
                      model: Optional[str] = None, effort: Optional[str] = None,
