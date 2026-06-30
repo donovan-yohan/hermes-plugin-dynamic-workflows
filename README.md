@@ -160,6 +160,11 @@ The plugin registers tools in the `dynamic_workflows` toolset:
 | `workflow` | Model-facing facade for validate/run/status/catalog/script operations. |
 | `workflow_control` | Operator surface for overview/status/pause/resume/stop/task_stop/retry. |
 
+The shipped script facade accepts inline `script`, catalog `scriptPath`, saved script `name`,
+runtime `args`, and `resumeFromRunId` for replay/resume flows; the lower-level Python
+library names (`script_source`, `script_name`, `script_args`, `replay_from`) are implementation
+details behind that model-facing compatibility shape.
+
 If Hermes does not show `workflow` after restart, check:
 
 1. the symlink points at this repo root, not `src/`
@@ -242,6 +247,100 @@ workflow(action="run_script", script_name="issue_lane", script_args={"issue": 12
 ```
 
 See [examples/README.md](examples/README.md) for runnable script VM, scoped grant, and finalizer examples.
+
+### Python-vs-JS workflow script compatibility boundary
+
+Dynamic Workflows aims for parity with Claude-style workflow scripts at the **orchestration
+primitive** level, not by executing the same source syntax today. Archive examples such as
+`loop-until-dry-bughunt.js` use JavaScript (`export const meta`, async functions, and
+`agent(prompt, { label, phase, schema })`). This plugin currently ships a guarded **Python**
+workflow-script VM with the same product contract expressed through Python syntax and
+parent-owned RPC calls.
+
+Intended parity:
+
+| Claude archive shape | Current Hermes Python harness |
+| --- | --- |
+| `export const meta = ...` | First statement must be literal `meta = {...}` with `name` and `description`; optional metadata such as `phases` is preserved. |
+| `agent(...)` | `await agent(agent_id, input, label=..., schema=...)`; the host owns the real agent runner. |
+| `parallel(...)` / `pipeline(...)` / `phase(...)` | `await parallel([...])`, `await pipeline(...)`, and `phase("title")` with deterministic, brokered execution. |
+| `log(...)`, script inputs, and budget checks | `log(...)`, read-only `args`, and read-only `budget.remaining()` / `budget.spent()`. |
+| Journal/cache/resume semantics | Stable call ids, metadata-only journals, deterministic replay cache, and durable Kanban reattach/resume where supported. |
+| Facade entrypoints | Inline `script`, catalog `scriptPath`, saved `name`, `args`, and `resumeFromRunId`; declared `meta.phases` appear in script run status. |
+
+Intentional differences in `0.1.0`:
+
+- JavaScript syntax is **future work** unless a separate JS guest runtime is added.
+- Python scripts cannot use `import` / `from ... import`, direct filesystem access, direct network access,
+  environment reads, process execution, clock/time APIs, randomness, `print`, or dynamic builtins such as
+  `eval`, `exec`, `open`, `__import__`, `globals`, or `getattr`.
+- Every outside effect must go through `agent`, `kanban_agent`, `capability`, `workflow`, `phase`, or `log`,
+  where the parent process applies capability policy, redaction, output limits, replay/idempotency, and approvals.
+- The subprocess environment is scrubbed; scripts receive only restricted builtins, safe `json` / `math` proxies,
+  `args`, `budget`, `meta`, and the RPC-backed workflow globals.
+
+Side-by-side translation of the archive's loop-until-dry shape:
+
+```js
+// Claude archive style — illustrative, not executed by this plugin today.
+export const meta = { name: "loop-until-dry-bughunt" };
+
+let round = 0;
+let areas = ["runtime", "docs", "tests"];
+
+while (areas.length && budget.remaining() > 0 && round < 4) {
+  phase(`round ${round + 1}`);
+  const results = await parallel(areas.map((area) =>
+    agent(`Find remaining bugs in ${area}`, {
+      label: `bughunt:${area}`,
+      phase: "bughunt",
+      schema: { bugs: "array", followups: "array" }
+    })
+  ));
+
+  areas = results.flatMap((result) => result.followups ?? []);
+  log(`round ${round + 1}: ${areas.length} follow-up areas`);
+  round += 1;
+}
+```
+
+```python
+# Current Hermes harness shape — validated, then run in the guarded Python VM.
+meta = {
+    "name": "loop_until_dry_bughunt",
+    "description": "Repeat bughunt passes until no follow-up areas remain",
+    "phases": ["bughunt"],
+}
+
+round_index = 0
+areas = list(args.get("areas", ["runtime", "docs", "tests"]))
+max_rounds = args.get("max_rounds", 4)
+
+
+async def scan(area):
+    return await agent(
+        "hermes.bughunter",
+        {"prompt": f"Find remaining bugs in {area}", "area": area},
+        label=f"bughunt:{area}",
+        schema={"bugs": "list", "followups": "list"},
+    )
+
+
+while areas and budget.remaining() > 0 and round_index < max_rounds:
+    phase(f"round {round_index + 1}")
+    results = await parallel([lambda area=area: scan(area) for area in areas])
+
+    next_areas = []
+    for result in results:
+        for followup in result.get("followups", []):
+            if followup not in next_areas:
+                next_areas.append(followup)
+    areas = next_areas
+    log(f"round {round_index + 1}: {len(areas)} follow-up areas")
+    round_index = round_index + 1
+
+return {"remaining_areas": areas, "rounds": round_index}
+```
 
 ## Event-driven workflows, not timer-owned phase control
 
