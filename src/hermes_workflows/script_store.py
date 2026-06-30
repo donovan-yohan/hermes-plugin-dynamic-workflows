@@ -64,6 +64,7 @@ __all__ = [
     "PromptReplayEntry",
     "ReplayCache",
     "CallRecorder",
+    "TranscriptRecorder",
     "ScriptRunStore",
     "canonical_hash",
     "script_sha256",
@@ -216,6 +217,7 @@ class ScriptRunMeta:
     error: Optional[dict[str, Any]] = None
     deterministic_runner: bool = False
     replay_of: Optional[str] = None
+    transcripts: Optional[dict[str, Any]] = None
     schema_version: int = SCRIPT_SCHEMA_VERSION
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
@@ -234,6 +236,7 @@ class ScriptRunMeta:
             "error": self.error,
             "deterministic_runner": self.deterministic_runner,
             "replay_of": self.replay_of,
+            "transcripts": self.transcripts,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -344,6 +347,231 @@ class CallRecorder:
                 os.fsync(f.fileno())
 
 
+def _agent_ref(call_id: Any) -> str:
+    """Stable, single-segment artifact stem for one brokered subagent call."""
+    if isinstance(call_id, int) and not isinstance(call_id, bool) and call_id >= 0:
+        return f"agent-{call_id:06d}"
+    digest = hashlib.sha256(str(call_id).encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"agent-{digest}"
+
+
+def _safe_text(value: Any, *, max_len: int = 128) -> Optional[str]:
+    """Small metadata-safe string coercion; never used for prompts or inputs."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.replace("\x00", "").strip()
+    if not value:
+        return None
+    return value[:max_len]
+
+
+def _safe_non_negative_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _spawn_depth(params: dict[str, Any]) -> int:
+    context = params.get("context") if isinstance(params.get("context"), dict) else {}
+    value = context.get("spawn_depth") if isinstance(context, dict) else None
+    depth = _safe_non_negative_int(value)
+    return depth if depth is not None else 1
+
+
+def _agent_type(method: str, params: dict[str, Any]) -> str:
+    if method == "agent" and "prompt" in params:
+        return "prompt_agent"
+    if method == "kanban_agent":
+        return "kanban_agent"
+    return "agent"
+
+
+def _result_keys(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(k) for k in value.keys())
+
+
+def _usage_counts(value: Any) -> tuple[Optional[int], Optional[int]]:
+    if not isinstance(value, dict):
+        return None, None
+    token_count = _safe_non_negative_int(value.get("_tokens"))
+    tool_count = _safe_non_negative_int(value.get("_tool_calls"))
+    if tool_count is None:
+        tool_count = _safe_non_negative_int(value.get("_tool_count"))
+    return token_count, tool_count
+
+
+class TranscriptRecorder:
+    """Append-only writer for per-subagent transcript artifacts (issue #76)."""
+
+    def __init__(self, run_dir: Path, lock: threading.Lock) -> None:
+        self._dir = run_dir / "transcripts"
+        self._lock = lock
+
+    def refs(self) -> dict[str, Any]:
+        agents: list[dict[str, Any]] = []
+        if self._dir.exists():
+            for path in sorted(self._dir.glob("agent-*.meta.json")):
+                try:
+                    meta = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(meta, dict):
+                    continue
+                agent_ref = str(meta.get("id") or path.name[:-10])
+                ref: dict[str, Any] = {
+                    "id": agent_ref,
+                    "transcript_path": str(self._dir / f"{agent_ref}.jsonl"),
+                    "meta_path": str(path),
+                    "state": str(meta.get("state") or "unknown"),
+                }
+                for key in ("label", "phase"):
+                    if meta.get(key) is not None:
+                        ref[key] = meta[key]
+                agents.append(ref)
+        return {"dir": str(self._dir), "journal_path": str(self._dir / "journal.jsonl"), "agents": agents}
+
+    def started(self, call_id: Any, method: str, params: dict[str, Any], *, started_at: str) -> str:
+        agent_ref = _agent_ref(call_id)
+        base = self._base_meta(agent_ref, call_id, method, params)
+        meta = {**base, "state": "running", "started_at": started_at, "completed_at": None, "duration_ms": None}
+        event = {**base, "event": "started", "state": "running", "started_at": started_at}
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._append_locked(self._journal_path(), event)
+            self._append_locked(self._agent_path(agent_ref), event)
+            self._write_meta_locked(agent_ref, meta)
+        return agent_ref
+
+    def result(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        value: Any,
+        state: str = "succeeded",
+        event_name: str = "result",
+    ) -> str:
+        agent_ref = _agent_ref(call_id)
+        token_count, tool_count = _usage_counts(value)
+        base = self._base_meta(agent_ref, call_id, method, params)
+        update = {
+            "state": state,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_ms": max(0, int(duration_ms)),
+            "token_count": token_count,
+            "tool_count": tool_count,
+        }
+        meta = {**base, **update}
+        event = {**base, "event": event_name, **update, "result_keys": _result_keys(value)}
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._append_locked(self._journal_path(), event)
+            self._append_locked(self._agent_path(agent_ref), event)
+            self._write_meta_locked(agent_ref, meta)
+        return agent_ref
+
+    def error(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        error_code: Optional[str],
+    ) -> str:
+        agent_ref = _agent_ref(call_id)
+        base = self._base_meta(agent_ref, call_id, method, params)
+        update = {
+            "state": "failed",
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_ms": max(0, int(duration_ms)),
+            "error_code": _safe_text(error_code),
+        }
+        meta = {**base, **update, "token_count": None, "tool_count": None}
+        event = {**base, "event": "error", **update}
+        with self._lock:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            self._append_locked(self._journal_path(), event)
+            self._append_locked(self._agent_path(agent_ref), event)
+            self._write_meta_locked(agent_ref, meta)
+        return agent_ref
+
+    def cache_hit(self, call_id: Any, method: str, params: dict[str, Any], *, at: str, value: Any) -> str:
+        return self.result(
+            call_id,
+            method,
+            params,
+            started_at=at,
+            completed_at=at,
+            duration_ms=0,
+            value=value,
+            state="cache_hit",
+            event_name="cache-hit",
+        )
+
+    def _base_meta(self, agent_ref: str, call_id: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "id": agent_ref,
+            "agent_ref": agent_ref,
+            "call_id": call_id if isinstance(call_id, int) and not isinstance(call_id, bool) else None,
+            "method": method,
+            "agent_type": _agent_type(method, params),
+            "spawn_depth": _spawn_depth(params),
+            "transcript_path": str(self._agent_path(agent_ref)),
+            "meta_path": str(self._meta_path(agent_ref)),
+        }
+        for key in ("label", "phase", "model"):
+            text = _safe_text(params.get(key))
+            if text is not None:
+                base[key] = text
+        if method == "agent" and "prompt" not in params:
+            agent_id = _safe_text(params.get("agent_id"))
+            if agent_id is not None:
+                base["agent_id"] = agent_id
+        if method == "kanban_agent":
+            profile = _safe_text(params.get("profile"))
+            if profile is not None:
+                base["profile"] = profile
+        return base
+
+    def _append_locked(self, path: Path, event: dict[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _write_meta_locked(self, agent_ref: str, meta: dict[str, Any]) -> None:
+        payload = json.dumps(meta, ensure_ascii=False, indent=2, default=str) + "\n"
+        tmp = self._dir / f"{agent_ref}.meta.json.tmp"
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._meta_path(agent_ref))
+        _fsync_dir(self._dir)
+
+    def _journal_path(self) -> Path:
+        return self._dir / "journal.jsonl"
+
+    def _agent_path(self, agent_ref: str) -> Path:
+        return self._dir / f"{agent_ref}.jsonl"
+
+    def _meta_path(self, agent_ref: str) -> Path:
+        return self._dir / f"{agent_ref}.meta.json"
+
+
 class ScriptRunStore:
     """Filesystem-backed durable store for subprocess workflow-script runs.
 
@@ -452,6 +680,11 @@ class ScriptRunStore:
         _require_safe_run_id(run_id)
         return CallRecorder(self._cache_path(run_id), self._lock)
 
+    def transcript_recorder(self, run_id: str) -> TranscriptRecorder:
+        """Return the per-subagent transcript artifact writer for ``run_id``."""
+        _require_safe_run_id(run_id)
+        return TranscriptRecorder(self._run_dir(run_id), self._lock)
+
     def finish(
         self,
         run_id: str,
@@ -483,6 +716,8 @@ class ScriptRunStore:
             record.meta = meta
             record.value = value
             record.error = error
+            refs = self.transcript_refs(run_id)
+            record.transcripts = refs if refs.get("agents") else None
             record.updated_at = utc_now_iso()
             self._write_meta(record)
             # The 'done' journal event is metadata-only: a script-authored
@@ -606,6 +841,11 @@ class ScriptRunStore:
     def journal_path(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
         return self._journal_path(run_id)
+
+    def transcript_refs(self, run_id: str) -> dict[str, Any]:
+        """Return transcript artifact refs/paths without loading transcript content."""
+        _require_safe_run_id(run_id)
+        return self.transcript_recorder(run_id).refs()
 
     def suspended_runs(self) -> list[ScriptRunMeta]:
         """Return runs durably suspended on an unresolved paused Kanban await (issue #5).
@@ -902,6 +1142,7 @@ class ScriptRunStore:
             error=data.get("error"),
             deterministic_runner=bool(data.get("deterministic_runner", False)),
             replay_of=data.get("replay_of"),
+            transcripts=data.get("transcripts") if isinstance(data.get("transcripts"), dict) else None,
             schema_version=version,
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),

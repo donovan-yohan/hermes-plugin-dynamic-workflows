@@ -482,11 +482,18 @@ def _control_link_resolver(store: FileRunStore, *, session_id: Optional[str] = N
     def resolve(record: Any) -> dict[str, Any]:
         if isinstance(record, BackgroundRunRecord):
             run_dir = _plugin_background_store(session_id=session_id).root / record.run_id
+            script_extras = None
+            if record.journal_path:
+                script_run_dir = Path(record.journal_path).parent
+                script_extras = {
+                    "script_run_journal": record.journal_path,
+                    "script_run_transcripts": str(script_run_dir / "transcripts"),
+                }
             return _controls.run_links(
                 run_id=record.run_id,
                 journal_path=str(run_dir / "journal.jsonl"),
                 result_path=str(run_dir / "run.json"),
-                extra={"script_run_journal": record.journal_path} if record.journal_path else None,
+                extra=script_extras,
             )
         run_dir = store.root / record.run_id
         return _controls.run_links(
@@ -687,6 +694,11 @@ def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
     except (ScriptRunStoreError, ValueError):
         pass
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
+        pass
+    try:
+        if _plugin_background_store(session_id=session_id).get(run_id) is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive; background status is best-effort
         pass
     return bool(_loop_waits(run_id=run_id))
 

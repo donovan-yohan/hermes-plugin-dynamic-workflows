@@ -11,9 +11,19 @@ from types import ModuleType
 from typing import Any, Callable
 
 import hermes_workflows.background as background_module
+from hermes_workflows.agents import ChildAgentRequest
 from hermes_workflows.background import BackgroundRunStore, BackgroundWorkflowRunManager
 from hermes_workflows.script_store import ScriptRunStore
 from hermes_workflows.vm import ScriptRunResult
+
+
+class _ChildRunner:
+    def __init__(self) -> None:
+        self.requests: list[ChildAgentRequest] = []
+
+    def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+        self.requests.append(request)
+        return {"answer": "child", "_tokens": 4}
 
 SCRIPT = (
     'meta = {"name": "background-demo", "description": "d"}\n'
@@ -315,3 +325,29 @@ def test_plugin_workflow_control_late_stop_preserves_completed_background_result
         assert status["data"]["lifecycle"] == "succeeded"
         assert status["data"]["result"] == {"answer": "preserve"}
         assert status["data"]["error"] is None
+
+
+def test_background_prompt_agent_uses_child_runner_and_persists_transcript_refs():
+    script = 'meta = {"name": "background-child", "description": "d"}\nreturn await agent("summarize", {"label": "bg"})\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        background_store = BackgroundRunStore(Path(tmp) / "background-runs")
+        script_store = ScriptRunStore(Path(tmp) / "script-runs")
+        manager = BackgroundWorkflowRunManager(background_store, script_store)
+        runner = _ChildRunner()
+
+        record = manager.launch_script(
+            script,
+            run_id="wfs_background_child",
+            child_agent_runner=runner,
+            deterministic_runner=True,
+        )
+        final = _eventually(
+            lambda: background_store.get(record.run_id),
+            lambda r: r is not None and r.status == "succeeded",
+        )
+
+        assert final.result == {"answer": "child", "_tokens": 4}
+        assert [request.label for request in runner.requests] == ["bg"]
+        refs = script_store.load_run(record.run_id).transcripts
+        assert refs["agents"][0]["state"] == "succeeded"
+        assert Path(refs["agents"][0]["meta_path"]).exists()
