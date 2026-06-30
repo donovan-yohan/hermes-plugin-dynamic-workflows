@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from hermes_workflows import ChildAgentRequest, ScriptRunStore, run_workflow_script
+from hermes_workflows import ChildAgentRequest, ScriptRunStore, VMLimits, run_workflow_script
 
 META = 'meta = {"name": "prompt-agent", "description": "d"}\n'
 
@@ -19,6 +19,18 @@ class FakeChildRunner:
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         self.requests.append(request)
         return dict(self.output)
+
+
+class SequenceChildRunner:
+    def __init__(self, outputs: list[Any]) -> None:
+        self.outputs = list(outputs)
+        self.requests: list[ChildAgentRequest] = []
+
+    def __call__(self, request: ChildAgentRequest) -> Any:
+        self.requests.append(request)
+        if self.outputs:
+            return self.outputs.pop(0)
+        return {}
 
 
 def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_metadata():
@@ -103,6 +115,72 @@ def test_prompt_agent_child_output_is_json_safe_before_returning_to_script():
         "bad": {"_unserializable_type": "Weird"},
         "items": [{"_unserializable_type": "Weird"}],
     }
+
+
+def test_prompt_agent_schema_invalid_output_retries_with_validation_context_and_journal():
+    runner = SequenceChildRunner([
+        {"answer": 7},
+        {"answer": "ok", "_tokens": 5},
+    ])
+    script = META + (
+        'result = await agent("summarize", {\n'
+        '    "label": "summary",\n'
+        '    "phase": "analysis",\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "context": {"topic": "pr"},\n'
+        '})\n'
+        'return result\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script,
+            store=store,
+            run_id="schema_retry_run",
+            child_agent_runner=runner,
+            deterministic_runner=True,
+        )
+
+        assert res.ok, res.error
+        assert res.value == {"answer": "ok", "_tokens": 5}
+        assert len(runner.requests) == 2
+        assert runner.requests[0].context == {"topic": "pr"}
+        retry_context = runner.requests[1].context
+        assert retry_context["topic"] == "pr"
+        assert retry_context["schema_validation_error"]["code"] == "schema"
+        assert "expected string" in retry_context["schema_validation_error"]["message"]
+
+        retry_events = [event for event in res.calls if event.get("error") == "schema_retry"]
+        assert len(retry_events) == 1
+        retry_event = retry_events[0]
+        assert retry_event["type"] == "rpc_call"
+        assert retry_event["call_id"] == 1
+        assert retry_event["method"] == "agent"
+        assert retry_event["agent_id"] == "prompt"
+        assert retry_event["ok"] is False
+        assert retry_event["label"] == "summary"
+        assert retry_event["phase"] == "analysis"
+        assert retry_event["attempt"] == 1
+        assert retry_event["max_retries"] == 2
+        journal_retry = [event for event in store.journal("schema_retry_run") if event.get("error") == "schema_retry"]
+        assert journal_retry[0]["attempt"] == 1
+        assert journal_retry[0]["max_retries"] == 2
+        assert store.load_cache("schema_retry_run").get(1).value == {"answer": "ok", "_tokens": 5}
+
+
+def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():
+    runner = SequenceChildRunner([{"answer": 7}, {}])
+    res = run_workflow_script(
+        META + 'return await agent("summarize", {"schema": {"answer": "string"}})\n',
+        child_agent_runner=runner,
+        limits=VMLimits(max_schema_retries=1),
+    )
+
+    assert res.ok is False
+    assert res.error["code"] == "schema"
+    assert "schema validation failed after 2 attempt(s)" in res.error["message"]
+    assert len(runner.requests) == 2
+    assert [event.get("error") for event in res.calls].count("schema_retry") == 1
 
 
 def test_legacy_agent_id_input_compatibility_is_preserved():
