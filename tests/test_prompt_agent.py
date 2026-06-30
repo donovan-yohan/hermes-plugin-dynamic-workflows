@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -385,6 +387,65 @@ def test_prompt_agent_duplicate_prompt_hits_current_run_cache():
         assert len([e for e in events if e["type"] == "agent_started"]) == 1
         hit = next(e for e in events if e["type"] == "agent_cache_hit")
         assert hit["cache"] == "run"
+
+
+def test_concurrent_duplicate_prompt_agents_record_one_cache_fingerprint():
+    count = 16
+
+    class SlowChildRunner:
+        def __init__(self) -> None:
+            self.requests: list[ChildAgentRequest] = []
+            self._lock = threading.Lock()
+            self._barrier = threading.Barrier(count)
+
+        def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+            with self._lock:
+                self.requests.append(request)
+            self._barrier.wait(timeout=5)
+            time.sleep(0.02)
+            return {"answer": "same", "_tokens": 1}
+
+    branches = ",\n".join(
+        "    lambda: agent('same concurrent prompt', {'label': 'same', 'schema': {'answer': 'string'}})"
+        for _ in range(count)
+    )
+    script = META + f"outs = await parallel([\n{branches}\n])\nreturn {{'count': len(outs)}}\n"
+    runner = SlowChildRunner()
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script,
+            store=store,
+            run_id="concurrent_dupe",
+            child_agent_runner=runner,
+            limits=VMLimits(max_parallel=count),
+        )
+        assert res.ok, res.error
+        assert res.value == {"count": count}
+
+        cache = store.load_cache("concurrent_dupe")
+        events = store.journal("concurrent_dupe")
+        fingerprint = next(e["fingerprint"] for e in events if e["type"] == "agent_result")
+        assert cache.get_prompt(fingerprint).value == {"answer": "same", "_tokens": 1}
+        assert len(cache) == 1
+
+
+def test_pipeline_prompt_agent_stage_allows_internal_dispatch_index_params():
+    # pipeline() annotates each child frame with _pipeline_item_index /
+    # _pipeline_stage_index; a prompt-agent stage must treat those as internal
+    # scheduling metadata, not reject them as unsupported options.
+    runner = FakeChildRunner({"answer": "ok", "_tokens": 1})
+    script = META + (
+        "outs = await pipeline([1, 2],\n"
+        "    lambda prev, item, i: agent('summarize ' + str(item), "
+        "{'label': 'x', 'schema': {'answer': 'string'}}),\n"
+        ")\n"
+        "return {'n': len(outs)}\n"
+    )
+    res = run_workflow_script(script, child_agent_runner=runner, limits=VMLimits(max_parallel=2))
+    assert res.ok, res.error
+    assert res.value == {"n": 2}
 
 
 def test_prompt_agent_duplicate_prompt_cache_hit_obeys_token_budget():

@@ -451,16 +451,17 @@ class CapabilityBroker:
                 fingerprint = ""
                 args_hash = ""
             if request is not None and isinstance(value, dict):
-                self._prompt_results[fingerprint] = (args_hash, value)
-                if (
-                    self._recorder is not None
-                    and fingerprint not in self._recorded_prompt_fingerprints
-                ):
-                    try:
-                        self._recorder.record_prompt(fingerprint, method, args_hash, value)
-                        self._recorded_prompt_fingerprints.add(fingerprint)
-                    except Exception:  # noqa: BLE001 — persistence is best-effort.
-                        pass
+                with self._lock:
+                    self._prompt_results[fingerprint] = (args_hash, value)
+                    if (
+                        self._recorder is not None
+                        and fingerprint not in self._recorded_prompt_fingerprints
+                    ):
+                        try:
+                            self._recorder.record_prompt(fingerprint, method, args_hash, value)
+                            self._recorded_prompt_fingerprints.add(fingerprint)
+                        except Exception:  # noqa: BLE001 — persistence is best-effort.
+                            pass
                 try:
                     self._emit_prompt_agent_event(
                         "agent_result", call_id, request, fingerprint, ok=True, has_value=True
@@ -527,7 +528,8 @@ class CapabilityBroker:
         entry_args_hash: Optional[str] = None
         cache_source: Optional[str] = None
 
-        cached = self._prompt_results.get(fingerprint)
+        with self._lock:
+            cached = self._prompt_results.get(fingerprint)
         if cached is not None:
             entry_args_hash, value = cached
             cache_source = "run"
@@ -556,14 +558,15 @@ class CapabilityBroker:
             raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
         _validate_output(value, request.schema)
         self._check_start_control(call_id, "agent", params)
-        self._check_token_budget()
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
-        usage = _non_negative_token_usage(value)
-        if usage is not None:
-            self._tokens += usage
-        self._replayed_calls += 1
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+            usage = _non_negative_token_usage(value)
+            if usage is not None:
+                self._tokens += usage
+            self._replayed_calls += 1
         self._emit_prompt_agent_event(
             "agent_cache_hit", call_id, request, fingerprint, ok=True, cache=cache_source
         )
@@ -713,12 +716,13 @@ class CapabilityBroker:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
         request = _prompt_agent_request(params)
-        self._check_token_budget()
-        # Count the script-visible prompt agent call once; schema retries below may
-        # cross the child-runner boundary again but remain bounded by max_schema_retries.
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        with self._lock:
+            self._check_token_budget()
+            # Count the script-visible prompt agent call once; schema retries below may
+            # cross the child-runner boundary again but remain bounded by max_schema_retries.
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         if self._child_runner is None:
             raise CapabilityDenied(
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
@@ -771,7 +775,8 @@ class CapabilityBroker:
 
             usage = _non_negative_token_usage(safe_output)
             if usage is not None:
-                self._tokens += usage
+                with self._lock:
+                    self._tokens += usage
             return safe_output
 
         raise CapabilityDenied("schema validation failed after retry exhaustion", code="schema")
@@ -1204,7 +1209,13 @@ def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
     prompt = params.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
-    unknown = sorted(set(params) - ({"prompt"} | CHILD_AGENT_OPTION_KEYS))
+    # parallel()/pipeline() annotate child frames with private dispatch-index
+    # params; they are internal scheduling metadata, not script-supplied options.
+    unknown = sorted(
+        set(params)
+        - ({"prompt"} | CHILD_AGENT_OPTION_KEYS
+           | {"_parallel_index", "_pipeline_item_index", "_pipeline_stage_index"})
+    )
     if unknown:
         raise CapabilityDenied(
             "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
