@@ -328,6 +328,11 @@ class BackgroundRunStore:
             record = self._load_unlocked(run_id)
             if record is None:
                 raise ValueError(f"background run not found: {run_id!r}")
+            if status == "stopped" and record.status in BACKGROUND_TERMINAL_STATES:
+                # A late operator stop is still recorded in the control store,
+                # but the background snapshot is already authoritative terminal
+                # history. Do not erase completed result/error payloads.
+                return record
             if status != "stopped" and record.status == "stopped":
                 return record
             record.status = status

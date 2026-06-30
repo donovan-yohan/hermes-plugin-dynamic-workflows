@@ -118,6 +118,51 @@ def test_background_stop_wins_over_late_worker_completion():
         assert final.error["type"] == "BackgroundRunStopped"
 
 
+def test_background_stop_after_success_preserves_terminal_result_and_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BackgroundRunStore(Path(tmp) / "background-runs")
+        store.begin("wfs_stop_after_success", script=SCRIPT, args={"value": "done"})
+        finished = store.finish("wfs_stop_after_success", ScriptRunResult(ok=True, value={"answer": "done"}))
+
+        stopped = store.stop("wfs_stop_after_success", reason="late operator stop")
+
+        assert finished.status == "succeeded"
+        assert stopped.status == "succeeded"
+        assert stopped.result == {"answer": "done"}
+        assert stopped.error is None
+        assert stopped.stopped_reason is None
+
+
+def test_background_stop_after_failure_preserves_terminal_error_and_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BackgroundRunStore(Path(tmp) / "background-runs")
+        store.begin("wfs_stop_after_failure", script=SCRIPT, args={"value": "bad"})
+        failure = {"type": "RuntimeError", "message": "boom"}
+        store.finish("wfs_stop_after_failure", ScriptRunResult(ok=False, error=failure))
+
+        stopped = store.stop("wfs_stop_after_failure", reason="late operator stop")
+
+        assert stopped.status == "failed"
+        assert stopped.result is None
+        assert stopped.error == failure
+        assert stopped.stopped_reason is None
+
+
+def test_background_stop_after_suspended_preserves_terminal_error_and_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = BackgroundRunStore(Path(tmp) / "background-runs")
+        store.begin("wfs_stop_after_suspended", script=SCRIPT, args={"value": "wait"})
+        suspend_error = {"type": "KanbanSuspended", "card_id": "t_wait", "profile": "kani-backend"}
+        store.finish("wfs_stop_after_suspended", ScriptRunResult(ok=False, error=suspend_error, suspended=True))
+
+        stopped = store.stop("wfs_stop_after_suspended", reason="late operator stop")
+
+        assert stopped.status == "suspended"
+        assert stopped.result is None
+        assert stopped.error == suspend_error
+        assert stopped.stopped_reason is None
+
+
 def test_background_finish_does_not_resurrect_stopped_run_when_stop_races_after_read(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         store = BackgroundRunStore(Path(tmp) / "background-runs")
@@ -229,3 +274,44 @@ def test_plugin_background_run_is_visible_in_workflow_control_status_and_overvie
         by_id = {r["run_id"]: r for r in overview["data"]["runs"]}
         assert by_id["wfs_plugin_bg"]["kind"] == "workflow_script"
         assert by_id["wfs_plugin_bg"]["status"] == "succeeded"
+
+
+def test_plugin_workflow_control_late_stop_preserves_completed_background_result(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp)
+        monkeypatch.setenv("HERMES_WORKFLOWS_STATE_DIR", str(state_dir / "runs"))
+        monkeypatch.setenv("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR", str(state_dir / "scripts"))
+        plugin = _load_plugin_root()
+        ctx = _FakeContext()
+        plugin.register(ctx)
+        wf = ctx.tools["workflow"]["handler"]
+        ctl = ctx.tools["workflow_control"]["handler"]
+
+        saved = json.loads(wf({"action": "script_save", "script_name": "late-stop", "script_source": PLUGIN_SCRIPT}))
+        assert saved["success"] is True
+        launched = json.loads(
+            wf({
+                "action": "run_script",
+                "script_name": "late-stop",
+                "script_args": {"value": "preserve"},
+                "execution_mode": "background",
+                "run_id": "wfs_plugin_late_stop",
+            })
+        )
+        assert launched["success"] is True
+
+        completed = _eventually(
+            lambda: json.loads(ctl({"action": "status", "run_id": "wfs_plugin_late_stop"})),
+            lambda data: data["data"]["lifecycle"] == "succeeded",
+        )
+        assert completed["data"]["result"] == {"answer": "preserve"}
+
+        stopped = json.loads(
+            ctl({"action": "stop", "run_id": "wfs_plugin_late_stop", "reason": "late operator stop"})
+        )
+        assert stopped["success"] is True
+
+        status = json.loads(ctl({"action": "status", "run_id": "wfs_plugin_late_stop"}))
+        assert status["data"]["lifecycle"] == "succeeded"
+        assert status["data"]["result"] == {"answer": "preserve"}
+        assert status["data"]["error"] is None
