@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -138,6 +139,7 @@ class VMLimits:
     max_agent_calls: int = 200
     max_kanban_calls: int = 100
     max_capability_calls: int = 100
+    max_parallel: int = 8
     max_runtime_s: float = 30.0
     allow_nested_workflows: bool = False
     token_budget: Optional[int] = None
@@ -264,6 +266,7 @@ class CapabilityBroker:
         self._capability_calls = 0
         self._tokens = 0
         self._replayed_calls = 0
+        self._lock = threading.Lock()
         self.should_abort = False
         self.abort_reason: Optional[str] = None
         # Durable suspend signal (issue #5): set when an unresolved paused Kanban
@@ -360,15 +363,16 @@ class CapabilityBroker:
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
 
         try:
-            self._rpc_calls += 1
-            if self._rpc_calls > self._limits.max_rpc_calls:
-                self.should_abort = True
-                self.abort_reason = "aborted: capability hard-limit exceeded"
-                raise CapabilityDenied(
-                    f"max_rpc_calls ({self._limits.max_rpc_calls}) exceeded", code="limit_rpc"
-                )
-            if method not in _ALLOWED_METHODS:
-                raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
+            with self._lock:
+                self._rpc_calls += 1
+                if self._rpc_calls > self._limits.max_rpc_calls:
+                    self.should_abort = True
+                    self.abort_reason = "aborted: capability hard-limit exceeded"
+                    raise CapabilityDenied(
+                        f"max_rpc_calls ({self._limits.max_rpc_calls}) exceeded", code="limit_rpc"
+                    )
+                if method not in _ALLOWED_METHODS:
+                    raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
             self._check_run_control(call_id, method, params)
 
             # Replay: serve a deterministic call from the cache instead of
@@ -447,6 +451,28 @@ class CapabilityBroker:
                 return False
         return is_replayable(method, deterministic_runner=self._deterministic_runner)
 
+    def started_event(self, frame: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return a metadata-only start marker for parallel child calls.
+
+        Sequential calls keep the historical one-result-event journal shape. A
+        workflow-script ``parallel()`` call annotates child RPC frames with a
+        private ``_parallel_index`` parameter; those calls get a separate start
+        marker so operators can see real dispatch timing without exposing raw
+        inputs.
+        """
+        params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        if "_parallel_index" not in params:
+            return None
+        event = self._call_event(
+            frame.get("id"),
+            frame.get("method"),
+            params,
+            ok=True,
+            event_type="rpc_call_start",
+        )
+        event["parallel_index"] = params.get("_parallel_index")
+        return event
+
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
 
@@ -459,12 +485,14 @@ class CapabilityBroker:
             return _MISS
         args_hash = replay_args_hash(method, params) if isinstance(params, dict) else ""
         if entry.method != method or entry.args_hash != args_hash:
-            self.should_abort = True
-            self.abort_reason = (
-                f"replay drift at call {call_id}: recorded {entry.method!r} does not "
-                f"match {method!r} (or arguments changed)"
-            )
-            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+            with self._lock:
+                self.should_abort = True
+                self.abort_reason = (
+                    f"replay drift at call {call_id}: recorded {entry.method!r} does not "
+                    f"match {method!r} (or arguments changed)"
+                )
+                abort_reason = self.abort_reason
+            raise CapabilityDenied(abort_reason, code="replay_mismatch")
         # Hit. Mirror the live accounting so cap-/budget-gated control flow in the
         # script reproduces the recorded run:
         #  * advance the soft per-method counters, so a later *non-cached* call
@@ -473,19 +501,21 @@ class CapabilityBroker:
         #  * re-apply the recorded non-negative token spend (a negative/absent
         #    value is ignored — the hard cap is not re-enforced on a faithful
         #    replay, so a tampered _tokens must not skew the budget downward).
-        if method == "agent":
-            self._agent_calls += 1
-        elif method == "kanban_agent":
-            self._kanban_calls += 1
-        elif method == "capability":
-            self._capability_calls += 1
-        if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
-            usage = entry.value.get("_tokens")
-            if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-                self._tokens += usage
-        self._replayed_calls += 1
+        with self._lock:
+            if method == "agent":
+                self._agent_calls += 1
+            elif method == "kanban_agent":
+                self._kanban_calls += 1
+            elif method == "capability":
+                self._capability_calls += 1
+            if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
+                usage = entry.value.get("_tokens")
+                if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+                    self._tokens += usage
+            self._replayed_calls += 1
+            budget = self._budget_info()
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
-        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": budget}
 
     def _dispatch(self, call_id: Any, method: str, params: dict[str, Any]) -> Any:
         if method == "log":
@@ -515,12 +545,13 @@ class CapabilityBroker:
             name = normalize_capability_name(raw_name)
         except ValueError as exc:
             raise CapabilityDenied(str(exc), code="bad_request") from exc
-        self._check_token_budget()
-        self._capability_calls += 1
-        if self._capability_calls > self._limits.max_capability_calls:
-            raise CapabilityDenied(
-                f"max_capability_calls ({self._limits.max_capability_calls}) exceeded", code="limit_capability"
-            )
+        with self._lock:
+            self._check_token_budget()
+            self._capability_calls += 1
+            if self._capability_calls > self._limits.max_capability_calls:
+                raise CapabilityDenied(
+                    f"max_capability_calls ({self._limits.max_capability_calls}) exceeded", code="limit_capability"
+                )
         if self._capability_registry is None:
             raise CapabilityDenied("no capability registry configured for this run", code="capability_unavailable")
         capability = self._capability_registry.get(name)
@@ -544,7 +575,8 @@ class CapabilityBroker:
         )
         usage = result.get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-            self._tokens += usage
+            with self._lock:
+                self._tokens += usage
         _validate_output(result, params.get("schema"))
         return result
 
@@ -563,7 +595,6 @@ class CapabilityBroker:
         agent_id = params.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id:
             raise CapabilityDenied("agent call requires a non-empty 'agent_id'", code="bad_request")
-        self._check_token_budget()
         if is_kanban_runner_id(agent_id):
             raise CapabilityDenied(
                 f"reserved kanban runner id {agent_id!r} must be reached via kanban_agent", code="reserved_agent"
@@ -571,11 +602,13 @@ class CapabilityBroker:
         if not is_known_agent(agent_id):
             raise CapabilityDenied(f"unknown agent id {agent_id!r}", code="unknown_agent")
         self._check_start_control(call_id, "agent", params)
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            # Soft denial: the script may catch CapabilityError and adapt. The
-            # max_rpc_calls hard cap is the runaway backstop that aborts the VM.
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                # Soft denial: the script may catch CapabilityError and adapt. The
+                # max_rpc_calls hard cap is the runaway backstop that aborts the VM.
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         payload = params.get("input") if isinstance(params.get("input"), dict) else {}
         return self._invoke(agent_id, payload, params.get("schema"))
 
@@ -590,10 +623,11 @@ class CapabilityBroker:
             raise CapabilityDenied(
                 "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
             )
-        self._check_token_budget()
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         if self._child_runner is None:
             raise CapabilityDenied(
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
@@ -619,7 +653,8 @@ class CapabilityBroker:
         _validate_output(safe_output, request.schema)
         usage = safe_output.get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool):
-            self._tokens += usage
+            with self._lock:
+                self._tokens += usage
         return safe_output
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -631,11 +666,12 @@ class CapabilityBroker:
         except ValueError as exc:
             raise CapabilityDenied(str(exc), code="bad_request") from exc
         self._check_start_control(call_id, "kanban_agent", params)
-        self._check_token_budget()
-        self._kanban_calls += 1
-        if self._kanban_calls > self._limits.max_kanban_calls:
-            # Soft denial (see _handle_agent): catchable; max_rpc_calls aborts.
-            raise CapabilityDenied(f"max_kanban_calls ({self._limits.max_kanban_calls}) exceeded", code="limit_kanban")
+        with self._lock:
+            self._check_token_budget()
+            self._kanban_calls += 1
+            if self._kanban_calls > self._limits.max_kanban_calls:
+                # Soft denial (see _handle_agent): catchable; max_rpc_calls aborts.
+                raise CapabilityDenied(f"max_kanban_calls ({self._limits.max_kanban_calls}) exceeded", code="limit_kanban")
 
         if self._kanban_backend is not None:
             return self._handle_kanban_durable(call_id, profile, on_block, params)
@@ -750,7 +786,8 @@ class CapabilityBroker:
             result["diagnostics"] = diagnostics
         usage = (resolution.result or {}).get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-            self._tokens += usage
+            with self._lock:
+                self._tokens += usage
         return result
 
     def _await_valid_kanban_result(
@@ -882,7 +919,8 @@ class CapabilityBroker:
         _validate_output(output, schema)
         usage = output.get("_tokens")
         if isinstance(usage, int) and not isinstance(usage, bool):
-            self._tokens += usage
+            with self._lock:
+                self._tokens += usage
         return output
 
     def _call_event(
@@ -894,8 +932,9 @@ class CapabilityBroker:
         ok: bool,
         error: Optional[str] = None,
         replayed: bool = False,
+        event_type: str = "rpc_call",
     ) -> dict[str, Any]:
-        event: dict[str, Any] = {"type": "rpc_call", "call_id": call_id, "method": method, "ok": ok}
+        event: dict[str, Any] = {"type": event_type, "call_id": call_id, "method": method, "ok": ok}
         if method in ("agent",):
             event["agent_id"] = params.get("agent_id")
         if method in ("kanban_agent",):
@@ -908,6 +947,8 @@ class CapabilityBroker:
             event["label"] = safe_capability_metadata_value(params.get("label"))
         if params.get("phase"):
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
+        if "_parallel_index" in params:
+            event["parallel_index"] = params.get("_parallel_index")
         if error:
             event["error"] = error
         if replayed:
@@ -1105,6 +1146,7 @@ class WorkflowVM:
                     "max_rpc_calls": self._limits.max_rpc_calls,
                     "max_agent_calls": self._limits.max_agent_calls,
                     "max_capability_calls": self._limits.max_capability_calls,
+                    "max_parallel": self._limits.max_parallel,
                     "max_runtime_s": self._limits.max_runtime_s,
                 },
                 "budget": {"total": self._limits.token_budget, "spent": 0,
@@ -1117,23 +1159,45 @@ class WorkflowVM:
                 protocol_error = f"child closed stdin before boot: {exc}"
                 booted = False
 
-            while booted:
+            ret_executor = ThreadPoolExecutor(max_workers=max(1, int(self._limits.max_parallel or 1)))
+            ret_write_lock = threading.Lock()
+            pending_rets: set[Future[Any]] = set()
+
+            def _set_protocol_error(message: str) -> None:
+                nonlocal protocol_error
+                if protocol_error is None:
+                    protocol_error = message
+
+            def _handle_and_reply(call_frame: dict[str, Any]) -> None:
+                nonlocal suspended
+                ret = broker.handle(call_frame)
                 try:
-                    frame = rpc.read_frame(proc.stdout)
-                except rpc.RPCProtocolError as exc:
-                    protocol_error = str(exc)
-                    break
-                if frame is None:
-                    break  # EOF: child exited (cleanly after done, or crashed).
-                kind = frame.get("t")
-                if kind == rpc.T_READY:
-                    meta = frame.get("meta")
-                elif kind == rpc.T_CALL:
-                    ret = broker.handle(frame)
-                    try:
+                    with ret_write_lock:
                         rpc.write_frame(proc.stdin, ret)
-                    except (BrokenPipeError, OSError) as exc:
-                        protocol_error = f"child stdin closed: {exc}"
+                except (BrokenPipeError, OSError) as exc:
+                    _set_protocol_error(f"child stdin closed: {exc}")
+                    return
+                if broker.should_abort:
+                    _kill(proc)
+                    _set_protocol_error(broker.abort_reason or "aborted: capability hard-limit exceeded")
+                if broker.should_suspend:
+                    # An unresolved paused Kanban await suspended the run: tear
+                    # the subprocess down (the script's local state is discarded;
+                    # a resume re-runs it from the replay cache) and report a
+                    # resumable suspended run rather than a failure.
+                    _kill(proc)
+                    suspended = broker.suspend_info or {}
+
+            try:
+                while booted:
+                    done_futures = {fut for fut in pending_rets if fut.done()}
+                    pending_rets.difference_update(done_futures)
+                    for fut in done_futures:
+                        exc = fut.exception()
+                        if exc is not None:
+                            _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
+                            _kill(proc)
+                    if protocol_error is not None or suspended is not None:
                         break
                     if broker.should_stop:
                         _kill(proc)
@@ -1147,18 +1211,36 @@ class WorkflowVM:
                         _kill(proc)
                         protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
                         break
-                    if broker.should_suspend:
-                        # An unresolved paused Kanban await suspended the run: tear
-                        # the subprocess down (the script's local state is discarded;
-                        # a resume re-runs it from the replay cache) and report a
-                        # resumable suspended run rather than a failure.
-                        _kill(proc)
-                        suspended = broker.suspend_info or {}
+                    try:
+                        frame = rpc.read_frame(proc.stdout)
+                    except rpc.RPCProtocolError as exc:
+                        protocol_error = str(exc)
                         break
-                elif kind == rpc.T_DONE:
-                    done = frame
-                    break
-                # Unknown frame types are ignored (forward-compatible).
+                    if frame is None:
+                        break  # EOF: child exited (cleanly after done, or crashed).
+                    kind = frame.get("t")
+                    if kind == rpc.T_READY:
+                        meta = frame.get("meta")
+                    elif kind == rpc.T_CALL:
+                        started = broker.started_event(frame)
+                        if started is not None:
+                            broker._emit(started)
+                        pending_rets.add(ret_executor.submit(_handle_and_reply, frame))
+                    elif kind == rpc.T_DONE:
+                        done = frame
+                        break
+                    # Unknown frame types are ignored (forward-compatible).
+            finally:
+                if pending_rets:
+                    wait(pending_rets, timeout=5)
+                    for fut in list(pending_rets):
+                        if fut.done():
+                            exc = fut.exception()
+                            if exc is not None:
+                                _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
+                        else:
+                            fut.cancel()
+                ret_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             timer.cancel()
             _close(proc.stdin)
@@ -1283,6 +1365,7 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "max_agent_calls": limits.max_agent_calls,
         "max_kanban_calls": limits.max_kanban_calls,
         "max_capability_calls": limits.max_capability_calls,
+        "max_parallel": limits.max_parallel,
         "max_runtime_s": limits.max_runtime_s,
         "allow_nested_workflows": limits.allow_nested_workflows,
         "token_budget": limits.token_budget,
@@ -1420,6 +1503,7 @@ def _limits_from_view(view: Any) -> VMLimits:
         max_agent_calls=_req_int(view, "max_agent_calls", default.max_agent_calls),
         max_kanban_calls=_req_int(view, "max_kanban_calls", default.max_kanban_calls),
         max_capability_calls=_req_int(view, "max_capability_calls", default.max_capability_calls),
+        max_parallel=_req_int(view, "max_parallel", default.max_parallel),
         max_runtime_s=_req_float(view, "max_runtime_s", default.max_runtime_s),
         allow_nested_workflows=_req_bool(
             view, "allow_nested_workflows", default.allow_nested_workflows
