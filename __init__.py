@@ -684,6 +684,11 @@ def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
         pass
     try:
+        if _plugin_background_store(session_id=session_id).get(run_id) is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive; background status is best-effort
+        pass
+    try:
         _plugin_script_run_store(session_id=session_id).load_run(run_id)
         return True
     except (ScriptRunStoreError, ValueError):
@@ -745,9 +750,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         if action == "status":
             run_store = _plugin_store(session_id=session_id)
             record = run_store.get(run_id)
-            background_record = None
-            if record is None:
-                background_record = _plugin_background_store(session_id=session_id).get(run_id)
+            background_record = None if record is not None else _plugin_background_store(session_id=session_id).get(run_id)
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
             events_limit = params.get("events_limit", 10)
             if record is None and background_record is None:
@@ -796,11 +799,11 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 lifecycle=lifecycle,
                 control_state=state,
                 current_phase=current_phase,
-                phases=phases,
                 progress=progress,
                 waits=waits,
                 result=result,
                 error=error,
+                phases=phases,
                 last_events=events,
                 links=links,
                 events_limit=events_limit,

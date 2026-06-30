@@ -352,6 +352,16 @@ while areas and budget.remaining() > 0 and round_index < max_rounds:
 return {"remaining_areas": areas, "rounds": round_index}
 ```
 
+The archive-parity regression under `tests/fixtures/loop_until_dry/` is intentionally
+deterministic. It uses a sanitized `cart.js` subject file plus `fake_child_responses.json`
+instead of replaying the original Claude transcript or contacting live agents. That fixture
+proves the runtime topology: round loop, three concurrent finder child agents, candidate
+deduplication, N verifier child agents, dry-counter termination, max-round fallback, progress
+rows, and prompt/options fingerprint resume. A live-agent smoke can reuse the same Python
+harness by injecting a real `child_agent_runner`, but live findings are expected to diverge
+from the fake fixture and should be treated as optional smoke evidence rather than a stable
+unit-test oracle.
+
 ## Event-driven workflows, not timer-owned phase control
 
 The big rule: **cron may start a workflow, but cron should not own workflow phase control**.
@@ -363,6 +373,38 @@ and webhook or task events resume the run from durable state.
 
 Use cron only for calendar starts, visibility heartbeats, or simple script-only pings. Use workflow
 events and waits for goal-directed advancement.
+
+## AsyncSessionDB-era ATH / Kanban boundary
+
+Hermes gateway session persistence is still backed by synchronous SQLite, but upstream Hermes now routes
+gateway `SessionDB` access through an `AsyncSessionDB` facade that offloads each call from the asyncio
+loop. That makes event-driven workflow UX less fragile: a busy gateway `state.db` operation should not
+freeze unrelated Discord/Telegram delivery while ATH or source bindings wake the operator thread.
+
+That upstream change is **liveness plumbing, not a workflow runtime**. Keep the ownership split explicit:
+
+| Layer | Owns | Does not own |
+| --- | --- | --- |
+| Dynamic Workflows | run state, phase transitions, durable waits, approvals, pause/stop/retry intent, resource/finalizer contracts, adapter policies | signed chat ingress, task execution, gateway session persistence |
+| ATH / async threads | signed event ingress, listener/source binding routing, thread continuity, compact notifications and approval prompts | workflow state machines, retries, cancellation policy, task graph semantics |
+| Kanban | durable multi-agent work graph, board/task state, worker audit trail, exact-head QA/review/release gates | the generic workflow abstraction or cross-backend dependency model |
+| Cron | calendar starts, visibility heartbeats, simple script-only pings | goal-directed phase advancement |
+
+Preferred durable operator loop:
+
+```text
+workflow run / controller
+  -> creates or waits on a Kanban task or external event
+  -> source binding / producer emits a compact signed ATH event
+  -> gateway wakes the original Discord/Telegram thread
+  -> operator inspects workflow_control status or approves a concrete action
+```
+
+Do **not** bake Kanban task fields into generic workflow specs, and do **not** make ATH a hidden control
+plane inside core execution. Dynamic Workflows should expose backend-neutral state/events/resources;
+host adapters translate those into ATH listeners, Kanban cards, gateway messages, or future shared stores.
+If event volume becomes high, remember AsyncSessionDB protects Hermes gateway `state.db` calls only —
+plugin-owned stores still need their own concurrency and shared-store design.
 
 ## Security model
 

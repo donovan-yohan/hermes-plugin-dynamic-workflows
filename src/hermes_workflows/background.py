@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from .agents import AgentRunner, ChildAgentRunner
 from .capabilities import CapabilityPolicy, CapabilityRegistry
+from .controls import ControlStore
 from .errors import ScriptValidationError
 from .registry import utc_now_iso
 from .script_store import ScriptRunStore, canonical_hash, script_run_id, script_sha256
@@ -328,7 +329,12 @@ class BackgroundRunStore:
             record = self._load_unlocked(run_id)
             if record is None:
                 raise ValueError(f"background run not found: {run_id!r}")
-            if record.status in BACKGROUND_TERMINAL_STATES:
+            if status == "stopped" and record.status in BACKGROUND_TERMINAL_STATES:
+                # A late operator stop is still recorded in the control store,
+                # but the background snapshot is already authoritative terminal
+                # history. Do not erase completed result/error payloads.
+                return record
+            if status != "stopped" and record.status == "stopped":
                 return record
             record.status = status
             record.updated_at = utc_now_iso()
@@ -421,6 +427,7 @@ class BackgroundWorkflowRunManager:
         kanban_backend: Any = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
+        control_store: Optional[ControlStore] = None,
     ) -> BackgroundRunRecord:
         if validate:
             validation = validate_script(script)
@@ -450,6 +457,7 @@ class BackgroundWorkflowRunManager:
                 "kanban_backend": kanban_backend,
                 "capability_registry": capability_registry,
                 "capability_policy": capability_policy,
+                "control_store": control_store,
             },
         )
         with self._threads_lock:
@@ -459,7 +467,10 @@ class BackgroundWorkflowRunManager:
         except BaseException as exc:
             with self._threads_lock:
                 self._threads.pop(rid, None)
-            self.store.fail_launch(rid, exc)
+            try:
+                self.store.fail_launch(rid, exc)
+            except BaseException:
+                pass
             raise
         # Give the worker a tiny scheduling window so callers usually see
         # ``running`` for trivial scripts, but never wait on user work.
@@ -492,6 +503,7 @@ class BackgroundWorkflowRunManager:
                 kanban_backend=kwargs["kanban_backend"],
                 capability_registry=kwargs["capability_registry"],
                 capability_policy=kwargs["capability_policy"],
+                control_store=kwargs["control_store"],
             )
             self.store.finish(run_id, result)
         except BaseException as exc:  # defensive boundary: never let a worker vanish silently.

@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -139,9 +140,14 @@ class VMLimits:
     max_agent_calls: int = 200
     max_kanban_calls: int = 100
     max_capability_calls: int = 100
+    max_parallel: int = 8
     max_runtime_s: float = 30.0
     allow_nested_workflows: bool = False
     token_budget: Optional[int] = None
+    # Schema-constrained prompt child agents may retry invalid/missing structured
+    # output before surfacing a typed ``schema`` denial. Counts retries after the
+    # initial attempt (``2`` => up to three child-agent invocations total).
+    max_schema_retries: int = 2
     # Durable suspend window for an unresolved ``on_block="pause"`` Kanban await
     # (issue #5). ``None`` (default) keeps the prior behaviour: a paused await
     # blocks in-process until the run deadline, then fails with ``kanban_timeout``.
@@ -269,6 +275,12 @@ class CapabilityBroker:
         self._capability_calls = 0
         self._tokens = 0
         self._replayed_calls = 0
+        self._lock = threading.Lock()
+        # Prompt-agent result cache for this process/run. Durable replays load the
+        # same shape from ReplayCache; this in-memory map avoids respawning a child
+        # twice for identical prompt/options within one live run.
+        self._prompt_results: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._recorded_prompt_fingerprints: set[str] = set()
         self.should_abort = False
         self.abort_reason: Optional[str] = None
         # Durable suspend signal (issue #5): set when an unresolved paused Kanban
@@ -436,16 +448,25 @@ class CapabilityBroker:
         transcript_start = 0.0
 
         try:
-            self._rpc_calls += 1
-            if self._rpc_calls > self._limits.max_rpc_calls:
-                self.should_abort = True
-                self.abort_reason = "aborted: capability hard-limit exceeded"
-                raise CapabilityDenied(
-                    f"max_rpc_calls ({self._limits.max_rpc_calls}) exceeded", code="limit_rpc"
-                )
-            if method not in _ALLOWED_METHODS:
-                raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
+            with self._lock:
+                self._rpc_calls += 1
+                if self._rpc_calls > self._limits.max_rpc_calls:
+                    self.should_abort = True
+                    self.abort_reason = "aborted: capability hard-limit exceeded"
+                    raise CapabilityDenied(
+                        f"max_rpc_calls ({self._limits.max_rpc_calls}) exceeded", code="limit_rpc"
+                    )
+                if method not in _ALLOWED_METHODS:
+                    raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
             self._check_run_control(call_id, method, params)
+
+            # Prompt-agent calls are resumable by a semantic fingerprint over the
+            # prompt/options. Prefer that cache over ordinal call-id replay so a
+            # matching completed live child call can be reused without respawning.
+            if method == "agent" and "prompt" in params:
+                prompt_replayed = self._maybe_prompt_cache_hit(call_id, params)
+                if prompt_replayed is not _MISS:
+                    return prompt_replayed
 
             # Replay: serve a deterministic call from the cache instead of
             # re-dispatching. A hit returns the recorded value without touching
@@ -507,6 +528,32 @@ class CapabilityBroker:
                 self._recorder.record(call_id, method, replay_args_hash(method, params), value)
             except Exception:  # noqa: BLE001 — persistence is best-effort.
                 pass
+        if method == "agent" and "prompt" in params:
+            try:
+                request = _prompt_agent_request(params)
+                fingerprint, args_hash = _prompt_agent_cache_identity(request)
+            except Exception:  # noqa: BLE001 — prompt metadata is best-effort after success.
+                request = None
+                fingerprint = ""
+                args_hash = ""
+            if request is not None and isinstance(value, dict):
+                with self._lock:
+                    self._prompt_results[fingerprint] = (args_hash, value)
+                    if (
+                        self._recorder is not None
+                        and fingerprint not in self._recorded_prompt_fingerprints
+                    ):
+                        try:
+                            self._recorder.record_prompt(fingerprint, method, args_hash, value)
+                            self._recorded_prompt_fingerprints.add(fingerprint)
+                        except Exception:  # noqa: BLE001 — persistence is best-effort.
+                            pass
+                try:
+                    self._emit_prompt_agent_event(
+                        "agent_result", call_id, request, fingerprint, ok=True, has_value=True
+                    )
+                except Exception:  # noqa: BLE001 — journaling is best-effort.
+                    pass
         try:
             self._emit(self._call_event(call_id, method, params, ok=True))
         except Exception:  # noqa: BLE001 — journaling is best-effort.
@@ -533,6 +580,87 @@ class CapabilityBroker:
                 return False
         return is_replayable(method, deterministic_runner=self._deterministic_runner)
 
+    def started_event(self, frame: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return a metadata-only start marker for parallel child calls.
+
+        Sequential calls keep the historical one-result-event journal shape.
+        Workflow-script ``parallel()`` and ``pipeline()`` calls annotate child
+        RPC frames with private index parameters; those calls get a separate
+        start marker so operators can see real dispatch timing without exposing
+        raw inputs.
+        """
+        params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        if not any(
+            key in params
+            for key in ("_parallel_index", "_pipeline_item_index", "_pipeline_stage_index")
+        ):
+            return None
+        event = self._call_event(
+            frame.get("id"),
+            frame.get("method"),
+            params,
+            ok=True,
+            event_type="rpc_call_start",
+        )
+        if "_parallel_index" in params:
+            event["parallel_index"] = params.get("_parallel_index")
+        return event
+
+    def _maybe_prompt_cache_hit(self, call_id: Any, params: dict[str, Any]) -> Any:
+        """Serve a completed ``agent(prompt, opts)`` result by semantic fingerprint."""
+        request = _prompt_agent_request(params)
+        fingerprint, args_hash = _prompt_agent_cache_identity(request)
+        value: Optional[dict[str, Any]] = None
+        entry_args_hash: Optional[str] = None
+        cache_source: Optional[str] = None
+
+        with self._lock:
+            cached = self._prompt_results.get(fingerprint)
+        if cached is not None:
+            entry_args_hash, value = cached
+            cache_source = "run"
+        elif self._replay is not None:
+            entry = self._replay.get_prompt(fingerprint)
+            if entry is not None:
+                if entry.method != "agent":
+                    self.should_abort = True
+                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: recorded method {entry.method!r}"
+                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                entry_args_hash = entry.args_hash
+                if not isinstance(entry.value, dict):
+                    self.should_abort = True
+                    self.abort_reason = f"prompt replay drift at fingerprint {fingerprint}: cached value is not an object"
+                    raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+                value = entry.value
+                cache_source = "replay"
+
+        if value is None or entry_args_hash is None:
+            return _MISS
+        if entry_args_hash != args_hash:
+            self.should_abort = True
+            self.abort_reason = (
+                f"prompt replay drift at fingerprint {fingerprint}: recorded arguments do not match"
+            )
+            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+        _validate_output(value, request.schema)
+        self._check_start_control(call_id, "agent", params)
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+            usage = _non_negative_token_usage(value)
+            if usage is not None:
+                self._tokens += usage
+            self._replayed_calls += 1
+        self._emit_prompt_agent_event(
+            "agent_cache_hit", call_id, request, fingerprint, ok=True, cache=cache_source
+        )
+        self._emit(self._call_event(call_id, "agent", params, ok=True, replayed=True))
+        if self._should_transcribe("agent", params):
+            self._transcript_cache_hit(call_id, "agent", params, value)
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": value, "budget": self._budget_info()}
+
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
 
@@ -545,12 +673,14 @@ class CapabilityBroker:
             return _MISS
         args_hash = replay_args_hash(method, params) if isinstance(params, dict) else ""
         if entry.method != method or entry.args_hash != args_hash:
-            self.should_abort = True
-            self.abort_reason = (
-                f"replay drift at call {call_id}: recorded {entry.method!r} does not "
-                f"match {method!r} (or arguments changed)"
-            )
-            raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
+            with self._lock:
+                self.should_abort = True
+                self.abort_reason = (
+                    f"replay drift at call {call_id}: recorded {entry.method!r} does not "
+                    f"match {method!r} (or arguments changed)"
+                )
+                abort_reason = self.abort_reason
+            raise CapabilityDenied(abort_reason, code="replay_mismatch")
         # Hit. Mirror the live accounting so cap-/budget-gated control flow in the
         # script reproduces the recorded run:
         #  * advance the soft per-method counters, so a later *non-cached* call
@@ -559,21 +689,23 @@ class CapabilityBroker:
         #  * re-apply the recorded non-negative token spend (a negative/absent
         #    value is ignored — the hard cap is not re-enforced on a faithful
         #    replay, so a tampered _tokens must not skew the budget downward).
-        if method == "agent":
-            self._agent_calls += 1
-        elif method == "kanban_agent":
-            self._kanban_calls += 1
-        elif method == "capability":
-            self._capability_calls += 1
-        if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
-            usage = entry.value.get("_tokens")
-            if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-                self._tokens += usage
-        self._replayed_calls += 1
+        with self._lock:
+            if method == "agent":
+                self._agent_calls += 1
+            elif method == "kanban_agent":
+                self._kanban_calls += 1
+            elif method == "capability":
+                self._capability_calls += 1
+            if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
+                usage = _non_negative_token_usage(entry.value)
+                if usage is not None:
+                    self._tokens += usage
+            self._replayed_calls += 1
+            budget = self._budget_info()
         if self._should_transcribe(method, params):
             self._transcript_cache_hit(call_id, method, params, entry.value)
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
-        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": self._budget_info()}
+        return {"t": rpc.T_RET, "id": call_id, "ok": True, "value": entry.value, "budget": budget}
 
     def _dispatch(self, call_id: Any, method: str, params: dict[str, Any]) -> Any:
         if method == "log":
@@ -603,12 +735,13 @@ class CapabilityBroker:
             name = normalize_capability_name(raw_name)
         except ValueError as exc:
             raise CapabilityDenied(str(exc), code="bad_request") from exc
-        self._check_token_budget()
-        self._capability_calls += 1
-        if self._capability_calls > self._limits.max_capability_calls:
-            raise CapabilityDenied(
-                f"max_capability_calls ({self._limits.max_capability_calls}) exceeded", code="limit_capability"
-            )
+        with self._lock:
+            self._check_token_budget()
+            self._capability_calls += 1
+            if self._capability_calls > self._limits.max_capability_calls:
+                raise CapabilityDenied(
+                    f"max_capability_calls ({self._limits.max_capability_calls}) exceeded", code="limit_capability"
+                )
         if self._capability_registry is None:
             raise CapabilityDenied("no capability registry configured for this run", code="capability_unavailable")
         capability = self._capability_registry.get(name)
@@ -630,9 +763,10 @@ class CapabilityBroker:
                 "replay": self._replay is not None,
             },
         )
-        usage = result.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-            self._tokens += usage
+        usage = _non_negative_token_usage(result)
+        if usage is not None:
+            with self._lock:
+                self._tokens += usage
         _validate_output(result, params.get("schema"))
         return result
 
@@ -646,12 +780,11 @@ class CapabilityBroker:
     def _handle_agent(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         if "prompt" in params:
             self._check_start_control(call_id, "agent", params)
-            return self._handle_prompt_agent(params)
+            return self._handle_prompt_agent(call_id, params)
 
         agent_id = params.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id:
             raise CapabilityDenied("agent call requires a non-empty 'agent_id'", code="bad_request")
-        self._check_token_budget()
         if is_kanban_runner_id(agent_id):
             raise CapabilityDenied(
                 f"reserved kanban runner id {agent_id!r} must be reached via kanban_agent", code="reserved_agent"
@@ -659,56 +792,103 @@ class CapabilityBroker:
         if not is_known_agent(agent_id):
             raise CapabilityDenied(f"unknown agent id {agent_id!r}", code="unknown_agent")
         self._check_start_control(call_id, "agent", params)
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            # Soft denial: the script may catch CapabilityError and adapt. The
-            # max_rpc_calls hard cap is the runaway backstop that aborts the VM.
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        with self._lock:
+            self._check_token_budget()
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                # Soft denial: the script may catch CapabilityError and adapt. The
+                # max_rpc_calls hard cap is the runaway backstop that aborts the VM.
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         payload = params.get("input") if isinstance(params.get("input"), dict) else {}
         return self._invoke(agent_id, payload, params.get("schema"))
 
-    def _handle_prompt_agent(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_prompt_agent(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
-        prompt = params.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
-        unknown = sorted(set(params) - ({"prompt"} | CHILD_AGENT_OPTION_KEYS))
-        if unknown:
-            raise CapabilityDenied(
-                "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
-            )
-        self._check_token_budget()
-        self._agent_calls += 1
-        if self._agent_calls > self._limits.max_agent_calls:
-            raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        request = _prompt_agent_request(params)
+        with self._lock:
+            self._check_token_budget()
+            # Count the script-visible prompt agent call once; schema retries below may
+            # cross the child-runner boundary again but remain bounded by max_schema_retries.
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
         if self._child_runner is None:
             raise CapabilityDenied(
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
             )
 
-        request = ChildAgentRequest(
-            prompt=prompt,
-            label=_optional_str(params, "label"),
-            phase=_optional_str(params, "phase"),
-            schema=_optional_dict(params, "schema"),
-            model=_optional_str(params, "model"),
-            effort=_optional_str(params, "effort"),
-            isolation=_optional_str(params, "isolation"),
-            context=_optional_dict(params, "context") or {},
+        fingerprint, _args_hash = _prompt_agent_cache_identity(request)
+        self._emit_prompt_agent_event("agent_started", call_id, request, fingerprint, ok=True)
+        return self._invoke_prompt_agent_with_schema_retry(call_id, request)
+
+    def _invoke_prompt_agent_with_schema_retry(
+        self, call_id: Any, request: ChildAgentRequest
+    ) -> dict[str, Any]:
+        """Invoke a prompt child agent, retrying schema-invalid structured output."""
+
+        assert self._child_runner is not None
+        retry_limit = max(0, int(self._limits.max_schema_retries))
+        attempts = retry_limit + 1
+        base_context = dict(request.context)
+        last_error: Optional[CapabilityDenied] = None
+
+        for attempt in range(1, attempts + 1):
+            effective_request = request
+            if last_error is not None:
+                effective_request = _request_with_schema_retry_context(
+                    request,
+                    base_context=base_context,
+                    attempt=attempt,
+                    max_retries=retry_limit,
+                    error=last_error,
+                )
+            try:
+                output = self._child_runner(effective_request)
+                if not isinstance(output, dict):
+                    raise CapabilityDenied(
+                        f"prompt child agent returned {type(output).__name__}, expected dict", code="schema"
+                    )
+                safe_output = redact_credentials(_json_safe(output))
+                assert isinstance(safe_output, dict)
+                _validate_output(safe_output, effective_request.schema)
+            except CapabilityDenied as exc:
+                if exc.code != "schema" or attempt >= attempts:
+                    if exc.code == "schema" and attempt >= attempts:
+                        raise CapabilityDenied(
+                            f"schema validation failed after {attempts} attempt(s): {exc}", code="schema"
+                        ) from exc
+                    raise
+                self._record_schema_retry(call_id, request, attempt, retry_limit)
+                last_error = exc
+                continue
+
+            usage = _non_negative_token_usage(safe_output)
+            if usage is not None:
+                with self._lock:
+                    self._tokens += usage
+            return safe_output
+
+        raise CapabilityDenied("schema validation failed after retry exhaustion", code="schema")
+
+    def _record_schema_retry(
+        self,
+        call_id: Any,
+        request: ChildAgentRequest,
+        attempt: int,
+        max_retries: int,
+    ) -> None:
+        """Journal a redacted schema-retry attempt for progress/status consumers."""
+        event = self._call_event(
+            call_id,
+            "agent",
+            {"agent_id": "prompt", "label": request.label, "phase": request.phase},
+            ok=False,
+            error="schema_retry",
         )
-        output = self._child_runner(request)
-        if not isinstance(output, dict):
-            raise CapabilityDenied(
-                f"prompt child agent returned {type(output).__name__}, expected dict", code="bad_output"
-            )
-        safe_output = redact_credentials(_json_safe(output))
-        assert isinstance(safe_output, dict)
-        _validate_output(safe_output, request.schema)
-        usage = safe_output.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
-            self._tokens += usage
-        return safe_output
+        event["attempt"] = attempt
+        event["max_retries"] = max_retries
+        self._emit(event)
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         profile = params.get("profile")
@@ -719,11 +899,12 @@ class CapabilityBroker:
         except ValueError as exc:
             raise CapabilityDenied(str(exc), code="bad_request") from exc
         self._check_start_control(call_id, "kanban_agent", params)
-        self._check_token_budget()
-        self._kanban_calls += 1
-        if self._kanban_calls > self._limits.max_kanban_calls:
-            # Soft denial (see _handle_agent): catchable; max_rpc_calls aborts.
-            raise CapabilityDenied(f"max_kanban_calls ({self._limits.max_kanban_calls}) exceeded", code="limit_kanban")
+        with self._lock:
+            self._check_token_budget()
+            self._kanban_calls += 1
+            if self._kanban_calls > self._limits.max_kanban_calls:
+                # Soft denial (see _handle_agent): catchable; max_rpc_calls aborts.
+                raise CapabilityDenied(f"max_kanban_calls ({self._limits.max_kanban_calls}) exceeded", code="limit_kanban")
 
         if self._kanban_backend is not None:
             return self._handle_kanban_durable(call_id, profile, on_block, params)
@@ -774,13 +955,33 @@ class CapabilityBroker:
         a failure. The metadata-only journal ``call`` event is emitted by the
         :class:`CapabilityDenied` path in :meth:`handle` (error ``kanban_suspended``).
         """
-        self.should_suspend = True
-        self.suspend_info = {
-            "card_id": card_id,
-            "profile": profile,
-            "call_id": call_id,
-            "on_block": on_block,
-        }
+        with self._lock:
+            self.should_suspend = True
+            self.suspend_info = {
+                "card_id": card_id,
+                "profile": profile,
+                "call_id": call_id,
+                "on_block": on_block,
+            }
+
+    def control_state(self) -> tuple[
+        bool, Optional[str], bool, Optional[dict[str, Any]], bool, Optional[dict[str, Any]], bool, Optional[dict[str, Any]]
+    ]:
+        """Return broker terminal control flags under one lock for driver threads."""
+        with self._lock:
+            suspend_info = dict(self.suspend_info) if self.suspend_info is not None else None
+            pause_info = dict(self.pause_info) if self.pause_info is not None else None
+            stop_info = dict(self.stop_info) if self.stop_info is not None else None
+            return (
+                self.should_abort,
+                self.abort_reason,
+                self.should_suspend,
+                suspend_info,
+                self.should_pause,
+                pause_info,
+                self.should_stop,
+                stop_info,
+            )
 
     def _kanban_idempotency_key(self, call_id: Any) -> str:
         """Stable key for one logical ``kanban_agent`` call.
@@ -836,9 +1037,10 @@ class CapabilityBroker:
             result["reason"] = resolution.reason
         if diagnostics:
             result["diagnostics"] = diagnostics
-        usage = (resolution.result or {}).get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
-            self._tokens += usage
+        usage = _non_negative_token_usage(resolution.result or {})
+        if usage is not None:
+            with self._lock:
+                self._tokens += usage
         return result
 
     def _await_valid_kanban_result(
@@ -968,10 +1170,39 @@ class CapabilityBroker:
                 f"agent {agent_id!r} returned {type(output).__name__}, expected dict", code="bad_output"
             )
         _validate_output(output, schema)
-        usage = output.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
-            self._tokens += usage
+        usage = _non_negative_token_usage(output)
+        if usage is not None:
+            with self._lock:
+                self._tokens += usage
         return output
+
+    def _emit_prompt_agent_event(
+        self,
+        event_type: str,
+        call_id: Any,
+        request: ChildAgentRequest,
+        fingerprint: str,
+        *,
+        ok: bool,
+        cache: Optional[str] = None,
+        has_value: Optional[bool] = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "type": event_type,
+            "call_id": call_id,
+            "method": "agent",
+            "fingerprint": fingerprint,
+            "ok": ok,
+        }
+        if request.label:
+            event["label"] = safe_capability_metadata_value(request.label)
+        if request.phase:
+            event["phase"] = safe_capability_metadata_value(request.phase)
+        if cache is not None:
+            event["cache"] = cache
+        if has_value is not None:
+            event["has_value"] = has_value
+        self._emit(event)
 
     def _call_event(
         self,
@@ -982,10 +1213,17 @@ class CapabilityBroker:
         ok: bool,
         error: Optional[str] = None,
         replayed: bool = False,
+        event_type: str = "rpc_call",
     ) -> dict[str, Any]:
-        event: dict[str, Any] = {"type": "rpc_call", "call_id": call_id, "method": method, "ok": ok}
+        event: dict[str, Any] = {"type": event_type, "call_id": call_id, "method": method, "ok": ok}
         if method in ("agent",):
             event["agent_id"] = params.get("agent_id")
+            if "prompt" in params:
+                try:
+                    request = _prompt_agent_request(params)
+                    event["fingerprint"] = _prompt_agent_cache_identity(request)[0]
+                except CapabilityDenied:
+                    pass
         if method in ("kanban_agent",):
             event["profile"] = params.get("profile")
         if method in ("capability",):
@@ -994,6 +1232,12 @@ class CapabilityBroker:
             event["phase_title"] = safe_capability_metadata_value(params.get("title"))
         if params.get("label"):
             event["label"] = safe_capability_metadata_value(params.get("label"))
+        if "_parallel_index" in params:
+            event["parallel_index"] = params.get("_parallel_index")
+        if "_pipeline_item_index" in params:
+            event["pipeline_item_index"] = params.get("_pipeline_item_index")
+        if "_pipeline_stage_index" in params:
+            event["pipeline_stage_index"] = params.get("_pipeline_stage_index")
         if params.get("phase"):
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if error:
@@ -1024,6 +1268,14 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
             )
 
 
+def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
+    """Return valid broker token usage, ignoring bools and negative values."""
+    usage = output.get("_tokens")
+    if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        return usage
+    return None
+
+
 def _optional_str(params: dict[str, Any], key: str) -> Optional[str]:
     value = params.get(key)
     if value is None:
@@ -1040,6 +1292,91 @@ def _optional_dict(params: dict[str, Any], key: str) -> Optional[dict[str, Any]]
     if isinstance(value, dict):
         return value
     raise CapabilityDenied(f"prompt agent option {key!r} must be an object", code="bad_request")
+
+
+def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
+    """Validate and normalize the parent-side prompt-agent request."""
+    prompt = params.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise CapabilityDenied("prompt agent call requires a non-empty 'prompt'", code="bad_request")
+    # parallel()/pipeline() annotate child frames with private dispatch-index
+    # params; they are internal scheduling metadata, not script-supplied options.
+    unknown = sorted(
+        set(params)
+        - ({"prompt"} | CHILD_AGENT_OPTION_KEYS
+           | {"_parallel_index", "_pipeline_item_index", "_pipeline_stage_index"})
+    )
+    if unknown:
+        raise CapabilityDenied(
+            "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
+        )
+    return ChildAgentRequest(
+        prompt=prompt,
+        label=_optional_str(params, "label"),
+        phase=_optional_str(params, "phase"),
+        schema=_optional_dict(params, "schema"),
+        model=_optional_str(params, "model"),
+        effort=_optional_str(params, "effort"),
+        isolation=_optional_str(params, "isolation"),
+        context=_optional_dict(params, "context") or {},
+    )
+
+
+def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, Any]:
+    """Semantic prompt-agent identity payload.
+
+    All currently supported options are semantic for child-agent dispatch, so none
+    are excluded: label, phase, schema, model, effort, isolation, and context all
+    participate alongside the prompt. Omitted and explicit ``None`` normalize to
+    the same JSON ``null`` value.
+    """
+    return {
+        "prompt": request.prompt,
+        "label": request.label,
+        "phase": request.phase,
+        "schema": request.schema,
+        "model": request.model,
+        "effort": request.effort,
+        "isolation": request.isolation,
+        "context": request.context,
+    }
+
+
+def _prompt_agent_cache_identity(request: ChildAgentRequest) -> tuple[str, str]:
+    payload = _prompt_agent_fingerprint_payload(request)
+    fingerprint = "v2:" + canonical_hash(
+        {"kind": "agent(prompt,opts)", "version": 2, "request": payload}
+    )
+    args_hash = canonical_hash({"method": "agent", "fingerprint": fingerprint, "request": payload})
+    return fingerprint, args_hash
+
+
+def _request_with_schema_retry_context(
+    request: ChildAgentRequest,
+    *,
+    base_context: dict[str, Any],
+    attempt: int,
+    max_retries: int,
+    error: CapabilityDenied,
+) -> ChildAgentRequest:
+    """Return ``request`` with validation-error context for a retry attempt."""
+    context = dict(base_context)
+    context["schema_validation_error"] = {
+        "attempt": attempt,
+        "max_retries": max_retries,
+        "code": error.code,
+        "message": str(error),
+    }
+    return ChildAgentRequest(
+        prompt=request.prompt,
+        label=request.label,
+        phase=request.phase,
+        schema=request.schema,
+        model=request.model,
+        effort=request.effort,
+        isolation=request.isolation,
+        context=context,
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -1185,6 +1522,59 @@ class WorkflowVM:
         suspended: Optional[dict[str, Any]] = None
         paused: Optional[dict[str, Any]] = None
         stopped: Optional[dict[str, Any]] = None
+        parent_calls_still_running: list[dict[str, Any]] = []
+        parent_calls_cancelled_before_start: list[dict[str, Any]] = []
+        state_lock = threading.Lock()
+        child_terminal = threading.Event()
+        run_deadline = time.monotonic() + self._limits.max_runtime_s
+
+        def _call_info(frame: dict[str, Any]) -> dict[str, Any]:
+            params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+            info: dict[str, Any] = {"call_id": frame.get("id"), "method": frame.get("method")}
+            if "_parallel_index" in params:
+                info["parallel_index"] = params.get("_parallel_index")
+            if frame.get("method") == "agent":
+                info["agent_id"] = params.get("agent_id") or params.get("prompt")
+            elif frame.get("method") == "kanban_agent":
+                info["profile"] = params.get("profile")
+            elif frame.get("method") == "capability":
+                info["capability"] = safe_capability_metadata_value(params.get("name"))
+            return info
+
+        def _set_protocol_error(message: str) -> None:
+            nonlocal protocol_error
+            with state_lock:
+                if protocol_error is None and not child_terminal.is_set():
+                    protocol_error = message
+
+        def _set_suspended(info: dict[str, Any]) -> None:
+            nonlocal suspended
+            with state_lock:
+                if suspended is None and not child_terminal.is_set():
+                    suspended = dict(info)
+
+        def _set_paused(info: dict[str, Any]) -> None:
+            nonlocal paused
+            with state_lock:
+                if paused is None and not child_terminal.is_set():
+                    paused = dict(info)
+
+        def _set_stopped(info: dict[str, Any]) -> None:
+            nonlocal stopped
+            with state_lock:
+                if stopped is None and not child_terminal.is_set():
+                    stopped = dict(info)
+
+        def _state_snapshot() -> tuple[
+            Optional[str], Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[dict[str, Any]]
+        ]:
+            with state_lock:
+                return (
+                    protocol_error,
+                    dict(suspended) if suspended is not None else None,
+                    dict(paused) if paused is not None else None,
+                    dict(stopped) if stopped is not None else None,
+                )
 
         try:
             assert proc.stdin is not None and proc.stdout is not None
@@ -1196,7 +1586,9 @@ class WorkflowVM:
                     "max_rpc_calls": self._limits.max_rpc_calls,
                     "max_agent_calls": self._limits.max_agent_calls,
                     "max_capability_calls": self._limits.max_capability_calls,
+                    "max_parallel": self._limits.max_parallel,
                     "max_runtime_s": self._limits.max_runtime_s,
+                    "max_schema_retries": self._limits.max_schema_retries,
                 },
                 "budget": {"total": self._limits.token_budget, "spent": 0,
                            "remaining": self._limits.token_budget},
@@ -1204,52 +1596,103 @@ class WorkflowVM:
             booted = True
             try:
                 rpc.write_frame(proc.stdin, boot)
-            except (BrokenPipeError, OSError) as exc:
-                protocol_error = f"child closed stdin before boot: {exc}"
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                _set_protocol_error(f"child closed stdin before boot: {exc}")
                 booted = False
 
-            while booted:
+            ret_executor = ThreadPoolExecutor(max_workers=max(1, int(self._limits.max_parallel or 1)))
+            ret_write_lock = threading.Lock()
+            pending_rets: set[Future[Any]] = set()
+            pending_info: dict[Future[Any], dict[str, Any]] = {}
+
+            def _handle_and_reply(call_frame: dict[str, Any]) -> None:
+                ret = broker.handle(call_frame)
                 try:
-                    frame = rpc.read_frame(proc.stdout)
-                except rpc.RPCProtocolError as exc:
-                    protocol_error = str(exc)
-                    break
-                if frame is None:
-                    break  # EOF: child exited (cleanly after done, or crashed).
-                kind = frame.get("t")
-                if kind == rpc.T_READY:
-                    meta = frame.get("meta")
-                elif kind == rpc.T_CALL:
-                    ret = broker.handle(frame)
-                    try:
+                    with ret_write_lock:
                         rpc.write_frame(proc.stdin, ret)
-                    except (BrokenPipeError, OSError) as exc:
-                        protocol_error = f"child stdin closed: {exc}"
+                except (BrokenPipeError, OSError, ValueError) as exc:
+                    _set_protocol_error(f"child stdin closed: {exc}")
+                    return
+                (
+                    should_abort,
+                    abort_reason,
+                    should_suspend,
+                    suspend_info,
+                    should_pause,
+                    pause_info,
+                    should_stop,
+                    stop_info,
+                ) = broker.control_state()
+                if should_stop:
+                    _kill(proc)
+                    _set_stopped(stop_info or {})
+                if should_pause:
+                    _kill(proc)
+                    _set_paused(pause_info or {})
+                if should_abort:
+                    _kill(proc)
+                    _set_protocol_error(abort_reason or "aborted: capability hard-limit exceeded")
+                if should_suspend:
+                    # An unresolved paused Kanban await suspended the run: tear
+                    # the subprocess down (the script's local state is discarded;
+                    # a resume re-runs it from the replay cache) and report a
+                    # resumable suspended run rather than a failure.
+                    _kill(proc)
+                    _set_suspended(suspend_info or {})
+
+            def _collect_done_futures(futures: set[Future[Any]]) -> None:
+                for fut in futures:
+                    exc = fut.exception()
+                    if exc is not None:
+                        _set_protocol_error(f"broker reply worker failed: {type(exc).__name__}: {exc}")
+
+            try:
+                while booted:
+                    done_futures = {fut for fut in pending_rets if fut.done()}
+                    pending_rets.difference_update(done_futures)
+                    _collect_done_futures(done_futures)
+                    state_error, state_suspended, state_paused, state_stopped = _state_snapshot()
+                    if (
+                        state_error is not None
+                        or state_suspended is not None
+                        or state_paused is not None
+                        or state_stopped is not None
+                    ):
                         break
-                    if broker.should_stop:
-                        _kill(proc)
-                        stopped = broker.stop_info or {}
+                    try:
+                        frame = rpc.read_frame(proc.stdout)
+                    except rpc.RPCProtocolError as exc:
+                        _set_protocol_error(str(exc))
                         break
-                    if broker.should_pause:
-                        _kill(proc)
-                        paused = broker.pause_info or {}
+                    if frame is None:
+                        break  # EOF: child exited (cleanly after done, or crashed).
+                    kind = frame.get("t")
+                    if kind == rpc.T_READY:
+                        meta = frame.get("meta")
+                    elif kind == rpc.T_CALL:
+                        started = broker.started_event(frame)
+                        if started is not None:
+                            broker._emit(started)
+                        fut = ret_executor.submit(_handle_and_reply, frame)
+                        pending_rets.add(fut)
+                        pending_info[fut] = _call_info(frame)
+                    elif kind == rpc.T_DONE:
+                        done = frame
+                        child_terminal.set()
                         break
-                    if broker.should_abort:
-                        _kill(proc)
-                        protocol_error = broker.abort_reason or "aborted: capability hard-limit exceeded"
-                        break
-                    if broker.should_suspend:
-                        # An unresolved paused Kanban await suspended the run: tear
-                        # the subprocess down (the script's local state is discarded;
-                        # a resume re-runs it from the replay cache) and report a
-                        # resumable suspended run rather than a failure.
-                        _kill(proc)
-                        suspended = broker.suspend_info or {}
-                        break
-                elif kind == rpc.T_DONE:
-                    done = frame
-                    break
-                # Unknown frame types are ignored (forward-compatible).
+                    # Unknown frame types are ignored (forward-compatible).
+            finally:
+                if pending_rets:
+                    remaining = max(0.0, run_deadline - time.monotonic())
+                    finished, unfinished = wait(pending_rets, timeout=remaining)
+                    _collect_done_futures(finished)
+                    for fut in unfinished:
+                        info = pending_info.get(fut, {"call_id": None, "method": "unknown"})
+                        if fut.cancel():
+                            parent_calls_cancelled_before_start.append(info)
+                        else:
+                            parent_calls_still_running.append(info)
+                ret_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             timer.cancel()
             _close(proc.stdin)
@@ -1268,37 +1711,54 @@ class WorkflowVM:
         stderr_text = "".join(stderr_chunks)[-4000:]
         exit_code = proc.returncode
 
-        if timed_out.is_set():
+        state_protocol_error, state_suspended, state_paused, state_stopped = _state_snapshot()
+        if parent_calls_still_running:
+            error: dict[str, Any] = {
+                "type": "WorkflowSubprocessError",
+                "message": (
+                    "parent-side RPC work is still running after workflow terminal state; "
+                    "running ThreadPoolExecutor calls cannot be cancelled"
+                ),
+                "parent_calls_still_running": parent_calls_still_running,
+            }
+            if parent_calls_cancelled_before_start:
+                error["parent_calls_cancelled_before_start"] = parent_calls_cancelled_before_start
+            if isinstance(done, dict) and done.get("error") is not None:
+                error["child_error"] = done.get("error")
+            return ScriptRunResult(
+                ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text, error=error,
+            )
+        if timed_out.is_set() and done is None and state_suspended is None:
             return ScriptRunResult(
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
                 error={"type": "WorkflowSubprocessError",
                        "message": f"workflow timed out after {self._limits.max_runtime_s}s"},
             )
-        if stopped is not None:
+        if state_stopped is not None:
             return ScriptRunResult(
                 ok=False, stopped=True, meta=meta, calls=calls,
                 exit_code=exit_code, stderr=stderr_text,
-                error={"type": "WorkflowStopped", **stopped},
+                error={"type": "WorkflowStopped", **state_stopped},
             )
-        if paused is not None:
+        if state_paused is not None:
             return ScriptRunResult(
                 ok=False, paused=True, meta=meta, calls=calls,
                 exit_code=exit_code, stderr=stderr_text,
-                error={"type": "WorkflowPaused", **paused},
+                error={"type": "WorkflowPaused", **state_paused},
             )
-        if suspended is not None:
+        if state_suspended is not None:
             # Durable, resumable suspension (issue #5) — not a failure. The error
             # payload is metadata-safe (card id is a content-address, profile is a
             # role name) so it can live on the operator-facing run.json.
             return ScriptRunResult(
                 ok=False, suspended=True, meta=meta, calls=calls,
                 exit_code=exit_code, stderr=stderr_text,
-                error={"type": "KanbanSuspended", **suspended},
+                error={"type": "KanbanSuspended", **state_suspended},
             )
-        if protocol_error is not None:
+        if state_protocol_error is not None:
             return ScriptRunResult(
                 ok=False, meta=meta, calls=calls, exit_code=exit_code, stderr=stderr_text,
-                error={"type": "WorkflowSubprocessError", "message": protocol_error},
+                error={"type": "WorkflowSubprocessError", "message": state_protocol_error},
             )
         if done is None:
             return ScriptRunResult(
@@ -1374,9 +1834,11 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "max_agent_calls": limits.max_agent_calls,
         "max_kanban_calls": limits.max_kanban_calls,
         "max_capability_calls": limits.max_capability_calls,
+        "max_parallel": limits.max_parallel,
         "max_runtime_s": limits.max_runtime_s,
         "allow_nested_workflows": limits.allow_nested_workflows,
         "token_budget": limits.token_budget,
+        "max_schema_retries": limits.max_schema_retries,
         "kanban_suspend_after_s": limits.kanban_suspend_after_s,
     }
 
@@ -1511,11 +1973,13 @@ def _limits_from_view(view: Any) -> VMLimits:
         max_agent_calls=_req_int(view, "max_agent_calls", default.max_agent_calls),
         max_kanban_calls=_req_int(view, "max_kanban_calls", default.max_kanban_calls),
         max_capability_calls=_req_int(view, "max_capability_calls", default.max_capability_calls),
+        max_parallel=_req_int(view, "max_parallel", default.max_parallel),
         max_runtime_s=_req_float(view, "max_runtime_s", default.max_runtime_s),
         allow_nested_workflows=_req_bool(
             view, "allow_nested_workflows", default.allow_nested_workflows
         ),
         token_budget=_req_token_budget(view, default.token_budget),
+        max_schema_retries=_req_int(view, "max_schema_retries", default.max_schema_retries),
         kanban_suspend_after_s=_req_opt_float(
             view, "kanban_suspend_after_s", default.kanban_suspend_after_s
         ),

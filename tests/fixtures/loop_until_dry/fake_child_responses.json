@@ -1,0 +1,57 @@
+{
+  "finders": {
+    "1": {
+      "totals": {
+        "bugs": [
+          {
+            "id": "cart-total-duplicate",
+            "title": "cart total double-counts quantity when a discount is present",
+            "severity": "high"
+          }
+        ],
+        "followups": ["discounts"]
+      },
+      "state": {
+        "bugs": [
+          {
+            "id": "cart-total-duplicate",
+            "title": "duplicate report of the totals bug from state scan",
+            "severity": "high"
+          },
+          {
+            "id": "cart-state-reset",
+            "title": "restoring a cart snapshot drops the selected discount",
+            "severity": "medium"
+          }
+        ],
+        "followups": []
+      },
+      "accessibility": {
+        "bugs": [],
+        "followups": []
+      }
+    },
+    "2": {
+      "discounts": {
+        "bugs": [
+          {
+            "id": "cart-total-duplicate",
+            "title": "known totals bug still explains the discount path",
+            "severity": "high"
+          }
+        ],
+        "followups": []
+      }
+    }
+  },
+  "verifiers": {
+    "cart-total-duplicate": {
+      "unit": {"verdict": "confirmed", "notes": "unit reproducer catches duplicate total"},
+      "integration": {"verdict": "confirmed", "notes": "checkout integration sees inflated total"}
+    },
+    "cart-state-reset": {
+      "unit": {"verdict": "confirmed", "notes": "restoreCart loses discount fixture"},
+      "integration": {"verdict": "confirmed", "notes": "reload flow drops selected discount"}
+    }
+  }
+}
