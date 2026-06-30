@@ -34,6 +34,11 @@ from hermes_workflows.registry import FileRunStore  # noqa: E402
 from hermes_workflows.catalog import FileWorkflowCatalog  # noqa: E402
 from hermes_workflows.script_catalog import FileWorkflowScriptCatalog  # noqa: E402
 from hermes_workflows import controls as _controls  # noqa: E402
+from hermes_workflows.background import (  # noqa: E402
+    BackgroundRunRecord,
+    BackgroundRunStore,
+    BackgroundWorkflowRunManager,
+)
 from hermes_workflows.controls import FileControlStore  # noqa: E402
 from hermes_workflows.script_store import ScriptRunStore  # noqa: E402
 
@@ -127,6 +132,20 @@ def _plugin_script_run_store(session_id: Optional[str] = None) -> ScriptRunStore
     return ScriptRunStore(str(root))
 
 
+def _plugin_background_store(session_id: Optional[str] = None) -> BackgroundRunStore:
+    root = _state_root() / "background-runs"
+    if session_id:
+        root = root / session_id
+    return BackgroundRunStore(str(root))
+
+
+def _plugin_background_manager(session_id: Optional[str] = None) -> BackgroundWorkflowRunManager:
+    return BackgroundWorkflowRunManager(
+        _plugin_background_store(session_id=session_id),
+        _plugin_script_run_store(session_id=session_id),
+    )
+
+
 def _session_id_from_kwargs(kwargs: dict[str, Any]) -> Optional[str]:
     """Extract a Hermes session id from dispatched kwargs when available."""
     parent_agent = kwargs.get("parent_agent")
@@ -215,6 +234,17 @@ WORKFLOW_SCHEMA = {
                 "minimum": 1,
                 "description": "Optional saved script harness version.",
                 "default": None,
+            },
+            "execution_mode": {
+                "type": ["string", "null"],
+                "enum": ["foreground", "background", None],
+                "description": "For action=run_script, run inline (foreground) or launch a local durable background run.",
+                "default": None,
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Shortcut for execution_mode=background on action=run_script.",
+                "default": False,
             },
             "include_source": {
                 "type": "boolean",
@@ -411,8 +441,16 @@ WORKFLOW_CONTROL_SCHEMA = {
 }
 
 
-def _control_link_resolver(store: FileRunStore):
+def _control_link_resolver(store: FileRunStore, *, session_id: Optional[str] = None):
     def resolve(record: Any) -> dict[str, Any]:
+        if isinstance(record, BackgroundRunRecord):
+            run_dir = _plugin_background_store(session_id=session_id).root / record.run_id
+            return _controls.run_links(
+                run_id=record.run_id,
+                journal_path=str(run_dir / "journal.jsonl"),
+                result_path=str(run_dir / "run.json"),
+                extra={"script_run_journal": record.journal_path} if record.journal_path else None,
+            )
         run_dir = store.root / record.run_id
         return _controls.run_links(
             run_id=record.run_id,
@@ -472,6 +510,11 @@ def _known_run(run_id: str, *, session_id: Optional[str]) -> bool:
         pass
     except Exception:  # pragma: no cover - defensive; control verbs fail closed below.
         pass
+    try:
+        if _plugin_background_store(session_id=session_id).get(run_id) is not None:
+            return True
+    except Exception:  # pragma: no cover - defensive; background status is best-effort
+        pass
     return bool(_loop_waits(run_id=run_id))
 
 
@@ -495,11 +538,12 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         if action == "overview":
             run_store = _plugin_store(session_id=session_id)
             waits = _kanban_waits(_plugin_script_store()) + _loop_waits()
+            records = [*run_store.list(), *_plugin_background_store(session_id=session_id).list()]
             overview = _controls.list_runs(
-                run_store.list(),
+                records,
                 control_store,
                 waits=waits,
-                link_resolver=_control_link_resolver(run_store),
+                link_resolver=_control_link_resolver(run_store, session_id=session_id),
                 limit=params.get("limit", 20),
             )
             return _ok({"operation": "overview", **overview})
@@ -514,11 +558,14 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
             record = run_store.get(run_id)
             script_store = _plugin_script_run_store(session_id=session_id)
             script_record = None
+            background_record = None
             if record is None:
                 try:
                     script_record = script_store.load_run(run_id)
                 except (ScriptRunStoreError, ValueError):
                     script_record = None
+            if record is None and script_record is None:
+                background_record = _plugin_background_store(session_id=session_id).get(run_id)
             state = _controls.project_control_state(run_id, control_store.list_for(run_id))
             waits = [
                 w
@@ -527,7 +574,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
             ]
             if record is not None:
                 events = run_store.journal(run_id, limit=params.get("events_limit", 10))
-                links = _control_link_resolver(run_store)(record)
+                links = _control_link_resolver(run_store, session_id=session_id)(record)
                 lifecycle = record.status
                 current_phase = _controls.current_phase(record.steps)
                 progress = record.to_status().progress.as_dict()
@@ -543,6 +590,15 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 progress = {"phases_total": len(phases)}
                 result = script_record.value
                 error = script_record.error
+            elif background_record is not None:
+                events = _plugin_background_store(session_id=session_id).journal(run_id, limit=params.get("events_limit", 10))
+                links = _control_link_resolver(run_store, session_id=session_id)(background_record)
+                lifecycle = background_record.status
+                current_phase = None
+                progress = None
+                result = background_record.result
+                error = background_record.error
+                phases = None
             else:
                 events = []
                 links = {"run_id": run_id}
@@ -590,6 +646,10 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         if not _known_run(run_id, session_id=session_id):
             raise ControlError(f"unknown workflow run: {run_id!r}")
         control = verbs[action]()
+        if action == "stop":
+            background_store = _plugin_background_store(session_id=session_id)
+            if background_store.get(run_id) is not None:
+                background_store.stop(run_id, reason=params.get("reason"))
         state = _controls.project_control_state(run_id, control_store.list_for(run_id))
         return _ok({"operation": action, "control": control.to_dict(), "control_state": state.to_dict()})
     except WorkflowError as exc:
@@ -612,6 +672,8 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             script_source=params.get("script_source"),
             script_args=params.get("script_args"),
             script_version=params.get("script_version"),
+            execution_mode=params.get("execution_mode"),
+            background=params.get("background", False),
             include_source=params.get("include_source", False),
             include_versions=params.get("include_versions", False),
             replace=params.get("replace", False),
@@ -620,6 +682,7 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             catalog=_plugin_catalog(),
             script_catalog=_plugin_script_catalog(),
             script_store=_plugin_script_run_store(session_id=session_id),
+            background_manager=_plugin_background_manager(session_id=session_id),
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),

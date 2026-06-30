@@ -14,6 +14,7 @@ from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
 from .agents import AgentRunner, StubAgentRunner
+from .background import BackgroundWorkflowRunManager
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
 from .errors import WorkflowValidationError
@@ -67,6 +68,9 @@ def workflow(
     replace: bool = False,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    execution_mode: Optional[str] = None,
+    background: bool = False,
+    background_manager: Optional[BackgroundWorkflowRunManager] = None,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
 
@@ -152,6 +156,31 @@ def workflow(
     if op == "run_script":
         if not script_name:
             raise ValueError("workflow run_script requires 'script_name'")
+        mode = _execution_mode(execution_mode=execution_mode, background=background)
+        if mode == "background":
+            active_catalog = script_catalog if script_catalog is not None else FileWorkflowScriptCatalog()
+            source = active_catalog.load_script(script_name, version=script_version)
+            active_store = script_store if script_store is not None else ScriptRunStore(".hermes-workflow-script-runs")
+            manager = background_manager or BackgroundWorkflowRunManager.from_script_store(active_store)
+            record = manager.launch_script(
+                source,
+                args=script_args,
+                script_name=script_name,
+                script_version=script_version,
+                agent_runner=agent_runner,
+                validate=validate,
+                run_id=run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+            )
+            return {
+                "operation": "run_script",
+                "script_name": script_name,
+                "execution_mode": "background",
+                "run_id": record.run_id,
+                "status": record.status,
+                "background": record.to_dict(),
+            }
         result = workflow_run_script(
             script_name,
             args=script_args,
@@ -163,8 +192,18 @@ def workflow(
             capability_registry=capability_registry,
             capability_policy=capability_policy,
         )
-        return {"operation": "run_script", "script_name": script_name, "result": result.as_dict()}
+        return {"operation": "run_script", "script_name": script_name, "execution_mode": "foreground", "result": result.as_dict()}
     raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
+
+
+def _execution_mode(*, execution_mode: Optional[str], background: bool) -> str:
+    """Normalize the script execution mode used by the model-facing facade."""
+    mode = execution_mode or ("background" if background else "foreground")
+    if mode not in {"foreground", "background"}:
+        raise ValueError("execution_mode must be 'foreground' or 'background'")
+    if background and execution_mode == "foreground":
+        raise ValueError("background=True conflicts with execution_mode='foreground'")
+    return mode
 
 
 def _run_and_status(
