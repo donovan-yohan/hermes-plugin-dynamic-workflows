@@ -1483,14 +1483,17 @@ Near-term and future work, roughly in priority order:
    fan-out adapter; surface concurrency, timeouts, and retry policy through the
    Protocol while preserving deterministic stubbing for tests.
 
-2. **True asynchronous execution.** Move from the deterministic synchronous
-   scheduler to real concurrent fan-out honoring `max_parallel` and the per-
-   definition `policy.max_parallel`, with backpressure and cancellation
-   (`status='cancelled'`). The operator-control seam now ships the durable intent
-   half of this: pause/resume/stop/`task_stop`/retry records, a control-state
-   projection, and wait inspection (§1.5.2, issue #9). Remaining: an executor that
-   *enforces* those intents — pausing fan-out, killing in-flight child work, and
-   running retries — rather than only recording and projecting them.
+2. **True asynchronous execution.** The script-VM side now ships real concurrent
+   fan-out: bounded-concurrency `parallel()` and no-barrier `pipeline()` honoring
+   `max_parallel` (operator-configurable through the `workflow(action="run_script")`
+   facade), with lifecycle-safe failure — a failed run drains/awaits already-started
+   parent-side runner work and reports work still running past the deadline rather
+   than returning terminal while child effects are in flight (issues #71/#72). The
+   operator-control seam ships the durable intent half: pause/resume/stop/
+   `task_stop`/retry records, a control-state projection, and wait inspection
+   (§1.5.2, issue #9). Remaining: an executor that *enforces* pause/retry intents
+   on the declarative JSON runtime, force-cancellation of running `ThreadPoolExecutor`
+   child calls, and the per-definition `policy.max_parallel` for JSON workflows.
 
 3. **Resume / journal engine.** Build on the existing append-style run records and
    `def_hash` correlation to support resuming an interrupted run from the last
@@ -1538,3 +1541,24 @@ Near-term and future work, roughly in priority order:
    (durations, fan-out width, failure rates), and trace correlation by `run_id` /
    `def_hash`. Observability must emit compact typed facts; raw transcripts,
    secrets, and backend-specific task payloads stay behind adapter-owned stores.
+
+9. **Claude-style API parity residuals.** A verified comparison of the script
+   contract against the observed `ultracode` workflow API (`agent`/`parallel`/
+   `pipeline`/`phase`/`budget`/`workflow`) confirms most core hooks ship; the
+   tracked residual gaps are:
+   - nested `workflow(name | {scriptPath}, args)` inline execution — the in-VM
+     `workflow()` RPC currently always denies (`nested_denied`/`nested_unsupported`)
+     rather than running a child workflow one level deep ([#91]);
+   - the `agentType` `agent()` option (custom subagent type selector) ([#92]);
+   - a truncate-and-spill result tier (capped completion notification +
+     on-demand spill) so the result is not delivered inline ([#93]);
+   - a `parallel()`/`pipeline()` per-call element cap and `effort` enum
+     validation ([#94]);
+   - persisting run-level stats / `workflowProgress` into the journal record ([#68]).
+
+   Intentional divergences (not gaps): the authoring surface is declarative
+   JSON / sandboxed Python, not executed JS (§2.2, §3); `agent()` failures raise
+   a structured error rather than returning a `null` sentinel; resume is
+   positional call-id replay with fail-closed drift-abort plus a `v2` prompt/
+   options fingerprint cache, not Claude's content-hash-only ledger; concurrency
+   is `max_parallel`-bounded rather than `min(16, cpu-2)`.
