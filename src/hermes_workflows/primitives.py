@@ -8,12 +8,14 @@ and free of network/filesystem effects.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
 from .agents import AgentRunner, ChildAgentRunner, StubAgentRunner
+from .background import BackgroundWorkflowRunManager
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
 from .controls import ControlStore
@@ -74,6 +76,9 @@ def workflow(
     resume_from_run_id: Optional[str] = None,
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
+    execution_mode: Optional[str] = None,
+    background: bool = False,
+    background_manager: Optional[BackgroundWorkflowRunManager] = None,
     control_store: Optional[ControlStore] = None,
 ) -> dict[str, Any]:
     """Model-facing workflow tool facade.
@@ -157,11 +162,14 @@ def workflow(
                 args=facade_script_args,
                 store=script_store,
                 agent_runner=agent_runner,
+                child_agent_runner=child_agent_runner,
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
+                max_parallel=max_parallel,
                 capability_registry=capability_registry,
                 capability_policy=capability_policy,
+                control_store=control_store,
             )
             return _script_run_payload("inline_script", result)
         if script_path is not None:
@@ -172,11 +180,14 @@ def workflow(
                 args=facade_script_args,
                 store=script_store,
                 agent_runner=agent_runner,
+                child_agent_runner=child_agent_runner,
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
+                max_parallel=max_parallel,
                 capability_registry=capability_registry,
                 capability_policy=capability_policy,
+                control_store=control_store,
             )
             return _script_run_payload("script_path", result, script_path=script_path)
         if facade_name is None:
@@ -187,12 +198,15 @@ def workflow(
             catalog=script_catalog,
             store=script_store,
             agent_runner=agent_runner,
+            child_agent_runner=child_agent_runner,
             version=script_version,
             validate=validate,
             run_id=run_id,
             replay_from=resume_from_run_id,
+            max_parallel=max_parallel,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
+            control_store=control_store,
         )
         return _script_run_payload("saved_script", result, name=facade_name)
     if op == "script_save":
@@ -218,6 +232,34 @@ def workflow(
         selected_name = facade_name
         if not selected_name:
             raise ValueError("workflow run_script requires 'script_name' or 'name'")
+        mode = _execution_mode(execution_mode=execution_mode, background=background)
+        if mode == "background":
+            active_catalog = script_catalog if script_catalog is not None else FileWorkflowScriptCatalog()
+            source = active_catalog.load_script(selected_name, version=script_version)
+            active_store = script_store if script_store is not None else ScriptRunStore(".hermes-workflow-script-runs")
+            manager = background_manager or BackgroundWorkflowRunManager.from_script_store(active_store)
+            record = manager.launch_script(
+                source,
+                args=facade_script_args,
+                script_name=selected_name,
+                script_version=script_version,
+                agent_runner=agent_runner,
+                child_agent_runner=child_agent_runner,
+                validate=validate,
+                run_id=run_id,
+                replay_from=resume_from_run_id,
+                capability_registry=capability_registry,
+                capability_policy=capability_policy,
+                control_store=control_store,
+            )
+            return {
+                "operation": "run_script",
+                "script_name": selected_name,
+                "execution_mode": "background",
+                "run_id": record.run_id,
+                "status": record.status,
+                "background": record.to_dict(),
+            }
         result = workflow_run_script(
             selected_name,
             args=facade_script_args,
@@ -225,16 +267,28 @@ def workflow(
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
+            limits=VMLimits(max_parallel=max_parallel),
             version=script_version,
             validate=validate,
+            max_parallel=max_parallel,
             run_id=run_id,
             replay_from=resume_from_run_id,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
             control_store=control_store,
         )
-        return {"operation": "run_script", "script_name": selected_name, "result": result.as_dict()}
+        return {"operation": "run_script", "script_name": selected_name, "execution_mode": "foreground", "result": result.as_dict()}
     raise ValueError("workflow action must be one of: validate, run, status, catalog, run_template, script_catalog, script_save, script_inspect, run_script")
+
+
+def _execution_mode(*, execution_mode: Optional[str], background: bool) -> str:
+    """Normalize the script execution mode used by the model-facing facade."""
+    mode = execution_mode or ("background" if background else "foreground")
+    if mode not in {"foreground", "background"}:
+        raise ValueError("execution_mode must be 'foreground' or 'background'")
+    if background and execution_mode == "foreground":
+        raise ValueError("background=True conflicts with execution_mode='foreground'")
+    return mode
 
 
 def _script_run_payload(source: str, result: ScriptRunResult, **extra: Any) -> dict[str, Any]:
@@ -343,6 +397,23 @@ def _effective_max_parallel(definition: dict[str, Any], override: int) -> int:
     if isinstance(policy_value, int) and not isinstance(policy_value, bool) and policy_value > 0:
         candidates.append(policy_value)
     return max(1, min(candidates))
+
+
+def _coerce_max_parallel(value: int) -> int:
+    """Normalize an operator-provided script-VM parallel width."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return VMLimits().max_parallel
+    return max(1, value)
+
+
+def _limits_with_max_parallel(limits: Optional[VMLimits], max_parallel: Optional[int]) -> Optional[VMLimits]:
+    """Apply a facade/operator max_parallel override without dropping other caps."""
+    if max_parallel is None:
+        return limits
+    requested = _coerce_max_parallel(max_parallel)
+    if limits is None:
+        return VMLimits(max_parallel=requested)
+    return replace(limits, max_parallel=max(1, min(limits.max_parallel, requested)))
 
 
 def _run_lifecycle_for_control_code(code: str) -> str:
@@ -505,6 +576,7 @@ def workflow_run_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Load and run a saved Python workflow-script harness by catalog name."""
     active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
@@ -514,7 +586,7 @@ def workflow_run_script(
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,
@@ -556,6 +628,7 @@ def run_workflow_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -586,7 +659,7 @@ def run_workflow_script(
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,

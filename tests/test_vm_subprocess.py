@@ -17,11 +17,13 @@ import os
 import stat
 import tempfile
 import threading
+import time
 from pathlib import Path
 
-from hermes_workflows import run_workflow_script
+from hermes_workflows import FileWorkflowScriptCatalog, run_workflow_script, workflow
 from hermes_workflows.agents import StubAgentRunner
 from hermes_workflows.errors import ScriptValidationError
+from hermes_workflows.script_store import ReplayCache, ReplayEntry, replay_args_hash
 from hermes_workflows.vm import CapabilityBroker, VMLimits, WorkflowVM, _scrubbed_env, run_script
 from hermes_workflows import rpc
 
@@ -181,6 +183,297 @@ def test_parallel_width_prevents_dispatching_queued_children_after_failure():
     assert res.ok is False
     assert res.error["type"] == "CapabilityError"
     assert started == [0]
+
+
+def test_pipeline_overlaps_item_stages_and_preserves_result_order():
+    item1_stage0_started = threading.Event()
+    item0_stage1_started = threading.Event()
+    active = [0]
+    max_active = [0]
+    lock = threading.Lock()
+
+    class OverlapRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            with lock:
+                active[0] += 1
+                max_active[0] = max(max_active[0], active[0])
+            try:
+                item = input["item"]
+                stage = input["stage"]
+                if item == 1 and stage == 0:
+                    item1_stage0_started.set()
+                    if not item0_stage1_started.wait(2.0):
+                        raise RuntimeError("item 0 did not enter stage 1 while item 1 was still in stage 0")
+                if item == 0 and stage == 1:
+                    item0_stage1_started.set()
+                    if not item1_stage0_started.wait(2.0):
+                        raise RuntimeError("item 1 never entered stage 0 concurrently")
+                return {"item": item, "stage": stage, "value": f"{item}:{stage}"}
+            finally:
+                with lock:
+                    active[0] -= 1
+
+    journal = []
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1, 'prev': prev['value']}),\n"
+        ")\n"
+        "return {'values': [o['value'] for o in outs]}\n"
+    )
+    res = run_workflow_script(
+        script,
+        agent_runner=OverlapRunner(),
+        limits=VMLimits(max_parallel=2),
+        journal=journal.append,
+    )
+
+    assert res.ok, res.error
+    assert res.value == {"values": ["0:1", "1:1"]}
+    assert max_active[0] == 2
+
+    starts = [e for e in journal if e["type"] == "rpc_call_start" and e["method"] == "agent"]
+    item1_stage0_result_index = next(
+        idx for idx, e in enumerate(journal)
+        if e["type"] == "rpc_call" and e.get("pipeline_item_index") == 1 and e.get("pipeline_stage_index") == 0
+    )
+    item0_stage1_start_index = next(
+        idx for idx, e in enumerate(journal)
+        if e["type"] == "rpc_call_start" and e.get("pipeline_item_index") == 0 and e.get("pipeline_stage_index") == 1
+    )
+
+    assert [(e["pipeline_item_index"], e["pipeline_stage_index"]) for e in starts[:3]] == [(0, 0), (1, 0), (0, 1)]
+    assert item0_stage1_start_index < item1_stage0_result_index
+
+
+def test_pipeline_failure_reports_item_and_stage():
+    class FailingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            if input["item"] == 1 and input["stage"] == 1:
+                raise RuntimeError("boom")
+            return {"item": input["item"], "stage": input["stage"]}
+
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1}),\n"
+        ")\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=FailingRunner(), limits=VMLimits(max_parallel=2))
+
+    assert res.ok is False
+    assert res.error["type"] == "PipelineStageError"
+    assert res.error["item_index"] == 1
+    assert res.error["stage_index"] == 1
+    assert res.error["cause_type"] == "CapabilityError"
+    assert res.error["code"] == "runner_error"
+
+
+def test_workflow_run_script_facade_forwards_max_parallel_limit():
+    class CountingRunner:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return dict(input)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    source = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item}),\n"
+        ")\n"
+        "return {'outs': outs}\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        catalog = FileWorkflowScriptCatalog([Path(d) / "scripts"])
+        catalog.save_script("bounded_pipeline", source)
+        runner = CountingRunner()
+
+        result = workflow(
+            action="run_script",
+            script_name="bounded_pipeline",
+            script_catalog=catalog,
+            agent_runner=runner,
+            max_parallel=1,
+        )["result"]
+
+    assert result["ok"] is True, result.get("error")
+    assert runner.max_active == 1
+
+
+def test_pipeline_failure_waits_for_in_flight_parent_runner_work():
+    class FailSlowRunner:
+        def __init__(self):
+            self.slow_started = threading.Event()
+            self.slow_finished = threading.Event()
+            self.calls = []
+            self.lock = threading.Lock()
+
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            payload = dict(input)
+            with self.lock:
+                self.calls.append(payload)
+            if payload == {"item": 0, "stage": 1}:
+                self.slow_started.wait(timeout=1.0)
+                raise RuntimeError("fast failure at item0 stage1")
+            if payload == {"item": 1, "stage": 0}:
+                self.slow_started.set()
+                time.sleep(0.25)
+                self.slow_finished.set()
+            return payload
+
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1}),\n"
+        ")\n"
+        "return {'outs': outs}\n"
+    )
+    runner = FailSlowRunner()
+    started = time.monotonic()
+
+    res = run_workflow_script(script, agent_runner=runner, limits=VMLimits(max_parallel=2, max_runtime_s=5.0))
+    elapsed = time.monotonic() - started
+
+    assert res.ok is False
+    assert res.error["type"] == "PipelineStageError"
+    assert runner.slow_started.is_set(), runner.calls
+    assert runner.slow_finished.is_set(), runner.calls
+    assert elapsed >= 0.20
+
+
+def test_parallel_running_sibling_return_does_not_mask_original_failure():
+    started = []
+    lock = threading.Lock()
+    first_two_started = threading.Event()
+    release_slow = threading.Event()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    first_two_started.set()
+            if index == 0:
+                if not first_two_started.wait(2.0):
+                    raise RuntimeError("parallel did not start the slow sibling")
+                release_slow.set()
+                raise RuntimeError("boom")
+            if index == 1:
+                if not release_slow.wait(2.0):
+                    raise RuntimeError("failure did not release slow sibling")
+                threading.Event().wait(0.05)
+                return {"i": index}
+            raise RuntimeError(f"queued child {index} should not have started")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "    lambda: agent('hermes.echo', {'i': 3}),\n"
+        "])\n"
+        "return outs\n"
+    )
+
+    for _ in range(20):
+        started.clear()
+        first_two_started.clear()
+        release_slow.clear()
+        res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2))
+        assert res.ok is False
+        assert res.error["type"] == "CapabilityError"
+        assert res.error.get("code") == "runner_error"
+        assert "Broken pipe" not in str(res.error)
+        assert sorted(started) == [0, 1]
+
+
+def test_parallel_failure_waits_for_already_started_parent_work_before_returning():
+    started = []
+    finished = []
+    lock = threading.Lock()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.35)
+                with lock:
+                    finished.append(index)
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    started_at = time.perf_counter()
+    res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=5.0))
+    elapsed = time.perf_counter() - started_at
+
+    assert res.ok is False
+    assert res.error["type"] == "CapabilityError"
+    assert "Broken pipe" not in str(res.error)
+    assert sorted(started) == [0, 1]
+    assert finished == [1]
+    assert elapsed >= 0.30
+
+
+def test_parallel_failure_reports_parent_work_still_running_after_deadline():
+    started = []
+    finished = threading.Event()
+    lock = threading.Lock()
+
+    class TooSlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.45)
+                finished.set()
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=TooSlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=0.1))
+
+    assert res.ok is False
+    assert res.error["type"] == "WorkflowSubprocessError"
+    assert "cannot be cancelled" in res.error["message"]
+    assert res.error["parent_calls_still_running"] == [
+        {"call_id": 2, "method": "agent", "parallel_index": 1, "agent_id": "hermes.echo"}
+    ]
+    assert sorted(started) == [0, 1]
+    assert finished.wait(1.0)
 
 
 def test_kanban_agent_routes_through_reserved_runner():
@@ -394,6 +687,43 @@ def test_broker_kanban_routes_to_reserved_runner():
 def test_broker_log_and_phase_are_noops_returning_none():
     assert _broker().handle(_call("log", {"message": "x"}))["value"] is None
     assert _broker().handle(_call("phase", {"title": "p"}))["value"] is None
+
+
+def test_replay_hit_journal_callback_can_reenter_broker_without_deadlock():
+    params = {"message": "cached"}
+    replay = ReplayCache(
+        {
+            1: ReplayEntry(
+                call_id=1,
+                method="log",
+                args_hash=replay_args_hash("log", params),
+                value=None,
+            )
+        },
+        source_run_id="src",
+    )
+    reentered = threading.Event()
+    reentrant_rets = []
+
+    def journal(event):
+        if event.get("replayed") and not reentered.is_set():
+            reentered.set()
+            reentrant_rets.append(broker.handle(_call("log", {"message": "reentrant"}, call_id=2)))
+
+    broker = CapabilityBroker(StubAgentRunner(), VMLimits(), journal=journal, replay=replay)
+    replay_rets = []
+    worker = threading.Thread(
+        target=lambda: replay_rets.append(broker.handle(_call("log", params, call_id=1))),
+        daemon=True,
+    )
+
+    worker.start()
+    worker.join(0.5)
+
+    assert not worker.is_alive(), "replay hit deadlocked when journal callback re-entered broker.handle"
+    assert reentered.is_set()
+    assert replay_rets[0]["ok"] is True
+    assert reentrant_rets[0]["ok"] is True
 
 
 def test_run_script_convenience_matches_vm():

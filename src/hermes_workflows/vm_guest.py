@@ -105,6 +105,19 @@ class CapabilityError(RuntimeError):
         super().__init__(message)
 
 
+class PipelineStageError(RuntimeError):
+    """Raised when one item fails at a specific ``pipeline()`` stage."""
+
+    def __init__(self, item_index: int, stage_index: int, exc: BaseException) -> None:
+        self.item_index = item_index
+        self.stage_index = stage_index
+        self.cause_type = type(exc).__name__
+        self.code = exc.code if isinstance(exc, CapabilityError) else None
+        super().__init__(
+            f"pipeline item {item_index} stage {stage_index} failed: {type(exc).__name__}: {exc}"
+        )
+
+
 class _Budget:
     """Read-only budget view exposed to the script, synced from the parent.
 
@@ -250,14 +263,26 @@ def _build_script_globals(
     max_parallel = max_parallel_raw if isinstance(max_parallel_raw, int) and not isinstance(max_parallel_raw, bool) else 8
     max_parallel = max(1, max_parallel)
     parallel_index: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("parallel_index", default=None)
+    pipeline_item_index: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+        "pipeline_item_index", default=None
+    )
+    pipeline_stage_index: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+        "pipeline_stage_index", default=None
+    )
 
-    def _annotate_parallel(params: dict[str, Any]) -> dict[str, Any]:
-        index = parallel_index.get()
-        if index is not None:
+    def _annotate_call(params: dict[str, Any]) -> dict[str, Any]:
+        p_index = parallel_index.get()
+        item_index = pipeline_item_index.get()
+        stage_index = pipeline_stage_index.get()
+        if p_index is not None or item_index is not None or stage_index is not None:
             params = dict(params)
-            params["_parallel_index"] = index
+        if p_index is not None:
+            params["_parallel_index"] = p_index
+        if item_index is not None:
+            params["_pipeline_item_index"] = item_index
+        if stage_index is not None:
+            params["_pipeline_stage_index"] = stage_index
         return params
-
 
     async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                      phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
@@ -276,10 +301,10 @@ def _build_script_globals(
             elif input is not None:
                 params["_invalid_opts_type"] = type(input).__name__
             params.update({key: value for key, value in explicit_opts.items() if value is not None})
-            return await conn.acall("agent", _annotate_parallel(params))
+            return await conn.acall("agent", _annotate_call(params))
         return await conn.acall(
             "agent",
-            _annotate_parallel({"agent_id": target, "input": input or {}, "label": label, "schema": schema}),
+            _annotate_call({"agent_id": target, "input": input or {}, "label": label, "schema": schema}),
         )
 
     async def kanban_agent(profile: str, task: Any = None, input: Optional[dict[str, Any]] = None, *,
@@ -302,16 +327,16 @@ def _build_script_globals(
             "workspace": workspace, "on_block": on_block,
         }
         params.update({key: value for key, value in extras.items() if value is not None})
-        return await conn.acall("kanban_agent", _annotate_parallel(params))
+        return await conn.acall("kanban_agent", _annotate_call(params))
 
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
-        return await conn.acall("workflow", _annotate_parallel({"name": name, "args": args}))
+        return await conn.acall("workflow", _annotate_call({"name": name, "args": args}))
 
     async def capability(name: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                          approval_id: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
         return await conn.acall(
             "capability",
-            _annotate_parallel(
+            _annotate_call(
                 {"name": name, "input": input or {}, "label": label, "approval_id": approval_id, "schema": schema}
             ),
         )
@@ -357,14 +382,47 @@ def _build_script_globals(
         return results
 
     async def pipeline(items: Any, *stages: Any) -> list[Any]:
-        """Run each item through all stages independently; no cross-item barrier."""
-        out = []
-        for index, item in enumerate(items):
+        """Run bounded per-item stage chains without a cross-item stage barrier."""
+        item_list = list(items)
+        results: list[Any] = [None] * len(item_list)
+        running: set[asyncio.Task[None]] = set()
+        next_index = 0
+
+        async def run_item(index: int, item: Any) -> None:
             current: Any = item
-            for stage in stages:
-                current = await _maybe_await(_call_stage(stage, current, item, index))
-            out.append(current)
-        return out
+            item_token = pipeline_item_index.set(index)
+            try:
+                for stage_index, stage in enumerate(stages):
+                    stage_token = pipeline_stage_index.set(stage_index)
+                    try:
+                        current = await _maybe_await(_call_stage(stage, current, item, index))
+                    except BaseException as exc:
+                        raise PipelineStageError(index, stage_index, exc) from exc
+                    finally:
+                        pipeline_stage_index.reset(stage_token)
+                results[index] = current
+            finally:
+                pipeline_item_index.reset(item_token)
+
+        def start_ready() -> None:
+            nonlocal next_index
+            while next_index < len(item_list) and len(running) < max_parallel:
+                running.add(asyncio.create_task(run_item(next_index, item_list[next_index])))
+                next_index += 1
+
+        start_ready()
+        while running:
+            done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            try:
+                for task in done:
+                    await task
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
+            start_ready()
+        return results
 
     script_globals: dict[str, Any] = {
         "__builtins__": _safe_builtins(),
@@ -382,6 +440,7 @@ def _build_script_globals(
         "parallel": parallel,
         "pipeline": pipeline,
         "CapabilityError": CapabilityError,
+        "PipelineStageError": PipelineStageError,
     }
     return script_globals
 
@@ -411,6 +470,12 @@ def _error_payload(exc: BaseException) -> dict[str, Any]:
     payload: dict[str, Any] = {"type": type(exc).__name__, "message": str(exc)}
     if isinstance(exc, CapabilityError) and exc.code:
         payload["code"] = exc.code
+    if isinstance(exc, PipelineStageError):
+        payload["item_index"] = exc.item_index
+        payload["stage_index"] = exc.stage_index
+        payload["cause_type"] = exc.cause_type
+        if exc.code:
+            payload["code"] = exc.code
     if line is not None:
         payload["line"] = line
     return payload

@@ -118,6 +118,11 @@ from .vm import (
     WorkflowVM,
     run_script,
 )
+from .background import (
+    BackgroundRunRecord,
+    BackgroundRunStore,
+    BackgroundWorkflowRunManager,
+)
 from .agents import (
     AgentRunner,
     ChildAgentRequest,
@@ -331,6 +336,9 @@ __all__ = [
     "VMLimits",
     "ScriptRunResult",
     "run_script",
+    "BackgroundRunRecord",
+    "BackgroundRunStore",
+    "BackgroundWorkflowRunManager",
     # models
     "Diagnostic",
     "ValidationResult",
