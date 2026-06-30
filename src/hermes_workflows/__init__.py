@@ -241,6 +241,7 @@ from .errors import (
     GrantError,
     GrantDenied,
     ControlError,
+    ControlDispatchDenied,
 )
 
 __version__ = "0.1.0"
@@ -452,4 +453,5 @@ __all__ = [
     "GrantError",
     "GrantDenied",
     "ControlError",
+    "ControlDispatchDenied",
 ]
