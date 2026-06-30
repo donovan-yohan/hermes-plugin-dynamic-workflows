@@ -522,8 +522,8 @@ class CapabilityBroker:
             raise CapabilityDenied(self.abort_reason, code="replay_mismatch")
         _validate_output(value, request.schema)
         self._agent_calls += 1
-        usage = value.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        usage = _non_negative_token_usage(value)
+        if usage is not None:
             self._tokens += usage
         self._replayed_calls += 1
         self._emit_prompt_agent_event(
@@ -565,8 +565,8 @@ class CapabilityBroker:
         elif method == "capability":
             self._capability_calls += 1
         if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
-            usage = entry.value.get("_tokens")
-            if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+            usage = _non_negative_token_usage(entry.value)
+            if usage is not None:
                 self._tokens += usage
         self._replayed_calls += 1
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
@@ -627,8 +627,8 @@ class CapabilityBroker:
                 "replay": self._replay is not None,
             },
         )
-        usage = result.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        usage = _non_negative_token_usage(result)
+        if usage is not None:
             self._tokens += usage
         _validate_output(result, params.get("schema"))
         return result
@@ -687,8 +687,8 @@ class CapabilityBroker:
         safe_output = redact_credentials(_json_safe(output))
         assert isinstance(safe_output, dict)
         _validate_output(safe_output, request.schema)
-        usage = safe_output.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
+        usage = _non_negative_token_usage(safe_output)
+        if usage is not None:
             self._tokens += usage
         return safe_output
 
@@ -818,8 +818,8 @@ class CapabilityBroker:
             result["reason"] = resolution.reason
         if diagnostics:
             result["diagnostics"] = diagnostics
-        usage = (resolution.result or {}).get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        usage = _non_negative_token_usage(resolution.result or {})
+        if usage is not None:
             self._tokens += usage
         return result
 
@@ -950,8 +950,8 @@ class CapabilityBroker:
                 f"agent {agent_id!r} returned {type(output).__name__}, expected dict", code="bad_output"
             )
         _validate_output(output, schema)
-        usage = output.get("_tokens")
-        if isinstance(usage, int) and not isinstance(usage, bool):
+        usage = _non_negative_token_usage(output)
+        if usage is not None:
             self._tokens += usage
         return output
 
@@ -1038,6 +1038,14 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
             raise CapabilityDenied(
                 f"output field {field_name!r} expected {hint}, got {type(value).__name__}", code="schema"
             )
+
+
+def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
+    """Return valid broker token usage, ignoring bools and negative values."""
+    usage = output.get("_tokens")
+    if isinstance(usage, int) and not isinstance(usage, bool) and usage >= 0:
+        return usage
+    return None
 
 
 def _optional_str(params: dict[str, Any], key: str) -> Optional[str]:

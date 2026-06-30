@@ -7,7 +7,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from hermes_workflows import REDACTED, ChildAgentRequest, ScriptRunStore, run_workflow_script
+from hermes_workflows import (
+    REDACTED,
+    CapabilityBroker,
+    ChildAgentRequest,
+    ScriptRunStore,
+    VMLimits,
+    run_workflow_script,
+)
 
 META = 'meta = {"name": "prompt-agent", "description": "d"}\n'
 
@@ -20,6 +27,31 @@ class FakeChildRunner:
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         self.requests.append(request)
         return dict(self.output)
+
+
+class PromptOutputRunner:
+    def __init__(self, outputs: dict[str, dict[str, Any]]) -> None:
+        self.outputs = outputs
+        self.requests: list[ChildAgentRequest] = []
+
+    def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+        self.requests.append(request)
+        return dict(self.outputs[request.prompt])
+
+
+def test_child_agent_request_as_dict_does_not_share_mutable_schema_or_context():
+    request = ChildAgentRequest(
+        prompt="summarize",
+        schema={"nested": {"answer": "string"}},
+        context={"items": [{"pr": 75}]},
+    )
+
+    exported = request.as_dict()
+    exported["schema"]["nested"]["answer"] = "number"
+    exported["context"]["items"][0]["pr"] = 87
+
+    assert request.schema == {"nested": {"answer": "string"}}
+    assert request.context == {"items": [{"pr": 75}]}
 
 
 def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_outputs():
@@ -199,6 +231,75 @@ def test_prompt_agent_duplicate_prompt_hits_current_run_cache():
         assert len([e for e in events if e["type"] == "agent_started"]) == 1
         hit = next(e for e in events if e["type"] == "agent_cache_hit")
         assert hit["cache"] == "run"
+
+
+def test_prompt_agent_negative_and_bool_tokens_do_not_lower_or_spend_budget():
+    runner = PromptOutputRunner(
+        {
+            "negative usage": {"answer": "ignored", "_tokens": -100},
+            "bool usage": {"answer": "ignored", "_tokens": True},
+            "spend budget": {"answer": "spent", "_tokens": 1},
+            "after budget": {"answer": "should not run", "_tokens": 1},
+        }
+    )
+    script = META + (
+        'await agent("negative usage", {"label": "negative"})\n'
+        'await agent("negative usage", {"label": "negative"})\n'
+        'await agent("bool usage", {"label": "bool"})\n'
+        'await agent("bool usage", {"label": "bool"})\n'
+        'await agent("spend budget", {"label": "spend"})\n'
+        'await agent("after budget", {"label": "after"})\n'
+        'return {"code": "bypassed"}\n'
+    )
+
+    res = run_workflow_script(script, child_agent_runner=runner, limits=VMLimits(token_budget=1))
+
+    assert res.ok is False
+    assert "hard-limit" in res.error["message"]
+    assert [request.prompt for request in runner.requests] == [
+        "negative usage",
+        "bool usage",
+        "spend budget",
+    ]
+
+
+def test_prompt_agent_replay_negative_tokens_do_not_lower_budget():
+    class TokenRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 — match AgentRunner signature.
+            return {"ok": agent_id, "_tokens": 1}
+
+    runner = PromptOutputRunner({"negative usage": {"answer": "ignored", "_tokens": -100}})
+    source_script = META + 'return await agent("negative usage", {"label": "negative"})\n'
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        rec = run_workflow_script(
+            source_script, store=store, run_id="src_tokens", child_agent_runner=runner
+        )
+        assert rec.ok, rec.error
+        replay = store.load_cache("src_tokens")
+
+    broker = CapabilityBroker(TokenRunner(), VMLimits(token_budget=1), replay=replay)
+    cached = broker.handle(
+        {
+            "t": "call",
+            "id": 1,
+            "method": "agent",
+            "params": {"prompt": "negative usage", "label": "negative"},
+        }
+    )
+    spend = broker.handle(
+        {"t": "call", "id": 2, "method": "agent", "params": {"agent_id": "hermes.echo", "input": {}}}
+    )
+    denied = broker.handle(
+        {"t": "call", "id": 3, "method": "agent", "params": {"agent_id": "hermes.echo", "input": {}}}
+    )
+
+    assert cached["ok"] is True
+    assert cached["budget"]["spent"] == 0
+    assert spend["ok"] is True
+    assert spend["budget"]["spent"] == 1
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "limit_token"
 
 
 def test_prompt_agent_semantic_options_change_fingerprint():
