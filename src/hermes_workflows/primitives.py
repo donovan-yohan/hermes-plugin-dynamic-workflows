@@ -8,6 +8,7 @@ and free of network/filesystem effects.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from . import schema as _schema
@@ -165,6 +166,7 @@ def workflow(
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
+                max_parallel=max_parallel,
                 capability_registry=capability_registry,
                 capability_policy=capability_policy,
                 control_store=control_store,
@@ -182,6 +184,7 @@ def workflow(
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
+                max_parallel=max_parallel,
                 capability_registry=capability_registry,
                 capability_policy=capability_policy,
                 control_store=control_store,
@@ -200,6 +203,7 @@ def workflow(
             validate=validate,
             run_id=run_id,
             replay_from=resume_from_run_id,
+            max_parallel=max_parallel,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
             control_store=control_store,
@@ -265,6 +269,7 @@ def workflow(
             child_agent_runner=child_agent_runner,
             version=script_version,
             validate=validate,
+            max_parallel=max_parallel,
             run_id=run_id,
             replay_from=resume_from_run_id,
             capability_registry=capability_registry,
@@ -391,6 +396,23 @@ def _effective_max_parallel(definition: dict[str, Any], override: int) -> int:
     if isinstance(policy_value, int) and not isinstance(policy_value, bool) and policy_value > 0:
         candidates.append(policy_value)
     return max(1, min(candidates))
+
+
+def _coerce_max_parallel(value: int) -> int:
+    """Normalize an operator-provided script-VM parallel width."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return VMLimits().max_parallel
+    return max(1, value)
+
+
+def _limits_with_max_parallel(limits: Optional[VMLimits], max_parallel: Optional[int]) -> Optional[VMLimits]:
+    """Apply a facade/operator max_parallel override without dropping other caps."""
+    if max_parallel is None:
+        return limits
+    requested = _coerce_max_parallel(max_parallel)
+    if limits is None:
+        return VMLimits(max_parallel=requested)
+    return replace(limits, max_parallel=max(1, min(limits.max_parallel, requested)))
 
 
 def _run_lifecycle_for_control_code(code: str) -> str:
@@ -553,6 +575,7 @@ def workflow_run_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Load and run a saved Python workflow-script harness by catalog name."""
     active_catalog = catalog if catalog is not None else FileWorkflowScriptCatalog()
@@ -562,7 +585,7 @@ def workflow_run_script(
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,
@@ -604,6 +627,7 @@ def run_workflow_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    max_parallel: Optional[int] = None,
 ) -> ScriptRunResult:
     """Run a Python workflow script in the parent-owned subprocess VM.
 
@@ -634,7 +658,7 @@ def run_workflow_script(
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
-        limits=limits,
+        limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
         store=store,

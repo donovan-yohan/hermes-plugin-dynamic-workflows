@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins as _builtins
+import contextvars
 import json as _json
 import math as _math
 import sys
@@ -141,15 +142,23 @@ class _Budget:
 
 
 class _Connection:
-    """Synchronous request/response RPC client to the parent broker."""
+    """Request/response RPC client to the parent broker."""
 
     def __init__(self, channel: rpc.Channel, budget: _Budget) -> None:
         self._channel = channel
         self._budget = budget
         self._next_id = 0
+        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._send_lock: Optional[asyncio.Lock] = None
+        self._reader_task: Optional[asyncio.Task[None]] = None
 
     def call(self, method: str, params: dict[str, Any]) -> Any:
         """Send one capability call and block for its structured response."""
+        if self._pending:
+            raise CapabilityError(
+                "synchronous workflow helper cannot run while parallel calls are pending",
+                code="parallel_sync_call",
+            )
         self._next_id += 1
         call_id = self._next_id
         self._channel.send({"t": rpc.T_CALL, "id": call_id, "method": method, "params": params})
@@ -167,6 +176,56 @@ class _Connection:
         error = frame.get("error") or {}
         raise CapabilityError(error.get("message", "capability denied"), code=error.get("code"))
 
+    async def acall(self, method: str, params: dict[str, Any]) -> Any:
+        """Send one capability call without blocking sibling async tasks."""
+        loop = asyncio.get_running_loop()
+        if self._send_lock is None:
+            self._send_lock = asyncio.Lock()
+        async with self._send_lock:
+            self._next_id += 1
+            call_id = self._next_id
+            fut: asyncio.Future[Any] = loop.create_future()
+            self._pending[call_id] = fut
+            self._channel.send({"t": rpc.T_CALL, "id": call_id, "method": method, "params": params})
+            if self._reader_task is None or self._reader_task.done():
+                self._reader_task = asyncio.create_task(self._read_returns())
+        try:
+            return await fut
+        finally:
+            if fut.cancelled():
+                self._pending.pop(call_id, None)
+
+    async def _read_returns(self) -> None:
+        """Resolve outstanding async RPC calls from parent ``ret`` frames."""
+        while self._pending:
+            frame = await asyncio.to_thread(self._channel.recv)
+            if frame is None:
+                self._fail_pending(CapabilityError("parent closed the channel", code="channel_closed"))
+                return
+            if frame.get("t") != rpc.T_RET:
+                self._fail_pending(
+                    CapabilityError(f"protocol desync: expected ret, got {frame.get('t')}", code="protocol")
+                )
+                return
+            call_id = frame.get("id")
+            fut = self._pending.pop(call_id, None)
+            if fut is None:
+                continue
+            self._budget._sync(frame.get("budget"))
+            if frame.get("ok"):
+                fut.set_result(frame.get("value"))
+            else:
+                error = frame.get("error") or {}
+                fut.set_exception(CapabilityError(error.get("message", "capability denied"), code=error.get("code")))
+        self._reader_task = None
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(exc)
+
 
 def _looks_like_legacy_agent_id(value: Any) -> bool:
     return (
@@ -175,8 +234,29 @@ def _looks_like_legacy_agent_id(value: Any) -> bool:
         and len(value.split(".", 1)[1]) > 0
         and not any(ch.isspace() for ch in value)
     )
-def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
+
+
+def _build_script_globals(
+    conn: _Connection,
+    args: Any,
+    budget: _Budget,
+    meta: Any,
+    limits: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Construct the restricted global namespace the script executes within."""
+
+    limit_info = limits if isinstance(limits, dict) else {}
+    max_parallel_raw = limit_info.get("max_parallel", 8)
+    max_parallel = max_parallel_raw if isinstance(max_parallel_raw, int) and not isinstance(max_parallel_raw, bool) else 8
+    max_parallel = max(1, max_parallel)
+    parallel_index: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("parallel_index", default=None)
+
+    def _annotate_parallel(params: dict[str, Any]) -> dict[str, Any]:
+        index = parallel_index.get()
+        if index is not None:
+            params = dict(params)
+            params["_parallel_index"] = index
+        return params
 
     async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                      phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
@@ -195,8 +275,11 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
             elif input is not None:
                 params["_invalid_opts_type"] = type(input).__name__
             params.update({key: value for key, value in explicit_opts.items() if value is not None})
-            return conn.call("agent", params)
-        return conn.call("agent", {"agent_id": target, "input": input or {}, "label": label, "schema": schema})
+            return await conn.acall("agent", _annotate_parallel(params))
+        return await conn.acall(
+            "agent",
+            _annotate_parallel({"agent_id": target, "input": input or {}, "label": label, "schema": schema}),
+        )
 
     async def kanban_agent(profile: str, task: Any = None, input: Optional[dict[str, Any]] = None, *,
                            title: Optional[str] = None, prompt: Optional[str] = None,
@@ -218,16 +301,18 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
             "workspace": workspace, "on_block": on_block,
         }
         params.update({key: value for key, value in extras.items() if value is not None})
-        return conn.call("kanban_agent", params)
+        return await conn.acall("kanban_agent", _annotate_parallel(params))
 
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
-        return conn.call("workflow", {"name": name, "args": args})
+        return await conn.acall("workflow", _annotate_parallel({"name": name, "args": args}))
 
     async def capability(name: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                          approval_id: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
-        return conn.call(
+        return await conn.acall(
             "capability",
-            {"name": name, "input": input or {}, "label": label, "approval_id": approval_id, "schema": schema},
+            _annotate_parallel(
+                {"name": name, "input": input or {}, "label": label, "approval_id": approval_id, "schema": schema}
+            ),
         )
 
     def log(message: Any) -> None:
@@ -237,10 +322,37 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
         conn.call("phase", {"title": str(title)})
 
     async def parallel(thunks: Any) -> list[Any]:
-        """Run thunks and join all results (barrier). Sequential & deterministic."""
-        results = []
-        for thunk in thunks:
-            results.append(await _maybe_await(thunk()))
+        """Run thunks concurrently up to the configured bound, preserving order."""
+        thunk_list = list(thunks)
+        results: list[Any] = [None] * len(thunk_list)
+        running: set[asyncio.Task[None]] = set()
+        next_index = 0
+
+        async def run_one(index: int, thunk: Any) -> None:
+            token = parallel_index.set(index)
+            try:
+                results[index] = await _maybe_await(thunk())
+            finally:
+                parallel_index.reset(token)
+
+        def start_ready() -> None:
+            nonlocal next_index
+            while next_index < len(thunk_list) and len(running) < max_parallel:
+                running.add(asyncio.create_task(run_one(next_index, thunk_list[next_index])))
+                next_index += 1
+
+        start_ready()
+        while running:
+            done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            try:
+                for task in done:
+                    await task
+            except BaseException:
+                for task in running:
+                    task.cancel()
+                await asyncio.gather(*running, return_exceptions=True)
+                raise
+            start_ready()
         return results
 
     async def pipeline(items: Any, *stages: Any) -> list[Any]:
@@ -335,7 +447,7 @@ def run(boot: dict[str, Any], channel: rpc.Channel) -> dict[str, Any]:
 
     budget = _Budget(boot.get("budget"))
     conn = _Connection(channel, budget)
-    script_globals = _build_script_globals(conn, boot.get("args"), budget, validation.meta)
+    script_globals = _build_script_globals(conn, boot.get("args"), budget, validation.meta, boot.get("limits"))
 
     channel.send({"t": rpc.T_READY, "meta": validation.meta})
 

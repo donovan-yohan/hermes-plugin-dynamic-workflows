@@ -16,6 +16,8 @@ Deterministic by construction: all effects route through ``StubAgentRunner``.
 import os
 import stat
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from hermes_workflows import run_workflow_script
@@ -99,6 +101,211 @@ def test_parallel_and_pipeline_execute_in_guest():
     res = run_workflow_script(script)
     assert res.ok, res.error
     assert res.value == {"parallel": ["hello, a", "hello, b"], "pipeline": ["X0", "Y1"]}
+
+
+def test_parallel_runs_bounded_concurrent_and_preserves_result_order():
+    started = []
+    finished = []
+    start_gate = threading.Event()
+    finish_gate = threading.Event()
+    lock = threading.Lock()
+
+    class BlockingRunner:
+        def __call__(self, agent_id, input):
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    start_gate.set()
+            if not start_gate.wait(2.0):
+                raise RuntimeError("parallel did not start the first two calls concurrently")
+            if index == 0:
+                if not finish_gate.wait(2.0):
+                    raise RuntimeError("second call did not finish while first was still running")
+            elif index == 1:
+                with lock:
+                    finished.append(index)
+                finish_gate.set()
+            with lock:
+                if index != 1:
+                    finished.append(index)
+            return {"i": index}
+
+    journal = []
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return {'order': [o['i'] for o in outs]}\n"
+    )
+    res = run_workflow_script(script, agent_runner=BlockingRunner(), limits=VMLimits(max_parallel=2), journal=journal.append)
+
+    assert res.ok, res.error
+    assert res.value == {"order": [0, 1, 2]}
+    assert started[:2] == [0, 1]
+    assert finished[:2] == [1, 0]
+    assert started == [0, 1, 2]
+
+    starts = [e for e in journal if e["type"] == "rpc_call_start" and e["method"] == "agent"]
+    results = [e for e in journal if e["type"] == "rpc_call" and e["method"] == "agent"]
+    assert [e["parallel_index"] for e in starts] == [0, 1, 2]
+    assert [e["parallel_index"] for e in results] == [1, 0, 2]
+    assert [e["call_id"] for e in starts[:2]] == [1, 2]
+    assert [e["call_id"] for e in results] == [2, 1, 3]
+
+
+def test_parallel_width_prevents_dispatching_queued_children_after_failure():
+    started = []
+    lock = threading.Lock()
+
+    class FailingRunner:
+        def __call__(self, agent_id, input):
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            return {"i": index}
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=FailingRunner(), limits=VMLimits(max_parallel=1))
+
+    assert res.ok is False
+    assert res.error["type"] == "CapabilityError"
+    assert started == [0]
+
+
+def test_parallel_running_sibling_return_does_not_mask_original_failure():
+    started = []
+    lock = threading.Lock()
+    first_two_started = threading.Event()
+    release_slow = threading.Event()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+                if len(started) == 2:
+                    first_two_started.set()
+            if index == 0:
+                if not first_two_started.wait(2.0):
+                    raise RuntimeError("parallel did not start the slow sibling")
+                release_slow.set()
+                raise RuntimeError("boom")
+            if index == 1:
+                if not release_slow.wait(2.0):
+                    raise RuntimeError("failure did not release slow sibling")
+                threading.Event().wait(0.05)
+                return {"i": index}
+            raise RuntimeError(f"queued child {index} should not have started")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "    lambda: agent('hermes.echo', {'i': 3}),\n"
+        "])\n"
+        "return outs\n"
+    )
+
+    for _ in range(20):
+        started.clear()
+        first_two_started.clear()
+        release_slow.clear()
+        res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2))
+        assert res.ok is False
+        assert res.error["type"] == "CapabilityError"
+        assert res.error.get("code") == "runner_error"
+        assert "Broken pipe" not in str(res.error)
+        assert sorted(started) == [0, 1]
+
+
+def test_parallel_failure_waits_for_already_started_parent_work_before_returning():
+    started = []
+    finished = []
+    lock = threading.Lock()
+
+    class SlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.35)
+                with lock:
+                    finished.append(index)
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    started_at = time.perf_counter()
+    res = run_workflow_script(script, agent_runner=SlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=5.0))
+    elapsed = time.perf_counter() - started_at
+
+    assert res.ok is False
+    assert res.error["type"] == "CapabilityError"
+    assert "Broken pipe" not in str(res.error)
+    assert sorted(started) == [0, 1]
+    assert finished == [1]
+    assert elapsed >= 0.30
+
+
+def test_parallel_failure_reports_parent_work_still_running_after_deadline():
+    started = []
+    finished = threading.Event()
+    lock = threading.Lock()
+
+    class TooSlowSiblingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - match AgentRunner signature.
+            index = input["i"]
+            with lock:
+                started.append(index)
+            if index == 0:
+                raise RuntimeError("boom")
+            if index == 1:
+                time.sleep(0.45)
+                finished.set()
+                return {"i": index}
+            raise AssertionError("queued child must not be dispatched after failure")
+
+    script = META + (
+        "outs = await parallel([\n"
+        "    lambda: agent('hermes.echo', {'i': 0}),\n"
+        "    lambda: agent('hermes.echo', {'i': 1}),\n"
+        "    lambda: agent('hermes.echo', {'i': 2}),\n"
+        "])\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=TooSlowSiblingRunner(), limits=VMLimits(max_parallel=2, max_runtime_s=0.1))
+
+    assert res.ok is False
+    assert res.error["type"] == "WorkflowSubprocessError"
+    assert "cannot be cancelled" in res.error["message"]
+    assert res.error["parent_calls_still_running"] == [
+        {"call_id": 2, "method": "agent", "parallel_index": 1, "agent_id": "hermes.echo"}
+    ]
+    assert sorted(started) == [0, 1]
+    assert finished.wait(1.0)
 
 
 def test_kanban_agent_routes_through_reserved_runner():
