@@ -183,6 +183,91 @@ def test_parallel_width_prevents_dispatching_queued_children_after_failure():
     assert started == [0]
 
 
+def test_pipeline_overlaps_item_stages_and_preserves_result_order():
+    item1_stage0_started = threading.Event()
+    item0_stage1_started = threading.Event()
+    active = [0]
+    max_active = [0]
+    lock = threading.Lock()
+
+    class OverlapRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            with lock:
+                active[0] += 1
+                max_active[0] = max(max_active[0], active[0])
+            try:
+                item = input["item"]
+                stage = input["stage"]
+                if item == 1 and stage == 0:
+                    item1_stage0_started.set()
+                    if not item0_stage1_started.wait(2.0):
+                        raise RuntimeError("item 0 did not enter stage 1 while item 1 was still in stage 0")
+                if item == 0 and stage == 1:
+                    item0_stage1_started.set()
+                    if not item1_stage0_started.wait(2.0):
+                        raise RuntimeError("item 1 never entered stage 0 concurrently")
+                return {"item": item, "stage": stage, "value": f"{item}:{stage}"}
+            finally:
+                with lock:
+                    active[0] -= 1
+
+    journal = []
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1, 'prev': prev['value']}),\n"
+        ")\n"
+        "return {'values': [o['value'] for o in outs]}\n"
+    )
+    res = run_workflow_script(
+        script,
+        agent_runner=OverlapRunner(),
+        limits=VMLimits(max_parallel=2),
+        journal=journal.append,
+    )
+
+    assert res.ok, res.error
+    assert res.value == {"values": ["0:1", "1:1"]}
+    assert max_active[0] == 2
+
+    starts = [e for e in journal if e["type"] == "rpc_call_start" and e["method"] == "agent"]
+    item1_stage0_result_index = next(
+        idx for idx, e in enumerate(journal)
+        if e["type"] == "rpc_call" and e.get("pipeline_item_index") == 1 and e.get("pipeline_stage_index") == 0
+    )
+    item0_stage1_start_index = next(
+        idx for idx, e in enumerate(journal)
+        if e["type"] == "rpc_call_start" and e.get("pipeline_item_index") == 0 and e.get("pipeline_stage_index") == 1
+    )
+
+    assert [(e["pipeline_item_index"], e["pipeline_stage_index"]) for e in starts[:3]] == [(0, 0), (1, 0), (0, 1)]
+    assert item0_stage1_start_index < item1_stage0_result_index
+
+
+def test_pipeline_failure_reports_item_and_stage():
+    class FailingRunner:
+        def __call__(self, agent_id, input):  # noqa: A002 - AgentRunner protocol name.
+            if input["item"] == 1 and input["stage"] == 1:
+                raise RuntimeError("boom")
+            return {"item": input["item"], "stage": input["stage"]}
+
+    script = META + (
+        "outs = await pipeline([0, 1],\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 0}),\n"
+        "    lambda prev, item, i: agent('hermes.echo', {'item': item, 'stage': 1}),\n"
+        ")\n"
+        "return outs\n"
+    )
+    res = run_workflow_script(script, agent_runner=FailingRunner(), limits=VMLimits(max_parallel=2))
+
+    assert res.ok is False
+    assert res.error["type"] == "PipelineStageError"
+    assert res.error["item_index"] == 1
+    assert res.error["stage_index"] == 1
+    assert res.error["cause_type"] == "CapabilityError"
+    assert res.error["code"] == "runner_error"
+
+
 def test_kanban_agent_routes_through_reserved_runner():
     script = META + (
         'r = await kanban_agent("relayplanner", {"goal": "plan"}, {"repo": "x"})\n'

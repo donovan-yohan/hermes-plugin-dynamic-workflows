@@ -455,13 +455,13 @@ class CapabilityBroker:
         """Return a metadata-only start marker for parallel child calls.
 
         Sequential calls keep the historical one-result-event journal shape. A
-        workflow-script ``parallel()`` call annotates child RPC frames with a
-        private ``_parallel_index`` parameter; those calls get a separate start
-        marker so operators can see real dispatch timing without exposing raw
-        inputs.
+        workflow-script ``parallel()`` and ``pipeline()`` calls annotate child
+        RPC frames with private index parameters; those calls get a separate
+        start marker so operators can see real dispatch timing without exposing
+        raw inputs.
         """
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
-        if "_parallel_index" not in params:
+        if not any(key in params for key in ("_parallel_index", "_pipeline_item_index", "_pipeline_stage_index")):
             return None
         event = self._call_event(
             frame.get("id"),
@@ -470,7 +470,6 @@ class CapabilityBroker:
             ok=True,
             event_type="rpc_call_start",
         )
-        event["parallel_index"] = params.get("_parallel_index")
         return event
 
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
@@ -949,6 +948,10 @@ class CapabilityBroker:
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if "_parallel_index" in params:
             event["parallel_index"] = params.get("_parallel_index")
+        if "_pipeline_item_index" in params:
+            event["pipeline_item_index"] = params.get("_pipeline_item_index")
+        if "_pipeline_stage_index" in params:
+            event["pipeline_stage_index"] = params.get("_pipeline_stage_index")
         if error:
             event["error"] = error
         if replayed:
