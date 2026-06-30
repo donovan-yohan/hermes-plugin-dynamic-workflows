@@ -28,7 +28,7 @@ import asyncio
 import builtins as _builtins
 import json as _json
 import math as _math
-import re
+import re as _re
 import sys
 import traceback
 from typing import Any, Optional
@@ -170,11 +170,15 @@ class _Connection:
 
 
 _AGENT_OPTION_KEYS = frozenset({"label", "phase", "schema", "model", "effort", "isolation", "context"})
-_LEGACY_AGENT_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
+_LEGACY_AGENT_ID_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+$")
 
 
 def _looks_like_legacy_agent_id(value: Any) -> bool:
-    return isinstance(value, str) and bool(_LEGACY_AGENT_ID_RE.fullmatch(value))
+    return isinstance(value, str) and _LEGACY_AGENT_ID_RE.fullmatch(value) is not None
+
+
+def _has_positional_prompt_options(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value) and set(value).issubset(_AGENT_OPTION_KEYS)
 
 
 def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: Any) -> dict[str, Any]:
@@ -188,7 +192,8 @@ def _build_script_globals(conn: _Connection, args: Any, budget: _Budget, meta: A
             "label": label, "phase": phase, "schema": schema, "model": model,
             "effort": effort, "isolation": isolation, "context": context,
         }
-        legacy_agent_id = _looks_like_legacy_agent_id(target)
+        positional_prompt_options = _has_positional_prompt_options(input)
+        legacy_agent_id = _looks_like_legacy_agent_id(target) and not positional_prompt_options
         opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
         if opts_from_pos is not None or (input is None and not legacy_agent_id):
             params: dict[str, Any] = {"prompt": target}

@@ -181,15 +181,15 @@ def test_prompt_agent_schema_invalid_output_retries_with_validation_context_and_
         assert store.load_cache("schema_retry_run").get(1).value == {"answer": "ok", "_tokens": 5}
 
 
-def test_prompt_agent_schema_retry_redacts_label_and_phase_metadata():
+def test_prompt_agent_schema_retry_journal_redacts_label_and_phase_metadata():
     runner = SequenceChildRunner([
         {"answer": 7},
         {"answer": "ok"},
     ])
     script = META + (
         'result = await agent("summarize", {\n'
-        '    "label": "token=not-a-real-secret",\n'
-        '    "phase": "secret=not-a-real-secret",\n'
+        '    "label": "ghp_SECRET_TOKEN",\n'
+        '    "phase": "token=phase-secret",\n'
         '    "schema": {"answer": "string"},\n'
         '})\n'
         'return result\n'
@@ -199,7 +199,7 @@ def test_prompt_agent_schema_retry_redacts_label_and_phase_metadata():
         res = run_workflow_script(
             script,
             store=store,
-            run_id="schema_retry_redacts_metadata",
+            run_id="schema_retry_redaction_run",
             child_agent_runner=runner,
             deterministic_runner=True,
         )
@@ -208,14 +208,14 @@ def test_prompt_agent_schema_retry_redacts_label_and_phase_metadata():
         retry_event = next(event for event in res.calls if event.get("error") == "schema_retry")
         assert retry_event["label"] == REDACTED
         assert retry_event["phase"] == REDACTED
-        assert "not-a-real-secret" not in repr(retry_event)
+
         journal_retry = next(
-            event for event in store.journal("schema_retry_redacts_metadata")
-            if event.get("error") == "schema_retry"
+            event for event in store.journal("schema_retry_redaction_run") if event.get("error") == "schema_retry"
         )
         assert journal_retry["label"] == REDACTED
         assert journal_retry["phase"] == REDACTED
-        assert "not-a-real-secret" not in repr(journal_retry)
+        assert "ghp_SECRET_TOKEN" not in repr(journal_retry)
+        assert "token=phase-secret" not in repr(journal_retry)
 
 
 def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():
@@ -231,6 +231,20 @@ def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():
     assert "schema validation failed after 2 attempt(s)" in res.error["message"]
     assert len(runner.requests) == 2
     assert [event.get("error") for event in res.calls].count("schema_retry") == 1
+
+
+def test_punctuated_schema_prompt_routes_to_child_runner_not_legacy_agent_id():
+    runner = FakeChildRunner({"answer": "brief"})
+    res = run_workflow_script(
+        META + 'return await agent("Summarize.", {"schema": {"answer": "string"}})\n',
+        child_agent_runner=runner,
+    )
+
+    assert res.ok, res.error
+    assert res.value == {"answer": "brief"}
+    assert len(runner.requests) == 1
+    assert runner.requests[0].prompt == "Summarize."
+    assert runner.requests[0].schema == {"answer": "string"}
 
 
 def test_legacy_agent_id_input_compatibility_is_preserved():

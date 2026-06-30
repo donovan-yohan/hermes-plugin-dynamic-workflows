@@ -512,6 +512,8 @@ class CapabilityBroker:
                 "unsupported prompt agent option(s): " + ", ".join(unknown), code="bad_request"
             )
         self._check_token_budget()
+        # Count the script-visible prompt agent call once; schema retries below may
+        # cross the child-runner boundary again but remain bounded by max_schema_retries.
         self._agent_calls += 1
         if self._agent_calls > self._limits.max_agent_calls:
             raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
