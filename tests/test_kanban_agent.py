@@ -37,7 +37,7 @@ from hermes_workflows.kanban import (
     normalize_on_block,
 )
 from hermes_workflows.script_store import ScriptRunStore
-from hermes_workflows.controls import InMemoryControlStore, stop_task
+from hermes_workflows.controls import InMemoryControlStore, stop_run, stop_task
 from hermes_workflows.vm import CapabilityBroker, VMLimits
 
 META = 'meta = {"name": "k5", "description": "d"}\n'
@@ -336,6 +336,72 @@ def test_e2e_replay_reattaches_and_creates_no_duplicate_card():
         assert rep.value["reattached"] is True
         assert len(backend.created_cards) == 1  # no duplicate card.
         assert backend.reattachments == 1
+
+
+def test_control_stop_active_replay_blocks_kanban_dispatch_before_reattach():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+        rec = run_workflow_script(
+            _E2E_SCRIPT,
+            args={"i": "#42"},
+            store=store,
+            run_id="src",
+            kanban_backend=backend,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_run(controls, "replay", reason="active replay stop")
+        rep = run_workflow_script(
+            _E2E_SCRIPT,
+            args={"i": "#42"},
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            kanban_backend=backend,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.stopped is True
+    assert rep.error["code"] == "run_stopped"
+    assert persisted.status == "stopped"
+    assert len(backend.created_cards) == 1
+    assert backend.reattachments == 0
+
+
+def test_control_task_stop_active_replay_blocks_kanban_dispatch_before_reattach():
+    script = META + (
+        'r = await kanban_agent("planner", title="plan", prompt="go", labels=["qa-label"], on_block="return")\n'
+        'return {"status": r["status"], "card_id": r["card_id"], "reattached": r["reattached"]}\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        backend = InMemoryKanbanBackend(auto="completed", known_profiles={"planner"})
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            kanban_backend=backend,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_task(controls, "replay", "qa-label", reason="skip replay child")
+        rep = run_workflow_script(
+            script,
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            kanban_backend=backend,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.ok is False
+    assert rep.error["code"] == "task_stopped"
+    assert persisted.status == "failed"
+    assert len(backend.created_cards) == 1
+    assert backend.reattachments == 0
 
 
 def test_e2e_chained_replay_reattaches_the_original_card():

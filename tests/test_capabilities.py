@@ -13,7 +13,7 @@ from hermes_workflows import (
 from hermes_workflows.vm import CapabilityBroker
 from hermes_workflows import rpc
 from hermes_workflows.agents import StubAgentRunner
-from hermes_workflows.controls import InMemoryControlStore, pause_run, stop_task
+from hermes_workflows.controls import InMemoryControlStore, pause_run, stop_run, stop_task
 from hermes_workflows.script_store import ScriptRunStore
 
 META = 'meta = {"name": "cap-demo", "description": "d"}\n'
@@ -110,6 +110,106 @@ def test_control_task_stop_blocks_matching_script_child_label():
     assert res.error["code"] == "task_stopped"
     assert persisted.status == "failed"
     assert calls == []
+
+
+def test_control_pause_active_replay_blocks_script_capability_dispatch():
+    calls = []
+    registry = CapabilityRegistry()
+    registry.register("tools.echo", lambda ctx: calls.append(ctx["run"]) or {"ok": True})
+    script = META + 'return await capability("tools.echo", {}, label="inventory")\n'
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            capability_registry=registry,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        pause_run(controls, "replay", reason="active replay pause")
+        rep = run_workflow_script(
+            script,
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            capability_registry=registry,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.paused is True
+    assert rep.error["code"] == "run_paused"
+    assert persisted.status == "paused"
+    assert len(calls) == 1
+    assert calls[0]["idempotency_root"] == "src"
+
+
+def test_control_task_stop_active_replay_blocks_script_capability_dispatch():
+    calls = []
+    registry = CapabilityRegistry()
+    registry.register("tools.echo", lambda ctx: calls.append(ctx["run"]) or {"ok": True})
+    script = META + 'return await capability("tools.echo", {}, label="inventory")\n'
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            capability_registry=registry,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_task(controls, "replay", "inventory", reason="skip replay call")
+        rep = run_workflow_script(
+            script,
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            capability_registry=registry,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.ok is False
+    assert rep.error["code"] == "task_stopped"
+    assert persisted.status == "failed"
+    assert len(calls) == 1
+
+
+def test_control_stop_active_replay_blocks_script_capability_dispatch():
+    calls = []
+    registry = CapabilityRegistry()
+    registry.register("tools.echo", lambda ctx: calls.append(ctx["run"]) or {"ok": True})
+    script = META + 'return await capability("tools.echo", {}, label="inventory")\n'
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            capability_registry=registry,
+        )
+        assert rec.ok, rec.error
+        controls = InMemoryControlStore()
+        stop_run(controls, "replay", reason="active replay stop")
+        rep = run_workflow_script(
+            script,
+            store=store,
+            run_id="replay",
+            replay_from="src",
+            capability_registry=registry,
+            control_store=controls,
+        )
+        persisted = store.load_run("replay")
+
+    assert rep.stopped is True
+    assert rep.error["code"] == "run_stopped"
+    assert persisted.status == "stopped"
+    assert len(calls) == 1
 
 
 def test_unregistered_capability_fails_closed():
@@ -349,7 +449,12 @@ def test_replayable_capability_is_cached_and_not_redispatched():
 
     with TemporaryDirectory() as tmp:
         store = ScriptRunStore(Path(tmp) / "runs")
-        rec = run_workflow_script(script, store=store, run_id="src", capability_registry=registry)
+        rec = run_workflow_script(
+            script,
+            store=store,
+            run_id="src",
+            capability_registry=registry,
+        )
         assert rec.ok, rec.error
         rep = run_workflow_script(
             script,

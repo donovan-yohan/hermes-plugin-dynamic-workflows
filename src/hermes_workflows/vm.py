@@ -209,6 +209,7 @@ class CapabilityBroker:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        active_run_id: Optional[str] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
@@ -231,6 +232,10 @@ class CapabilityBroker:
         # a replay reattaches the same card rather than opening a duplicate.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        # Operator controls are scoped to the run currently being driven. Replays
+        # intentionally keep the original run as idempotency_root for card/cache
+        # convergence, but pause/stop/task_stop must read the fresh replay run id.
+        self._active_run_id = active_run_id or idempotency_root
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
         self._control_store = control_store
@@ -274,7 +279,7 @@ class CapabilityBroker:
     def _control_state(self):
         if self._control_store is None:
             return None
-        return project_control_state(self._idempotency_root, self._control_store.list_for(self._idempotency_root))
+        return project_control_state(self._active_run_id, self._control_store.list_for(self._active_run_id))
 
     def _deny_for_control(self, decision, *, call_id: Any, method: str) -> None:
         info = {
@@ -885,6 +890,7 @@ class WorkflowVM:
         deterministic_runner: bool = False,
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
+        active_run_id: Optional[str] = None,
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
@@ -900,6 +906,7 @@ class WorkflowVM:
         # Durable Kanban awaitable wiring (issue #5): forwarded to the broker.
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
+        self._active_run_id = active_run_id or idempotency_root
         # Generic host-owned capability API wiring (issue #29): forwarded to the broker.
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy
@@ -938,6 +945,7 @@ class WorkflowVM:
             deterministic_runner=self._deterministic_runner,
             kanban_backend=self._kanban_backend,
             idempotency_root=self._idempotency_root,
+            active_run_id=self._active_run_id,
             capability_registry=self._capability_registry,
             capability_policy=self._capability_policy,
             control_store=self._control_store,
@@ -1449,6 +1457,7 @@ def run_script(
             deterministic_runner=deterministic,
             kanban_backend=kanban_backend,
             idempotency_root=idempotency_root,
+            active_run_id=idempotency_root,
             capability_registry=capability_registry,
             capability_policy=capability_policy,
             control_store=control_store,
@@ -1496,6 +1505,7 @@ def run_script(
         deterministic_runner=deterministic,
         kanban_backend=kanban_backend,
         idempotency_root=idempotency_root,
+        active_run_id=persist_run_id,
         capability_registry=capability_registry,
         capability_policy=capability_policy,
         control_store=control_store,
