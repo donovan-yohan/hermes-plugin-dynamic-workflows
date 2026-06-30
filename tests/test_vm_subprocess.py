@@ -22,6 +22,7 @@ from pathlib import Path
 from hermes_workflows import run_workflow_script
 from hermes_workflows.agents import StubAgentRunner
 from hermes_workflows.errors import ScriptValidationError
+from hermes_workflows.script_store import ReplayCache, ReplayEntry, replay_args_hash
 from hermes_workflows.vm import CapabilityBroker, VMLimits, WorkflowVM, _scrubbed_env, run_script
 from hermes_workflows import rpc
 
@@ -479,6 +480,43 @@ def test_broker_kanban_routes_to_reserved_runner():
 def test_broker_log_and_phase_are_noops_returning_none():
     assert _broker().handle(_call("log", {"message": "x"}))["value"] is None
     assert _broker().handle(_call("phase", {"title": "p"}))["value"] is None
+
+
+def test_replay_hit_journal_callback_can_reenter_broker_without_deadlock():
+    params = {"message": "cached"}
+    replay = ReplayCache(
+        {
+            1: ReplayEntry(
+                call_id=1,
+                method="log",
+                args_hash=replay_args_hash("log", params),
+                value=None,
+            )
+        },
+        source_run_id="src",
+    )
+    reentered = threading.Event()
+    reentrant_rets = []
+
+    def journal(event):
+        if event.get("replayed") and not reentered.is_set():
+            reentered.set()
+            reentrant_rets.append(broker.handle(_call("log", {"message": "reentrant"}, call_id=2)))
+
+    broker = CapabilityBroker(StubAgentRunner(), VMLimits(), journal=journal, replay=replay)
+    replay_rets = []
+    worker = threading.Thread(
+        target=lambda: replay_rets.append(broker.handle(_call("log", params, call_id=1))),
+        daemon=True,
+    )
+
+    worker.start()
+    worker.join(0.5)
+
+    assert not worker.is_alive(), "replay hit deadlocked when journal callback re-entered broker.handle"
+    assert reentered.is_set()
+    assert replay_rets[0]["ok"] is True
+    assert reentrant_rets[0]["ok"] is True
 
 
 def test_run_script_convenience_matches_vm():
