@@ -436,7 +436,7 @@ class ScriptRunStore:
         }
         for key in (
             "agent_id", "profile", "capability", "label", "phase", "phase_title", "fingerprint",
-            "error", "replayed", "cache", "has_value",
+            "error", "replayed", "cache", "has_value", "attempt", "max_retries",
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)

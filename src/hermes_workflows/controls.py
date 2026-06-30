@@ -966,7 +966,7 @@ def list_runs(
         links = link_resolver(record) if callable(link_resolver) else {}
         summary = summarize_run(
             record,
-            kind=kind,
+            kind=str(getattr(record, "kind", kind) or kind),
             control_state=state,
             wait_count=waits_by_run.get(run_id, 0),
             links=links if isinstance(links, dict) else {},

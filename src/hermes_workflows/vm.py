@@ -141,6 +141,10 @@ class VMLimits:
     max_runtime_s: float = 30.0
     allow_nested_workflows: bool = False
     token_budget: Optional[int] = None
+    # Schema-constrained prompt child agents may retry invalid/missing structured
+    # output before surfacing a typed ``schema`` denial. Counts retries after the
+    # initial attempt (``2`` => up to three child-agent invocations total).
+    max_schema_retries: int = 2
     # Durable suspend window for an unresolved ``on_block="pause"`` Kanban await
     # (issue #5). ``None`` (default) keeps the prior behaviour: a paused await
     # blocks in-process until the run deadline, then fails with ``kanban_timeout``.
@@ -673,6 +677,8 @@ class CapabilityBroker:
 
         request = _prompt_agent_request(params)
         self._check_token_budget()
+        # Count the script-visible prompt agent call once; schema retries below may
+        # cross the child-runner boundary again but remain bounded by max_schema_retries.
         self._agent_calls += 1
         if self._agent_calls > self._limits.max_agent_calls:
             raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
@@ -683,18 +689,74 @@ class CapabilityBroker:
 
         fingerprint, _args_hash = _prompt_agent_cache_identity(request)
         self._emit_prompt_agent_event("agent_started", call_id, request, fingerprint, ok=True)
-        output = self._child_runner(request)
-        if not isinstance(output, dict):
-            raise CapabilityDenied(
-                f"prompt child agent returned {type(output).__name__}, expected dict", code="bad_output"
-            )
-        safe_output = redact_credentials(_json_safe(output))
-        assert isinstance(safe_output, dict)
-        _validate_output(safe_output, request.schema)
-        usage = _non_negative_token_usage(safe_output)
-        if usage is not None:
-            self._tokens += usage
-        return safe_output
+        return self._invoke_prompt_agent_with_schema_retry(call_id, request)
+
+    def _invoke_prompt_agent_with_schema_retry(
+        self, call_id: Any, request: ChildAgentRequest
+    ) -> dict[str, Any]:
+        """Invoke a prompt child agent, retrying schema-invalid structured output."""
+
+        assert self._child_runner is not None
+        retry_limit = max(0, int(self._limits.max_schema_retries))
+        attempts = retry_limit + 1
+        base_context = dict(request.context)
+        last_error: Optional[CapabilityDenied] = None
+
+        for attempt in range(1, attempts + 1):
+            effective_request = request
+            if last_error is not None:
+                effective_request = _request_with_schema_retry_context(
+                    request,
+                    base_context=base_context,
+                    attempt=attempt,
+                    max_retries=retry_limit,
+                    error=last_error,
+                )
+            try:
+                output = self._child_runner(effective_request)
+                if not isinstance(output, dict):
+                    raise CapabilityDenied(
+                        f"prompt child agent returned {type(output).__name__}, expected dict", code="schema"
+                    )
+                safe_output = redact_credentials(_json_safe(output))
+                assert isinstance(safe_output, dict)
+                _validate_output(safe_output, effective_request.schema)
+            except CapabilityDenied as exc:
+                if exc.code != "schema" or attempt >= attempts:
+                    if exc.code == "schema" and attempt >= attempts:
+                        raise CapabilityDenied(
+                            f"schema validation failed after {attempts} attempt(s): {exc}", code="schema"
+                        ) from exc
+                    raise
+                self._record_schema_retry(call_id, request, attempt, retry_limit)
+                last_error = exc
+                continue
+
+            usage = _non_negative_token_usage(safe_output)
+            if usage is not None:
+                self._tokens += usage
+            return safe_output
+
+        raise CapabilityDenied("schema validation failed after retry exhaustion", code="schema")
+
+    def _record_schema_retry(
+        self,
+        call_id: Any,
+        request: ChildAgentRequest,
+        attempt: int,
+        max_retries: int,
+    ) -> None:
+        """Journal a redacted schema-retry attempt for progress/status consumers."""
+        event = self._call_event(
+            call_id,
+            "agent",
+            {"agent_id": "prompt", "label": request.label, "phase": request.phase},
+            ok=False,
+            error="schema_retry",
+        )
+        event["attempt"] = attempt
+        event["max_retries"] = max_retries
+        self._emit(event)
 
     def _handle_kanban(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         profile = params.get("profile")
@@ -1121,6 +1183,34 @@ def _prompt_agent_cache_identity(request: ChildAgentRequest) -> tuple[str, str]:
     return fingerprint, args_hash
 
 
+def _request_with_schema_retry_context(
+    request: ChildAgentRequest,
+    *,
+    base_context: dict[str, Any],
+    attempt: int,
+    max_retries: int,
+    error: CapabilityDenied,
+) -> ChildAgentRequest:
+    """Return ``request`` with validation-error context for a retry attempt."""
+    context = dict(base_context)
+    context["schema_validation_error"] = {
+        "attempt": attempt,
+        "max_retries": max_retries,
+        "code": error.code,
+        "message": str(error),
+    }
+    return ChildAgentRequest(
+        prompt=request.prompt,
+        label=request.label,
+        phase=request.phase,
+        schema=request.schema,
+        model=request.model,
+        effort=request.effort,
+        isolation=request.isolation,
+        context=context,
+    )
+
+
 def _json_safe(value: Any) -> Any:
     """Coerce child-agent output into a deterministic JSON-safe shape."""
     if isinstance(value, dict):
@@ -1273,6 +1363,7 @@ class WorkflowVM:
                     "max_agent_calls": self._limits.max_agent_calls,
                     "max_capability_calls": self._limits.max_capability_calls,
                     "max_runtime_s": self._limits.max_runtime_s,
+                    "max_schema_retries": self._limits.max_schema_retries,
                 },
                 "budget": {"total": self._limits.token_budget, "spent": 0,
                            "remaining": self._limits.token_budget},
@@ -1453,6 +1544,7 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "max_runtime_s": limits.max_runtime_s,
         "allow_nested_workflows": limits.allow_nested_workflows,
         "token_budget": limits.token_budget,
+        "max_schema_retries": limits.max_schema_retries,
         "kanban_suspend_after_s": limits.kanban_suspend_after_s,
     }
 
@@ -1592,6 +1684,7 @@ def _limits_from_view(view: Any) -> VMLimits:
             view, "allow_nested_workflows", default.allow_nested_workflows
         ),
         token_budget=_req_token_budget(view, default.token_budget),
+        max_schema_retries=_req_int(view, "max_schema_retries", default.max_schema_retries),
         kanban_suspend_after_s=_req_opt_float(
             view, "kanban_suspend_after_s", default.kanban_suspend_after_s
         ),
