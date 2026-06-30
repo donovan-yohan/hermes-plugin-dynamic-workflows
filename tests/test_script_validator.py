@@ -64,10 +64,21 @@ def test_meta_phases_field_is_allowed():
     ]
 
 
+def test_legacy_meta_phase_strings_are_normalized():
+    src = (
+        'meta = {"name": "x", "description": "y", "phases": ["Plan", "  Build  "]}\n'
+        "log('go')\n"
+    )
+    v = validate_script(src)
+    assert v.ok
+    assert v.meta is not None
+    assert v.meta["phases"] == [{"title": "Plan"}, {"title": "Build"}]
+
+
 def test_invalid_meta_phases_are_rejected_with_stable_diagnostics():
     v = validate_script(
         'meta = {"name": "x", "description": "y", "phases": '
-        '["plan", {"detail": "missing title"}, {"title": "", "detail": "x"}, {"title": "Build", "detail": 3}]}\n'
+        '["", {"detail": "missing title"}, {"title": "", "detail": "x"}, {"title": "Build", "detail": 3}]}\n'
         "log('go')\n"
     )
     diagnostics = [d.as_dict() for d in v.diagnostics]

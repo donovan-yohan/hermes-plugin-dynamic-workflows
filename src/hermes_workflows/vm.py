@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import rpc
+from . import errors as err, rpc
 from .agents import AgentRunner, StubAgentRunner, is_known_agent, kanban_runner_id, is_kanban_runner_id
 from .capabilities import (
     CapabilityPolicy,
@@ -70,7 +70,7 @@ from .script_store import (
     replay_args_hash,
     script_sha256,
 )
-from .script_validator import validate_script
+from .script_validator import ScriptValidation, validate_script
 
 __all__ = [
     "VMLimits",
@@ -95,6 +95,15 @@ _MISS = object()
 # re-complete with bad output rapidly; the await is deadline-bounded, but this keeps
 # a buggy worker from amplifying into unbounded journal writes / board comments.
 _MAX_RESULT_INVALID_RECORDS = 8
+
+_SCRIPT_META_DIAGNOSTIC_CODES = frozenset(
+    {
+        err.E_SCRIPT_META_POSITION,
+        err.E_SCRIPT_META_SHAPE,
+        err.E_SCRIPT_META_FIELDS,
+        err.E_SCRIPT_META_PHASES,
+    }
+)
 
 # Output-schema type table (mirrors runtime._TYPE_MAP) for brokered agent calls.
 _TYPE_MAP: dict[str, tuple[type, ...]] = {
@@ -1076,6 +1085,15 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
     }
 
 
+def _validation_meta(validation: ScriptValidation) -> Optional[dict[str, Any]]:
+    """Return extracted script meta only when the meta contract itself passed."""
+    if validation.meta is None:
+        return None
+    if any(d.code in _SCRIPT_META_DIAGNOSTIC_CODES for d in validation.diagnostics):
+        return None
+    return validation.meta
+
+
 class _CorruptLimitsView(ValueError):
     """A persisted ``_limits_view`` carries a present-but-invalid value.
 
@@ -1340,7 +1358,7 @@ def run_script(
     validation = validate_script(script)
     if validate and not validation.ok:
         raise ScriptValidationError(validation.diagnostics)
-    validation_meta = validation.meta if validation.ok else None
+    validation_meta = _validation_meta(validation)
 
     persist_run_id = run_id if run_id is not None else store.next_run_id(script, args)
     store.begin(
@@ -1393,7 +1411,7 @@ def run_script(
     store.finish(
         persist_run_id,
         status=status,
-        meta=result.meta,
+        meta=result.meta if result.meta is not None else validation_meta,
         value=result.value,
         error=result.error,
     )

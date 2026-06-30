@@ -39,6 +39,7 @@ PHASE_META = (
     'meta = {"name": "demo", "description": "d", '
     '"phases": [{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
 )
+LEGACY_PHASE_META = 'meta = {"name": "demo", "description": "d", "phases": ["Plan", "Build"]}\n'
 
 # A script exercising every replayable method (log, agent, phase, kanban_agent).
 FULL_SCRIPT = META + (
@@ -161,6 +162,31 @@ def test_script_run_snapshot_persists_declared_phase_metadata():
         assert snapshot["phases"] == loaded.phases
         phase_call = [e for e in store.journal("run_phases") if e.get("method") == "phase"][0]
         assert phase_call["phase_title"] == "Plan"
+
+
+def test_script_run_snapshot_persists_legacy_string_phase_metadata():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        script = LEGACY_PHASE_META + 'phase("Plan")\nreturn {"ok": True}\n'
+        res = run_workflow_script(script, store=store, run_id="run_legacy_phases")
+        assert res.ok, res.error
+
+        loaded = store.load_run("run_legacy_phases")
+        assert loaded.meta is not None
+        assert loaded.meta["phases"] == [{"title": "Plan"}, {"title": "Build"}]
+        assert loaded.phases == [{"title": "Plan"}, {"title": "Build"}]
+
+
+def test_validate_false_preserves_valid_phase_metadata_on_static_error():
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        script = LEGACY_PHASE_META + "import os\n"
+        res = run_workflow_script(script, store=store, run_id="run_invalid_with_meta", validate=False)
+        assert not res.ok
+
+        loaded = store.load_run("run_invalid_with_meta")
+        assert loaded.status == "failed"
+        assert loaded.phases == [{"title": "Plan"}, {"title": "Build"}]
 
 
 def test_minted_run_id_is_used_when_omitted():

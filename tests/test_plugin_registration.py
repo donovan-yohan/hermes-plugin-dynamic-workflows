@@ -160,7 +160,7 @@ def test_registered_workflow_handler_runs_saved_script_harness():
     assert run_payload["data"]["result"]["value"] == {"value": 42}
 
 
-def test_workflow_control_status_surfaces_script_declared_phases():
+def _workflow_control_status_for_saved_script(source: str) -> dict[str, Any]:
     old_state_dir = os.environ.get("HERMES_WORKFLOWS_STATE_DIR")
     old_script_dir = os.environ.get("HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR")
     with tempfile.TemporaryDirectory() as tmp:
@@ -171,11 +171,6 @@ def test_workflow_control_status_surfaces_script_declared_phases():
             plugin = _load_plugin_root()
             ctx = FakeContext()
             plugin.register(ctx)
-            source = (
-                'meta = {"name": "saved", "description": "plugin script", '
-                '"phases": [{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
-                'return {"value": args["value"]}\n'
-            )
             json.loads(
                 ctx.tools["workflow"]["handler"](
                     {"action": "script_save", "script_name": "saved", "script_source": source}
@@ -187,7 +182,7 @@ def test_workflow_control_status_surfaces_script_declared_phases():
                 )
             )
             run_id = run_payload["data"]["result"]["run_id"]
-            status_payload = json.loads(ctx.tools["workflow_control"]["handler"]({"action": "status", "run_id": run_id}))
+            return json.loads(ctx.tools["workflow_control"]["handler"]({"action": "status", "run_id": run_id}))
         finally:
             if old_state_dir is None:
                 os.environ.pop("HERMES_WORKFLOWS_STATE_DIR", None)
@@ -198,9 +193,33 @@ def test_workflow_control_status_surfaces_script_declared_phases():
             else:
                 os.environ["HERMES_WORKFLOWS_SCRIPT_CATALOG_DIR"] = old_script_dir
 
+
+def test_workflow_control_status_surfaces_script_declared_phases():
+    source = (
+        'meta = {"name": "saved", "description": "plugin script", '
+        '"phases": [{"title": "Plan", "detail": "choose work"}, {"title": "Build"}]}\n'
+        'return {"value": args["value"]}\n'
+    )
+    status_payload = _workflow_control_status_for_saved_script(source)
+
     assert status_payload["success"] is True
     assert status_payload["data"]["lifecycle"] == "succeeded"
     assert status_payload["data"]["phases"] == [
         {"id": "phase_1", "title": "Plan", "detail": "choose work", "status": "queued"},
+        {"id": "phase_2", "title": "Build", "detail": "", "status": "queued"},
+    ]
+
+
+def test_workflow_control_status_surfaces_legacy_script_phase_strings():
+    source = (
+        'meta = {"name": "saved", "description": "plugin script", "phases": ["Plan", "Build"]}\n'
+        'return {"value": args["value"]}\n'
+    )
+    status_payload = _workflow_control_status_for_saved_script(source)
+
+    assert status_payload["success"] is True
+    assert status_payload["data"]["lifecycle"] == "succeeded"
+    assert status_payload["data"]["phases"] == [
+        {"id": "phase_1", "title": "Plan", "detail": "", "status": "queued"},
         {"id": "phase_2", "title": "Build", "detail": "", "status": "queued"},
     ]

@@ -253,9 +253,10 @@ def normalize_meta_phases(meta: Any) -> list[dict[str, str]]:
     """Return normalized script phase declarations from a validated ``meta``.
 
     The public script contract is ``meta.phases = [{"title": str, "detail"?: str}]``.
-    ``id`` is optional and preserved when present. Invalid/unvalidated shapes
-    return an empty list so status surfaces fail closed rather than leaking
-    arbitrary data.
+    Legacy ``meta.phases = ["title", ...]`` entries are accepted and normalized
+    to ``{"title": str}``. ``id`` is optional and preserved when present.
+    Invalid/unvalidated shapes return an empty list so status surfaces fail
+    closed rather than leaking arbitrary data.
     """
     if not isinstance(meta, dict):
         return []
@@ -264,6 +265,9 @@ def normalize_meta_phases(meta: Any) -> list[dict[str, str]]:
         return []
     out: list[dict[str, str]] = []
     for phase in phases:
+        if isinstance(phase, str) and phase.strip():
+            out.append({"title": phase.strip()})
+            continue
         if not isinstance(phase, dict) or not _nonempty_str(phase.get("title")):
             return []
         row = {"title": str(phase["title"]).strip()}
@@ -285,8 +289,17 @@ def _validate_meta_phases(meta: dict[str, Any], diags: list[Diagnostic]) -> Opti
     normalized: list[dict[str, str]] = []
     for index, phase in enumerate(phases):
         pointer = f"/script/meta/phases/{index}"
+        if isinstance(phase, str):
+            title = phase.strip()
+            if not title:
+                diags.append(
+                    _e_ptr(err.E_SCRIPT_META_PHASES, "each meta phase must define a non-empty title", pointer)
+                )
+                continue
+            normalized.append({"title": title})
+            continue
         if not isinstance(phase, dict):
-            diags.append(_e_ptr(err.E_SCRIPT_META_PHASES, "each meta phase must be a dict", pointer))
+            diags.append(_e_ptr(err.E_SCRIPT_META_PHASES, "each meta phase must be a dict or string title", pointer))
             continue
         title = phase.get("title")
         if not _nonempty_str(title):
