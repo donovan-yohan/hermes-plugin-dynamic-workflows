@@ -968,8 +968,11 @@ effects funnel through the injected `AgentRunner` boundary as the JSON runtime
 a live Hermes. Prompt-shaped `agent(prompt, opts)` effects cross the separate
 `ChildAgentRunner` seam: by default they fail closed unless a host supplies a
 runner; the Hermes plugin can now explicitly supply a `delegate_task`-backed
-runner with `child_agent_backend="delegate"` (foreground structured summary
-parse) or `"delegate_background"` (dispatch-handle envelope only).
+runner with `child_agent_backend="delegate_task"` (foreground structured summary
+parse) or `"delegate_task_background"` (redacted dispatch-handle envelope only).
+The adapter is intentionally foreground-script-only for now: local background
+script runs reject `child_agent_backend` until delegate handles, completions, and
+stop/retry visibility are persisted into workflow status/control.
 
 ### 5.3 Generic capability registry and policy (#29)
 

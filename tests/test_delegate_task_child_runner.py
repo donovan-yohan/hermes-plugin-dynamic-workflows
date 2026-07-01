@@ -5,13 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from hermes_workflows import (
-    ChildAgentRequest,
-    DelegateTaskChildAgentRunner,
-    build_delegate_task_context,
-    parse_delegate_task_json_summary,
-    run_workflow_script,
-)
+from hermes_workflows import ChildAgentRequest, DelegateTaskChildAgentRunner, run_workflow_script
+from hermes_workflows.delegation import build_delegate_task_context, parse_delegate_task_json_summary
 
 META = 'meta = {"name": "delegate-child", "description": "d"}\n'
 
@@ -19,10 +14,10 @@ META = 'meta = {"name": "delegate-child", "description": "d"}\n'
 class FakeDispatcher:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: list[dict[str, Any]] = []
 
-    def __call__(self, tool_name: str, args: dict[str, Any]) -> str:
-        self.calls.append((tool_name, args))
+    def __call__(self, args: dict[str, Any]) -> str:
+        self.calls.append(args)
         return json.dumps(self.payload)
 
 
@@ -70,8 +65,7 @@ def test_delegate_task_runner_sync_parses_structured_summary():
     result = runner(ChildAgentRequest("answer as JSON", schema={"answer": "string"}))
 
     assert result == {"answer": "ok", "_tokens": 5}
-    assert dispatcher.calls[0][0] == "delegate_task"
-    args = dispatcher.calls[0][1]
+    args = dispatcher.calls[0]
     assert args["goal"] == "answer as JSON"
     assert args["background"] is False
     assert args["role"] == "leaf"
@@ -111,10 +105,21 @@ def test_delegate_task_runner_background_returns_dispatch_handle_envelope():
         "delegation_id": "deleg_123",
         "mode": "background",
         "count": 1,
-        "goals": ["do work"],
         "note": "keep working",
     }
-    assert dispatcher.calls[0][1]["background"] is True
+    assert dispatcher.calls[0]["background"] is True
+
+
+def test_delegate_task_runner_rejects_extra_args_reserved_field_collision():
+    dispatcher = FakeDispatcher({"results": []})
+    runner = DelegateTaskChildAgentRunner(dispatcher, extra_args={"background": True})
+
+    try:
+        runner(ChildAgentRequest("do work"))
+    except ValueError as exc:
+        assert "reserved fields" in str(exc)
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("expected reserved field collision to fail")
 
 
 def test_delegate_task_runner_can_power_workflow_prompt_agent_sync():

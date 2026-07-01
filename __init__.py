@@ -285,8 +285,8 @@ WORKFLOW_SCHEMA = {
             },
             "child_agent_backend": {
                 "type": ["string", "null"],
-                "enum": ["delegate", "delegate_background", None],
-                "description": "Optional backend for script agent(prompt, opts) calls. delegate waits for a structured delegate_task result; delegate_background returns a dispatch handle envelope.",
+                "enum": ["delegate_task", "delegate_task_background", None],
+                "description": "Optional backend for foreground script agent(prompt, opts) calls. delegate_task waits for a structured delegate_task result; delegate_task_background returns a redacted dispatch-handle envelope.",
                 "default": None,
             },
             "include_source": {
@@ -851,6 +851,33 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         return _error(exc)
 
 
+_DELEGATE_CHILD_BACKENDS = {
+    "delegate_task": False,
+    "delegate_task_background": True,
+}
+_SCRIPT_CHILD_AGENT_OPERATIONS = {"run_facade_script", "run_script"}
+
+
+def _workflow_operation_from_params(params: dict[str, Any]) -> str:
+    facade_name = params.get("name") if params.get("name") is not None else params.get("script_name")
+    has_facade_script = (
+        params.get("script") is not None
+        or params.get("scriptPath") is not None
+        or facade_name is not None
+    )
+    return cast(
+        str,
+        params.get("action")
+        or (
+            "validate" if params.get("dry_run") else
+            "run_facade_script" if has_facade_script else
+            "run_template" if params.get("template_name") else
+            "status" if params.get("definition") is None and params.get("run_id") else
+            "run"
+        ),
+    )
+
+
 def _delegate_child_agent_runner(
     params: dict[str, Any],
     *,
@@ -862,20 +889,26 @@ def _delegate_child_agent_runner(
     backend = params.get("child_agent_backend")
     if backend in (None, ""):
         return None
-    if backend not in {"delegate", "delegate_background"}:
-        raise ValueError("child_agent_backend must be 'delegate' or 'delegate_background'")
+    if backend not in _DELEGATE_CHILD_BACKENDS:
+        raise ValueError("child_agent_backend must be 'delegate_task' or 'delegate_task_background'")
+    operation = _workflow_operation_from_params(params)
+    if operation not in _SCRIPT_CHILD_AGENT_OPERATIONS:
+        raise ValueError("child_agent_backend is only supported for script runs")
+    if params.get("background") or params.get("execution_mode") == "background":
+        raise ValueError("child_agent_backend is not supported for local background script runs")
     dispatch_tool = getattr(plugin_context, "dispatch_tool", None)
     if not callable(dispatch_tool):
         raise ValueError("child_agent_backend requires plugin context dispatch_tool support")
-    forwarded = dict(dispatch_kwargs or {})
-    forwarded.pop("plugin_context", None)
+    forwarded: dict[str, Any] = {}
+    if dispatch_kwargs and dispatch_kwargs.get("parent_agent") is not None:
+        forwarded["parent_agent"] = dispatch_kwargs["parent_agent"]
 
-    def _dispatch(tool_name: str, args: dict[str, Any]) -> str | dict[str, Any]:
-        return cast(str | dict[str, Any], dispatch_tool(tool_name, args, **forwarded))
+    def _dispatch(args: dict[str, Any]) -> str | dict[str, Any]:
+        return cast(str | dict[str, Any], dispatch_tool("delegate_task", args, **forwarded))
 
     return DelegateTaskChildAgentRunner(
         _dispatch,
-        background=backend == "delegate_background",
+        background=_DELEGATE_CHILD_BACKENDS[backend],
     )
 
 

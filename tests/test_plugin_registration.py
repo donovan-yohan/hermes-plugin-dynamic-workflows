@@ -273,7 +273,7 @@ def test_registered_workflow_handler_can_use_delegate_child_agent_backend():
             )
             payload = json.loads(
                 ctx.tools["workflow"]["handler"](
-                    {"script": source, "child_agent_backend": "delegate"},
+                    {"script": source, "child_agent_backend": "delegate_task"},
                     parent_agent=object(),
                     plugin_context=object(),  # host may pass this too; registered ctx still wins
                 )
@@ -291,6 +291,7 @@ def test_registered_workflow_handler_can_use_delegate_child_agent_backend():
     assert tool_name == "delegate_task"
     assert args["background"] is False
     assert "return JSON" == args["goal"]
+    assert set(kwargs) == {"parent_agent"}
     assert kwargs["parent_agent"] is not None
 
 
@@ -315,7 +316,7 @@ def test_registered_workflow_handler_delegate_background_returns_handle():
             )
             payload = json.loads(
                 ctx.tools["workflow"]["handler"](
-                    {"script": source, "child_agent_backend": "delegate_background"},
+                    {"script": source, "child_agent_backend": "delegate_task_background"},
                     parent_agent=object(),
                 )
             )
@@ -329,4 +330,44 @@ def test_registered_workflow_handler_delegate_background_returns_handle():
     value = payload["data"]["result"]["value"]
     assert value["delegation_status"] == "dispatched"
     assert value["delegation_id"] == "deleg_plugin"
+    assert "goals" not in value
     assert ctx.dispatches[0][1]["background"] is True
+
+
+def test_delegate_child_agent_backend_rejects_local_background_runs():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {
+                "action": "run_script",
+                "name": "saved",
+                "child_agent_backend": "delegate_task_background",
+                "background": True,
+            },
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "not supported for local background" in payload["error"]["message"]
+    assert ctx.dispatches == []
+
+
+def test_delegate_child_agent_backend_is_script_run_only():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {"action": "catalog", "child_agent_backend": "delegate_task"},
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "only supported for script runs" in payload["error"]["message"]
+    assert ctx.dispatches == []

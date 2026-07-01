@@ -134,12 +134,7 @@ from .agents import (
     kanban_runner_id,
     is_kanban_runner_id,
 )
-from .delegation import (
-    DelegateTaskChildAgentRunner,
-    ToolDispatcher,
-    build_delegate_task_context,
-    parse_delegate_task_json_summary,
-)
+from .delegation import DelegateTaskChildAgentRunner
 from .registry import (
     RunStore,
     InMemoryRunStore,
@@ -363,9 +358,6 @@ __all__ = [
     "kanban_runner_id",
     "is_kanban_runner_id",
     "DelegateTaskChildAgentRunner",
-    "ToolDispatcher",
-    "build_delegate_task_context",
-    "parse_delegate_task_json_summary",
     # registry
     "RunStore",
     "InMemoryRunStore",

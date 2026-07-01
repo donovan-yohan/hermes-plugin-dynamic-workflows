@@ -1,10 +1,10 @@
 """Hermes ``delegate_task`` adapter for workflow prompt child agents.
 
 The core workflow package stays pure stdlib and host-neutral.  This module is a
-small adapter boundary: callers inject a dispatcher that knows how to call a
-host tool (for the Hermes plugin this is ``PluginContext.dispatch_tool``), and
-we convert workflow-script ``agent(prompt, opts)`` requests into
-``delegate_task`` calls.
+small adapter boundary: callers inject a dispatcher that knows how to call
+``delegate_task`` (for the Hermes plugin this wraps ``PluginContext.dispatch_tool``),
+and we convert workflow-script ``agent(prompt, opts)`` requests into delegate
+calls.
 """
 
 from __future__ import annotations
@@ -17,23 +17,23 @@ from typing import Any, Protocol
 from .agents import ChildAgentRequest, ChildAgentRunner
 
 __all__ = [
-    "ToolDispatcher",
+    "DelegateTaskDispatcher",
     "DelegateTaskChildAgentRunner",
     "build_delegate_task_context",
     "parse_delegate_task_json_summary",
 ]
 
 
-class ToolDispatcher(Protocol):
-    """Callable used to invoke a host-owned Hermes tool."""
+class DelegateTaskDispatcher(Protocol):
+    """Callable used to invoke host-owned Hermes ``delegate_task``."""
 
-    def __call__(self, tool_name: str, args: dict[str, Any]) -> str | dict[str, Any]:
-        """Dispatch ``tool_name`` with JSON-like ``args`` and return the tool payload."""
+    def __call__(self, args: dict[str, Any]) -> str | dict[str, Any]:
+        """Dispatch ``delegate_task`` with JSON-like ``args`` and return the payload."""
         ...
 
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(\{.*\})\s*```\s*$", re.IGNORECASE | re.DOTALL)
+_RESERVED_DELEGATE_TASK_ARGS = frozenset({"goal", "context", "role", "background"})
 
 
 def build_delegate_task_context(request: ChildAgentRequest) -> str:
@@ -72,30 +72,20 @@ def parse_delegate_task_json_summary(summary: str) -> dict[str, Any]:
 
     ``delegate_task`` returns child summaries, not a typed object channel.  For
     schema-backed workflow calls we instruct the child to return only JSON, then
-    accept either a bare object or a fenced JSON object for robustness.
+    accept either a bare object or a single fenced JSON object for robustness.
     """
 
     text = summary.strip()
-    candidates = [text]
-    fence = _JSON_FENCE_RE.search(text)
-    if fence:
-        candidates.insert(0, fence.group(1).strip())
-    obj_match = _JSON_OBJECT_RE.search(text)
-    if obj_match:
-        candidates.append(obj_match.group(0).strip())
+    fence = _JSON_FENCE_RE.match(text)
+    candidates = [fence.group(1).strip()] if fence else [text]
 
-    errors: list[str] = []
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError as exc:
-            errors.append(str(exc))
-            continue
-        if not isinstance(value, dict):
-            raise ValueError("delegate_task summary JSON must be an object")
-        return value
-    detail = errors[0] if errors else "no JSON object found"
-    raise ValueError(f"delegate_task summary did not contain a JSON object: {detail}")
+    try:
+        value = json.loads(candidates[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"delegate_task summary did not contain a JSON object: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("delegate_task summary JSON must be an object")
+    return value
 
 
 @dataclass
@@ -108,20 +98,25 @@ class DelegateTaskChildAgentRunner(ChildAgentRunner):
     pretend the workflow has the child result yet.
     """
 
-    dispatch: ToolDispatcher
+    dispatch: DelegateTaskDispatcher
     background: bool = False
     role: str = "leaf"
     extra_args: dict[str, Any] = field(default_factory=dict)
 
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
-        args: dict[str, Any] = {
-            "goal": request.prompt,
-            "context": build_delegate_task_context(request),
-            "role": self.role,
-            "background": self.background,
-        }
-        args.update(self.extra_args)
-        payload = self.dispatch("delegate_task", args)
+        collisions = sorted(set(self.extra_args).intersection(_RESERVED_DELEGATE_TASK_ARGS))
+        if collisions:
+            raise ValueError(f"delegate_task extra_args cannot override reserved fields: {', '.join(collisions)}")
+        args: dict[str, Any] = dict(self.extra_args)
+        args.update(
+            {
+                "goal": request.prompt,
+                "context": build_delegate_task_context(request),
+                "role": self.role,
+                "background": self.background,
+            }
+        )
+        payload = self.dispatch(args)
         data = _coerce_tool_payload(payload)
         if self.background:
             return _background_dispatch_envelope(data)
@@ -157,7 +152,6 @@ def _background_dispatch_envelope(data: dict[str, Any]) -> dict[str, Any]:
         "delegation_id": data.get("delegation_id"),
         "mode": data.get("mode", "background"),
         "count": data.get("count", 1),
-        "goals": data.get("goals") or [],
         "note": data.get("note"),
     }
 

@@ -26,7 +26,7 @@ First public alpha release line for `hermes-plugin-dynamic-workflows`.
 - Bounded concurrent `parallel()` and no-barrier `pipeline()` item flow with operator-configurable `max_parallel` (wired through the `workflow(action="run_script")` facade) and lifecycle-safe failure: a failed run waits for already-started parent-side runner work and reports any work still running past the deadline instead of returning terminal while it is alive.
 - Local background workflow-script run manager: scripts launch/run/inspect/stop outside the main turn with fail-closed stop/terminal-state lifecycle and operator-visible status.
 - Per-subagent transcript artifacts — per-call journal plus redacted metadata refs (including replay/cache-hit refs), surfaced in background run links.
-- Optional Hermes `delegate_task` child-agent adapter — plugin callers can set `child_agent_backend="delegate"` for foreground structured prompt-agent results or `"delegate_background"` for explicit background dispatch envelopes, while the local script runner remains the workflow controller.
+- Optional Hermes `delegate_task` child-agent adapter — plugin callers can set `child_agent_backend="delegate_task"` for foreground structured prompt-agent results or `"delegate_task_background"` for explicit redacted background dispatch envelopes, while the local script runner remains the workflow controller.
 - Archive-backed loop-until-dry parity fixture exercising parallel fan-out plus prompt/options replay.
 
 ### Fixed
