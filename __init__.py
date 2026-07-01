@@ -13,7 +13,7 @@ import re
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 # Project-local plugin loading does not necessarily install the src-layout
 # package first. Make a checkout usable as a Hermes plugin directory.
@@ -39,6 +39,7 @@ from hermes_workflows.background import (  # noqa: E402
     BackgroundRunStore,
     BackgroundWorkflowRunManager,
 )
+from hermes_workflows.delegation import DelegateTaskChildAgentRunner  # noqa: E402
 from hermes_workflows.controls import FileControlStore  # noqa: E402
 from hermes_workflows.script_store import ScriptRunStore  # noqa: E402
 
@@ -281,6 +282,12 @@ WORKFLOW_SCHEMA = {
                 "type": "boolean",
                 "description": "Shortcut for execution_mode=background on action=run_script.",
                 "default": False,
+            },
+            "child_agent_backend": {
+                "type": ["string", "null"],
+                "enum": ["delegate", "delegate_background", None],
+                "description": "Optional backend for script agent(prompt, opts) calls. delegate waits for a structured delegate_task result; delegate_background returns a dispatch handle envelope.",
+                "default": None,
             },
             "include_source": {
                 "type": "boolean",
@@ -844,10 +851,43 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         return _error(exc)
 
 
+def _delegate_child_agent_runner(
+    params: dict[str, Any],
+    *,
+    plugin_context: Any = None,
+    dispatch_kwargs: Optional[dict[str, Any]] = None,
+) -> Optional[DelegateTaskChildAgentRunner]:
+    """Build a delegate_task-backed child runner when explicitly requested."""
+
+    backend = params.get("child_agent_backend")
+    if backend in (None, ""):
+        return None
+    if backend not in {"delegate", "delegate_background"}:
+        raise ValueError("child_agent_backend must be 'delegate' or 'delegate_background'")
+    dispatch_tool = getattr(plugin_context, "dispatch_tool", None)
+    if not callable(dispatch_tool):
+        raise ValueError("child_agent_backend requires plugin context dispatch_tool support")
+    forwarded = dict(dispatch_kwargs or {})
+    forwarded.pop("plugin_context", None)
+
+    def _dispatch(tool_name: str, args: dict[str, Any]) -> str | dict[str, Any]:
+        return cast(str | dict[str, Any], dispatch_tool(tool_name, args, **forwarded))
+
+    return DelegateTaskChildAgentRunner(
+        _dispatch,
+        background=backend == "delegate_background",
+    )
+
+
 def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
     try:
         session_id = _session_id_from_kwargs(kwargs)
         store = _plugin_store(session_id=session_id)
+        child_agent_runner = _delegate_child_agent_runner(
+            params,
+            plugin_context=kwargs.get("plugin_context"),
+            dispatch_kwargs=kwargs,
+        )
         result = _workflow(
             action=params.get("action"),
             definition=params.get("definition"),
@@ -874,6 +914,7 @@ def _handle_workflow(params: dict[str, Any], **kwargs: Any) -> str:
             script_catalog=_plugin_script_catalog(),
             script_store=_plugin_script_run_store(session_id=session_id),
             background_manager=_plugin_background_manager(session_id=session_id),
+            child_agent_runner=child_agent_runner,
             validate=params.get("validate", True),
             max_parallel=params.get("max_parallel", 8),
             include_steps=params.get("include_steps", True),
@@ -944,7 +985,10 @@ def register(ctx: Any) -> None:
         name="workflow",
         toolset=TOOLSET,
         schema=WORKFLOW_SCHEMA,
-        handler=_handle_workflow,
+        handler=lambda params, **kwargs: _handle_workflow(
+            params,
+            **{**kwargs, "plugin_context": ctx},
+        ),
         description="Validate, run, or inspect a dynamic workflow via one model-facing entry point.",
     )
     ctx.register_tool(
