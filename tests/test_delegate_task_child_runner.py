@@ -110,6 +110,27 @@ def test_delegate_task_runner_background_returns_dispatch_handle_envelope():
     assert dispatcher.calls[0]["background"] is True
 
 
+def test_delegate_task_runner_background_inline_fallback_redacts_prompt_payload():
+    dispatcher = FakeDispatcher(
+        {
+            "results": [{"task_index": 0, "status": "completed", "summary": "done"}],
+            "goal": "secret prompt",
+            "context": "secret context",
+            "nested": {"tasks": [{"goal": "nested secret"}], "safe": "kept"},
+        }
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher, background=True)
+
+    result = runner(ChildAgentRequest("launch"))
+
+    assert result["delegation_status"] == "completed_inline"
+    payload = result["delegate_task"]
+    assert payload["goal"] == "[redacted]"
+    assert payload["context"] == "[redacted]"
+    assert payload["nested"] == {"tasks": "[redacted]", "safe": "kept"}
+    assert payload["results"][0]["summary"] == "done"
+
+
 def test_delegate_task_runner_rejects_extra_args_reserved_field_collision():
     dispatcher = FakeDispatcher({"results": []})
     runner = DelegateTaskChildAgentRunner(dispatcher, extra_args={"background": True})

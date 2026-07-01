@@ -34,6 +34,8 @@ class DelegateTaskDispatcher(Protocol):
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(\{.*\})\s*```\s*$", re.IGNORECASE | re.DOTALL)
 _RESERVED_DELEGATE_TASK_ARGS = frozenset({"goal", "context", "role", "background"})
+_PROMPT_BEARING_KEYS = frozenset({"context", "goal", "goals", "prompt", "prompts", "tasks"})
+_REDACTED = "[redacted]"
 
 
 def build_delegate_task_context(request: ChildAgentRequest) -> str:
@@ -145,7 +147,7 @@ def _background_dispatch_envelope(data: dict[str, Any]) -> dict[str, Any]:
         # delegate_task can fall back to synchronous execution when async delivery
         # is unavailable; surface that honestly instead of losing the result.
         if "results" in data:
-            return {"delegation_status": "completed_inline", "delegate_task": data}
+            return {"delegation_status": "completed_inline", "delegate_task": _redact_prompt_payload(data)}
         raise RuntimeError(f"delegate_task background dispatch failed: {data!r}")
     return {
         "delegation_status": "dispatched",
@@ -154,6 +156,17 @@ def _background_dispatch_envelope(data: dict[str, Any]) -> dict[str, Any]:
         "count": data.get("count", 1),
         "note": data.get("note"),
     }
+
+
+def _redact_prompt_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _REDACTED if str(key).lower() in _PROMPT_BEARING_KEYS else _redact_prompt_payload(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_prompt_payload(child) for child in value]
+    return value
 
 
 def _foreground_result(data: dict[str, Any], request: ChildAgentRequest) -> dict[str, Any]:

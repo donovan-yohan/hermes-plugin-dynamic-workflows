@@ -859,11 +859,10 @@ _SCRIPT_CHILD_AGENT_OPERATIONS = {"run_facade_script", "run_script"}
 
 
 def _workflow_operation_from_params(params: dict[str, Any]) -> str:
-    facade_name = params.get("name") if params.get("name") is not None else params.get("script_name")
     has_facade_script = (
         params.get("script") is not None
         or params.get("scriptPath") is not None
-        or facade_name is not None
+        or params.get("name") is not None
     )
     return cast(
         str,

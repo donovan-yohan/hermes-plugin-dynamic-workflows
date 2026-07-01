@@ -371,3 +371,20 @@ def test_delegate_child_agent_backend_is_script_run_only():
     assert payload["success"] is False
     assert "only supported for script runs" in payload["error"]["message"]
     assert ctx.dispatches == []
+
+
+def test_delegate_child_agent_backend_does_not_treat_script_name_as_facade_signal():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {"script_name": "saved", "child_agent_backend": "delegate_task"},
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "only supported for script runs" in payload["error"]["message"]
+    assert ctx.dispatches == []
