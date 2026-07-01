@@ -21,6 +21,7 @@ and testable without a live Hermes. This module is pure stdlib.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -157,6 +158,16 @@ class VMLimits:
     # via ``replay_from`` rather than the parent blocking. Capped at
     # ``max_runtime_s`` (a value >= it never suspends; the run deadline wins).
     kanban_suspend_after_s: Optional[float] = None
+    # Hard ceiling on a single ``agent``/``kanban_agent`` (including prompt-agent)
+    # result's JSON-serialized size, mirroring the capability-result bound in
+    # ``CapabilityPolicy.max_result_bytes``. A huge child result must not land
+    # inline in script memory nor unbounded in the replay cache — this is our
+    # single worst context exposure (issue #106). Unlike the capability path,
+    # there is no field-level clipping here: an over-limit result fails closed
+    # with a deterministic ``result_too_large`` error rather than being silently
+    # truncated, so a future spill tier (#93) can convert this error into an
+    # offload instead of guessing at what was cut.
+    max_result_bytes: int = 512 * 1024
 
 
 @dataclass
@@ -482,6 +493,8 @@ class CapabilityBroker:
                 transcript_start = time.monotonic()
                 self._transcript_started(call_id, method, params, transcript_started_at)
             value = self._dispatch(call_id, method, params)
+            if method in ("agent", "kanban_agent"):
+                self._check_result_size(call_id, method, value)
             if transcript_started_at is not None:
                 self._transcript_result(call_id, method, params, transcript_started_at, transcript_start, value)
             # The effect has already happened. Persist (replay cache + journal)
@@ -513,6 +526,33 @@ class CapabilityBroker:
                 "error": {"code": "runner_error", "message": f"{type(exc).__name__} raised while dispatching brokered call"},
                 "budget": self._budget_info(),
             }
+
+    def _check_result_size(self, call_id: Any, method: str, value: Any) -> None:
+        """Fail closed on an over-limit ``agent``/``kanban_agent`` result.
+
+        Mirrors the capability-result bound (:func:`capabilities._bound_result`):
+        a huge child result must not land inline in script memory nor unbounded
+        in the replay cache/prompt-agent cache. Unlike the capability path there
+        is no field-level clipping — this is a hard ceiling, not a truncation, so
+        the denial is deterministic and metadata-only (observed size, limit, call
+        id; never the payload itself). Called *before* ``_persist_success`` so a
+        cache write for this call never happens.
+        """
+        limit = self._limits.max_result_bytes
+        try:
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except TypeError:
+            # Not JSON-safe: a later serialization stage (writing the ret frame)
+            # is the right place to surface that distinct failure, not this bound.
+            return
+        observed = len(encoded)
+        if observed <= limit:
+            return
+        raise CapabilityDenied(
+            f"{method} result for call {call_id!r} is {observed} bytes, "
+            f"exceeding max_result_bytes ({limit})",
+            code="result_too_large",
+        )
 
     def _persist_success(self, call_id: Any, method: str, params: dict[str, Any], value: Any) -> None:
         """Best-effort persist a successful call (replay cache + journal event).
@@ -1840,6 +1880,7 @@ def _limits_view(limits: VMLimits) -> dict[str, Any]:
         "token_budget": limits.token_budget,
         "max_schema_retries": limits.max_schema_retries,
         "kanban_suspend_after_s": limits.kanban_suspend_after_s,
+        "max_result_bytes": limits.max_result_bytes,
     }
 
 
@@ -1983,6 +2024,7 @@ def _limits_from_view(view: Any) -> VMLimits:
         kanban_suspend_after_s=_req_opt_float(
             view, "kanban_suspend_after_s", default.kanban_suspend_after_s
         ),
+        max_result_bytes=_req_int(view, "max_result_bytes", default.max_result_bytes),
     )
 
 

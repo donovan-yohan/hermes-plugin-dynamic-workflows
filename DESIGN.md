@@ -990,10 +990,41 @@ A subprocess crash, a CPU-spin timeout (`VMLimits.max_runtime_s`), a protocol
 breach, or an exit-without-result is mapped to a failed `ScriptRunResult` —
 never an uncaught exception — so parent state is never corrupted. `VMLimits`
 (`max_rpc_calls` hard-abort backstop, soft per-`agent`/`kanban` caps,
-`token_budget`, `allow_nested_workflows`) is the first slice of the issue #11
-governance surface; launch-approval/session routing remain parent-owned future
-work. Journal events are metadata-only by default (method, call id, agent
-id/profile, ok) — raw inputs/outputs and prompts are redacted.
+`token_budget`, `allow_nested_workflows`, `max_result_bytes`) is the first
+slice of the issue #11 governance surface; launch-approval/session routing
+remain parent-owned future work. Journal events are metadata-only by default
+(method, call id, agent id/profile, ok) — raw inputs/outputs and prompts are
+redacted.
+
+| `VMLimits` field | Default | Enforced against | Breach behavior |
+| --- | --- | --- | --- |
+| `max_rpc_calls` | `1000` | every brokered `call` frame | hard-abort: `should_abort=True`, `limit_rpc` |
+| `max_agent_calls` | `200` | `agent` (incl. prompt-agent) dispatch | soft denial: `limit_agent` |
+| `max_kanban_calls` | `100` | `kanban_agent` dispatch | soft denial: `limit_kanban` |
+| `max_capability_calls` | `100` | `capability` dispatch | soft denial: `limit_capability` |
+| `max_parallel` | `8` | guest-side `parallel()` fan-out | guest-enforced batching |
+| `max_runtime_s` | `30.0` | wall-clock run deadline | hard-abort: subprocess killed, timeout |
+| `token_budget` | `None` (unbounded) | cumulative agent/prompt token usage | soft denial: `limit_token` |
+| `max_schema_retries` | `2` | prompt-agent structured-output retries | typed `schema` denial after retries exhausted |
+| `kanban_suspend_after_s` | `None` (blocks to deadline) | unresolved `on_block="pause"` Kanban await | durable suspend (`status="suspended"`), not a failure |
+| `max_result_bytes` | `524288` (512 KiB) | `agent`/`kanban_agent` (incl. prompt-agent) result, JSON-serialized, checked before `_persist_success` | soft denial: `result_too_large` (metadata-only: observed size, limit, call id) |
+
+`max_result_bytes` (#106) mirrors `CapabilityPolicy.max_result_bytes` on the
+`agent`/`kanban_agent` side of the broker success path: `capability()` already
+clips well-known stream fields then fails closed if the result is still too
+large (`capability_result_too_large`), but a huge `agent`/`kanban_agent`
+result had no bound at all — the single worst context-exposure gap, the
+mirror image of a filesystem-as-artifact-channel design. The broker checks the
+JSON-serialized size of every `agent`/`kanban_agent` value (prompt-agent calls
+are `agent` calls with a `prompt` param, so they are covered by the same
+check) immediately after dispatch and *before* `_persist_success`, so an
+over-limit result never reaches the script, the replay cache, or the
+in-memory prompt-agent cache. This is a hard ceiling, not a truncation: unlike
+the capability path there is no field-level clipping, so the failure is
+deterministic and repeatable rather than a surprise partial payload — a script
+may catch `result_too_large` via `CapabilityError` like any other soft denial.
+A future spill tier (#93) can convert this error into an offload instead of
+guessing at what was cut.
 
 ### 5.5 What is intentionally deferred
 
