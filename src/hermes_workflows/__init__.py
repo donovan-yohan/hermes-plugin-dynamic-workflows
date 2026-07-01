@@ -131,6 +131,8 @@ from .agents import (
     StubAgentRunner,
     KNOWN_AGENTS,
     is_known_agent,
+    register_known_agent,
+    registered_agent_ids,
     kanban_runner_id,
     is_kanban_runner_id,
 )
@@ -354,6 +356,8 @@ __all__ = [
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
+    "register_known_agent",
+    "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
     # registry
