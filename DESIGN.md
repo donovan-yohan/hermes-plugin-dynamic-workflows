@@ -1134,6 +1134,32 @@ script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
 
+### 5.7.1 Journal durability modes (issue #108)
+
+`journal.jsonl` writes historically always fsynced per event (the safest, and
+still the default, policy). `ScriptRunStore(root, *, durability=..., async_flush_every=...)`
+exposes a LangGraph-inspired `"exit" | "async" | "sync"` knob so an embedder can
+trade write latency against crash-window size. The knob governs **only**
+`journal.jsonl`; `run.json` (the operator-facing snapshot) is always fsynced
+on every `finish()`, and the per-card durable kanban event log
+(`append_kanban_event`, `script_store.py:964-1063`) is untouched — it keeps its
+own always-fsync policy, since it is the cross-process producer/consumer seam
+worker durability depends on.
+
+| Mode | Per-event behavior | Crash window |
+| --- | --- | --- |
+| `sync` (default) | Every `boot`/`call`/`agent_*`/`done` event is written and fsynced before the call returns — unchanged from the store's original behavior. | None: a parent crash immediately after any journal-producing call still leaves that event durable. |
+| `async` | Events are buffered in memory and fsynced together once `async_flush_every` events have accumulated (default 8) — a **count** trigger, never a wall-clock timer (the module's no-wall-clock/no-randomness contract applies to journal writes too, so behavior stays deterministic and replay-safe). | Up to `async_flush_every - 1` of the most recent events (since the last count-triggered flush) are only in process memory and are lost on a parent crash/kill before the next flush or before the run's terminal `finish()`. |
+| `exit` | Events are buffered in memory and never proactively fsynced during the run. | Every event since `begin()` is only in process memory until the run's terminal `finish()`; a parent crash/kill at any point during the run loses the entire in-memory journal for that run (the `run.json` snapshot from any prior `finish()`-adjacent write is unaffected, since it is a different file with its own always-fsync policy). |
+
+Regardless of mode, **`finish()` always force-flushes** any buffered events
+before returning — this is the single funnel for every terminal status
+(`succeeded` / `failed` / `suspended` / `stopped` / `paused`), so suspend and
+abort get the same durability guarantee as a normal completion: once `finish()`
+returns, the full journal for that run is on disk. The only crash window that
+matters for `async`/`exit` is therefore *mid-run, before `finish()` runs* —
+exactly the trade an embedder opts into for lower per-call write latency.
+
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
 `kanban.py` upgrades `kanban_agent` from a synchronous stub call into a
