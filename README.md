@@ -257,6 +257,16 @@ workflow(script='meta = {"name": "inline", "description": "demo"}\nlog("resume")
 
 See [examples/README.md](examples/README.md) for runnable script VM, scoped grant, and finalizer examples.
 
+### Shipped script-VM runtime capabilities
+
+`0.1.0` runs the script VM with Claude-style dynamic-workflow parity:
+
+- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, and `context`; schema output is validated with bounded retry-on-mismatch before a typed failure.
+- **Real bounded concurrency** — `parallel()` (barrier) and `pipeline()` (no-barrier item flow) execute on a thread pool sized to the operator-configurable `max_parallel`, with lifecycle-safe failure that drains in-flight parent work instead of returning terminal while it is still alive.
+- **Fingerprint resume cache** — a duplicate prompt/options call dedups to one child and replays via a `v2` prompt/options hash; `resume_from_run_id` replays an interrupted run's completed calls.
+- **Background runs** — scripts can launch/run/inspect/stop outside the main turn with fail-closed stop, terminal-state lifecycle, and operator-visible status.
+- **Per-subagent transcripts** — per-call journal plus redacted metadata refs (including replay/cache-hit refs), surfaced in background run links.
+
 ### Python-vs-JS workflow script compatibility boundary
 
 Dynamic Workflows aims for parity with Claude-style workflow scripts at the **orchestration
@@ -459,7 +469,7 @@ The repo intentionally avoids runtime dependencies. `pytest` is only a dev conve
 
 ## Current limitations
 
-- `parallel` is modeled with deterministic joins; true concurrent execution belongs to host adapters.
+- The declarative JSON `parallel` step is modeled with deterministic sequential joins (its `max_parallel` bounds logical fan-out, not OS threads). The subprocess script-VM `parallel()` / `pipeline()` do run real bounded concurrency on a thread pool capped by `max_parallel`.
 - Event and run stores are local/in-memory/file oriented by default; multi-host production needs a shared adapter.
 - The default `StubAgentRunner` only simulates demo agents.
 - The script VM can replay completed deterministic RPC calls, but general partial-run resume is still evolving.
