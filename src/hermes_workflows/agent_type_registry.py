@@ -115,10 +115,10 @@ class AgentTypeDefinition:
 def _split_frontmatter(text: str) -> tuple[Optional[dict[str, str]], str]:
     """Split ``---``-delimited frontmatter from the trailing body.
 
-    Returns ``(None, text)`` when ``text`` has no opening/closing ``---``
-    delimiter pair (no frontmatter present at all). Raises ``ValueError`` for
-    a frontmatter block that is present but structurally broken (a line with
-    no ``:`` separator). The ``ValueError`` message carries only the 1-based
+    Returns ``(None, text)`` when ``text`` does not open with ``---`` (no
+    frontmatter present at all). Raises ``ValueError`` for a frontmatter block
+    that is present but structurally broken: an opening ``---`` that is never
+    closed, or a line with no ``:`` separator. The ``ValueError`` message carries only the 1-based
     line number, never the offending line's text -- this diagnostic is
     forwarded verbatim into a script-visible ``CapabilityDenied`` (see
     :meth:`AgentTypeRegistry.resolve` / :class:`AgentTypeRegistryError`), so
@@ -133,7 +133,9 @@ def _split_frontmatter(text: str) -> tuple[Optional[dict[str, str]], str]:
             end = i
             break
     if end is None:
-        return None, text
+        # An opened-but-never-closed block is malformed frontmatter, not "no
+        # frontmatter" -- reporting the latter would mislead the operator.
+        raise ValueError("unclosed '---' frontmatter block")
     frontmatter: dict[str, str] = {}
     for line_no, line in enumerate(lines[1:end], start=2):
         if not line.strip():
@@ -224,6 +226,14 @@ class AgentTypeRegistry:
         if not isinstance(fm_name, str) or not fm_name:
             raise AgentTypeRegistryError(
                 f"agent type definition {name!r} frontmatter is missing a non-empty 'name'", code="agent_type_invalid"
+            )
+        if fm_name != name:
+            # A definition claiming a different name than the one it resolves
+            # as is a misconfiguration (e.g. a copied file) -- fail closed
+            # rather than silently serving it under the filename-derived name.
+            raise AgentTypeRegistryError(
+                f"agent type definition {name!r} frontmatter 'name' does not match its filename",
+                code="agent_type_invalid",
             )
         if not body.strip():
             raise AgentTypeRegistryError(

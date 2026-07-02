@@ -218,3 +218,36 @@ def test_general_purpose_can_be_shadowed_by_a_project_definition():
         registry = AgentTypeRegistry(roots=[root])
         definition = registry.resolve(GENERAL_PURPOSE_AGENT_TYPE)
         assert definition.system_prompt == "Custom general-purpose prompt."
+
+
+def test_unclosed_frontmatter_block_is_malformed_not_missing():
+    # An opening --- that is never closed must be reported as malformed
+    # frontmatter (Copilot review, PR #130), not fall through to the
+    # misleading "missing '---' frontmatter" diagnostic.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "reviewer.md").write_text(
+            "---\nname: reviewer\nYou are a reviewer.\n", encoding="utf-8"
+        )
+        registry = AgentTypeRegistry(roots=[root])
+        with pytest.raises(AgentTypeRegistryError) as excinfo:
+            registry.resolve("reviewer")
+        assert excinfo.value.code == "agent_type_invalid"
+        assert "unclosed" in str(excinfo.value)
+
+
+def test_frontmatter_name_must_match_the_filename_derived_name():
+    # The required frontmatter name is authoritative-looking but resolution is
+    # by filename; a mismatch (e.g. a copied file) must fail closed instead of
+    # silently serving the definition under the filename-derived name
+    # (Copilot review, PR #130).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "reviewer.md").write_text(
+            "---\nname: planner\n---\nYou are a reviewer.\n", encoding="utf-8"
+        )
+        registry = AgentTypeRegistry(roots=[root])
+        with pytest.raises(AgentTypeRegistryError) as excinfo:
+            registry.resolve("reviewer")
+        assert excinfo.value.code == "agent_type_invalid"
+        assert "does not match" in str(excinfo.value)
