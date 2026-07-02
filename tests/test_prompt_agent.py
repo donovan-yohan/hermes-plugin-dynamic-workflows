@@ -280,6 +280,29 @@ def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():
     assert [event.get("error") for event in res.calls].count("schema_retry") == 1
 
 
+def test_prompt_agent_malformed_dynamic_schema_never_invokes_the_child_runner():
+    # A schema built from a variable escapes script_validator's static literal
+    # check (issue #107 review): the broker must reject a malformed schema
+    # once, up front -- not burn max_schema_retries+1 real child agent calls
+    # on a retry loop that can never succeed (a bad schema is never fixed by
+    # the *payload* changing).
+    runner = SequenceChildRunner([{"answer": "ok"}])
+    script = META + (
+        'bad_schema = {"type": "object", "bogus": 1}\n'
+        'return await agent("summarize", {"schema": bad_schema})\n'
+    )
+    res = run_workflow_script(
+        script,
+        child_agent_runner=runner,
+        limits=VMLimits(max_schema_retries=3),
+    )
+
+    assert res.ok is False
+    assert res.error["code"] == "bad_request"
+    assert len(runner.requests) == 0
+    assert [event.get("error") for event in res.calls].count("schema_retry") == 0
+
+
 def test_punctuated_schema_prompt_routes_to_child_runner_not_legacy_agent_id():
     runner = FakeChildRunner({"answer": "brief"})
     res = run_workflow_script(

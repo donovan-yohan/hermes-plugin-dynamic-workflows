@@ -75,6 +75,7 @@ from .kanban import (
 )
 from .grants import redact_credentials
 from .registry import utc_now_iso
+from . import schema_subset
 from .script_store import (
     CallRecorder,
     ReplayCache,
@@ -119,14 +120,6 @@ _SCRIPT_META_DIAGNOSTIC_CODES = frozenset(
         err.E_SCRIPT_META_PHASES,
     }
 )
-
-# Output-schema type table (mirrors runtime._TYPE_MAP) for brokered agent calls.
-_TYPE_MAP: dict[str, tuple[type, ...]] = {
-    "string": (str,), "str": (str,), "number": (int, float), "int": (int,),
-    "integer": (int,), "float": (float,), "bool": (bool,), "boolean": (bool,),
-    "object": (dict,), "dict": (dict,), "list": (list,), "array": (list,), "any": (object,),
-}
-
 
 @dataclass
 class VMLimits:
@@ -999,6 +992,17 @@ class CapabilityBroker:
         """Invoke a prompt child agent, retrying schema-invalid structured output."""
 
         assert self._child_runner is not None
+        try:
+            schema_subset.normalize_schema(request.schema)
+        except schema_subset.SchemaError as exc:
+            # A malformed schema (e.g. a dynamically-built ``schema=`` that
+            # escaped script_validator's static literal check) is never the
+            # child agent's fault to fix by retrying -- no output can "pass" a
+            # schema that is itself broken. Reject once, before the first
+            # invocation, instead of burning max_schema_retries+1 real child
+            # agent calls on an unwinnable retry loop whose retry-context
+            # prompt would misleadingly tell the agent to fix its output.
+            raise CapabilityDenied(f"invalid 'schema' argument: {exc}", code="bad_request") from exc
         retry_limit = max(0, int(self._limits.max_schema_retries))
         attempts = retry_limit + 1
         base_context = dict(request.context)
@@ -1427,22 +1431,21 @@ class CapabilityBroker:
 
 
 def _validate_output(output: dict[str, Any], schema: Any) -> None:
-    """Validate brokered agent output against a flat ``field -> type`` schema."""
-    if not isinstance(schema, dict) or not schema:
-        return
-    for field_name, hint in schema.items():
-        if field_name not in output:
-            raise CapabilityDenied(f"agent output missing declared field {field_name!r}", code="schema")
-        expected = (hint,) if isinstance(hint, type) else _TYPE_MAP.get(str(hint).lower())
-        if expected is None:
-            continue
-        value = output[field_name]
-        if expected != (bool,) and isinstance(value, bool):
-            raise CapabilityDenied(f"output field {field_name!r} expected {hint}, got bool", code="schema")
-        if not isinstance(value, expected):
-            raise CapabilityDenied(
-                f"output field {field_name!r} expected {hint}, got {type(value).__name__}", code="schema"
-            )
+    """Validate brokered agent output against the shared schema subset.
+
+    Delegates to :mod:`hermes_workflows.schema_subset` (issue #107), which
+    understands both the JSON-Schema subset (nested ``object``/``array``,
+    ``enum``, ``additionalProperties``) and legacy flat ``{field: type}``
+    schemas. A malformed schema (e.g. an unsupported keyword) and a genuine
+    output mismatch both surface the same way they always have here: a
+    ``CapabilityDenied`` with ``code="schema"``, so the schema-retry loop
+    (:meth:`CapabilityBroker._invoke_prompt_agent_with_schema_retry`) is
+    unaffected.
+    """
+    try:
+        schema_subset.validate(output, schema)
+    except schema_subset.SchemaError as exc:
+        raise CapabilityDenied(str(exc), code="schema") from exc
 
 
 def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
