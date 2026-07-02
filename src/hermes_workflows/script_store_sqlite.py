@@ -453,6 +453,7 @@ class SqliteScriptRunStore:
             "agent_id", "profile", "capability", "label", "phase", "phase_title", "parallel_index",
             "pipeline_item_index", "pipeline_stage_index",
             "fingerprint", "error", "retryable", "replayed", "cache", "has_value", "attempt", "max_retries",
+            "dropped_context_keys",
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)

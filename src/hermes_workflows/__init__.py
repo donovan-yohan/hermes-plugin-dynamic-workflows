@@ -49,6 +49,7 @@ from .capabilities import (
     CapabilityPolicy,
     CapabilityRegistry,
     UnknownWorkflowCapability,
+    finalize_capability_result,
     normalize_capability_name,
 )
 from .events import (
@@ -128,6 +129,8 @@ from .agents import (
     ChildAgentRequest,
     ChildAgentRunner,
     CHILD_AGENT_OPTION_KEYS,
+    child_visible_context_keys,
+    filter_child_visible_context,
     StubAgentRunner,
     AsyncChildAgentRequest,
     AsyncChildAgentRunner,
@@ -139,6 +142,13 @@ from .agents import (
     registered_agent_ids,
     kanban_runner_id,
     is_kanban_runner_id,
+)
+from .agent_type_registry import (
+    AgentTypeDefinition,
+    AgentTypeRegistry,
+    AgentTypeRegistryError,
+    GENERAL_PURPOSE_AGENT_TYPE,
+    safe_agent_type_name,
 )
 from .registry import (
     RunStore,
@@ -152,6 +162,7 @@ from .controls import (
     CONTROL_ACTIONS,
     CONTROL_OPERATIONS,
     CONTROL_DECISION_CODES,
+    APPROVAL_DECISION_KINDS,
     WorkflowControl,
     RunControlState,
     ControlDecision,
@@ -165,6 +176,8 @@ from .controls import (
     stop_run,
     stop_task,
     retry,
+    decide_call,
+    latest_call_decision,
     record_control,
     project_control_state,
     evaluate_control_state,
@@ -174,6 +187,7 @@ from .controls import (
     may_check_run,
     waits_from_loop_status,
     waits_from_kanban_states,
+    waits_from_suspended_run,
     summarize_run,
     inspect_run,
     list_runs,
@@ -287,6 +301,7 @@ __all__ = [
     "CapabilityPolicy",
     "CapabilityRegistry",
     "UnknownWorkflowCapability",
+    "finalize_capability_result",
     "normalize_capability_name",
     # generic workflow event broker (issue #7)
     "WorkflowEvent",
@@ -366,6 +381,8 @@ __all__ = [
     "ChildAgentRequest",
     "ChildAgentRunner",
     "CHILD_AGENT_OPTION_KEYS",
+    "child_visible_context_keys",
+    "filter_child_visible_context",
     "StubAgentRunner",
     # async child-agent lifecycle (issue #112)
     "AsyncChildAgentRequest",
@@ -378,6 +395,12 @@ __all__ = [
     "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
+    # file-based agent-type registry (issue #104)
+    "AgentTypeDefinition",
+    "AgentTypeRegistry",
+    "AgentTypeRegistryError",
+    "GENERAL_PURPOSE_AGENT_TYPE",
+    "safe_agent_type_name",
     # registry
     "RunStore",
     "InMemoryRunStore",
@@ -389,6 +412,7 @@ __all__ = [
     "CONTROL_ACTIONS",
     "CONTROL_OPERATIONS",
     "CONTROL_DECISION_CODES",
+    "APPROVAL_DECISION_KINDS",
     "WorkflowControl",
     "RunControlState",
     "ControlDecision",
@@ -402,6 +426,8 @@ __all__ = [
     "stop_run",
     "stop_task",
     "retry",
+    "decide_call",
+    "latest_call_decision",
     "record_control",
     "project_control_state",
     "evaluate_control_state",
@@ -411,6 +437,7 @@ __all__ = [
     "may_check_run",
     "waits_from_loop_status",
     "waits_from_kanban_states",
+    "waits_from_suspended_run",
     "summarize_run",
     "inspect_run",
     "list_runs",

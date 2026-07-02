@@ -39,9 +39,26 @@ __all__ = [
     "default_script_catalog_roots",
     "safe_script_name",
     "safe_script_path",
+    "ensure_within_root",
 ]
 
 _SCRIPT_VERSION_RE = re.compile(r"^v(?P<n>[0-9]{6})\.workflow(?:\.py)?$")
+
+
+def ensure_within_root(root: Path, path: Path) -> None:
+    """Raise ``ValueError`` if ``path`` does not resolve inside ``root``.
+
+    Shared root-escape guard: the one place path-traversal hygiene for a
+    file-backed catalog/registry lives, so every such component in this
+    package (the script catalog here, and the agent-type registry -- issue
+    #104) reuses the identical check instead of re-implementing it.
+    """
+    try:
+        resolved_root = root.resolve(strict=False)
+        resolved_path = path.resolve(strict=False)
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"path escaped root: {path}") from exc
 
 
 def safe_script_name(name: str) -> str:
@@ -257,9 +274,7 @@ class FileWorkflowScriptCatalog:
     @staticmethod
     def _ensure_within_root(root: Path, path: Path) -> None:
         try:
-            resolved_root = root.resolve(strict=False)
-            resolved_path = path.resolve(strict=False)
-            resolved_path.relative_to(resolved_root)
+            ensure_within_root(root, path)
         except ValueError as exc:
             raise ValueError("script catalog path escaped root") from exc
 

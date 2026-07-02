@@ -25,6 +25,8 @@ __all__ = [
     "ChildAgentRequest",
     "ChildAgentRunner",
     "CHILD_AGENT_OPTION_KEYS",
+    "child_visible_context_keys",
+    "filter_child_visible_context",
     "StubAgentRunner",
     "AsyncChildAgentRequest",
     "AsyncChildAgentRunner",
@@ -40,7 +42,7 @@ __all__ = [
 ]
 
 CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
-    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools"}
+    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools", "agentType"}
 )
 
 
@@ -155,6 +157,21 @@ class ChildAgentRequest:
     isolation: Optional[str] = None
     context: dict[str, Any] = field(default_factory=dict)
     tools: Optional[tuple[str, ...]] = None
+    # Named subagent type selector (issue #92), resolved against a file-based
+    # registry by the broker (issue #104) -- see
+    # :mod:`hermes_workflows.agent_type_registry`. ``None`` means the script
+    # never set ``agentType`` explicitly; the broker still resolves a system
+    # prompt/defaults for the dispatch (the built-in ``general-purpose``
+    # type), it just does not stamp this field or the replay fingerprint.
+    agent_type: Optional[str] = None
+    # Broker-resolved system prompt for the request's effective agent type
+    # (explicit ``agentType`` or the built-in ``general-purpose`` default).
+    # Never script-settable directly -- there is no matching opts key -- and
+    # never part of the replay fingerprint (see ``_prompt_agent_fingerprint_payload``
+    # in :mod:`hermes_workflows.vm`): the agent-type *name* already
+    # identifies the call; the resolved prompt text is a deterministic
+    # function of it for a given registry.
+    system_prompt: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the runner contract as a plain JSON-friendly dict."""
@@ -168,16 +185,83 @@ class ChildAgentRequest:
             "isolation": self.isolation,
             "context": copy.deepcopy(self.context),
             "tools": list(self.tools) if self.tools is not None else None,
+            "agent_type": self.agent_type,
+            "system_prompt": self.system_prompt,
         }
 
 
 @runtime_checkable
 class ChildAgentRunner(Protocol):
-    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``."""
+    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``.
+
+    A runner may additionally declare a ``child_visible_context_keys:
+    frozenset[str]`` attribute naming the ``ChildAgentRequest.context`` keys it
+    is allowed to receive (issue #102). This is not a formal Protocol member --
+    it is optional and resolved via ``getattr`` with a fail-closed default (see
+    :func:`child_visible_context_keys`) -- so existing runners that predate the
+    contract keep working unchanged; they simply see no context until they opt
+    in. The allowlist is enforced parent-side, in ``vm.py``, immediately before
+    a ``ChildAgentRequest`` crosses this boundary; the runner is never trusted
+    to police itself. This is the inverse of deepagents' ``private_state_keys``
+    denylist: an explicit, host-declared *allowlist* of what a child may see,
+    not a list of what to hide from it.
+    """
 
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         """Run one isolated child agent and return its final structured result."""
         ...
+
+
+def child_visible_context_keys(runner: Any) -> frozenset[str]:
+    """Resolve ``runner``'s declared child-visible-context allowlist (issue #102).
+
+    Fail-closed default: a runner that does not expose a
+    ``child_visible_context_keys`` attribute gets an empty allowlist, so no
+    ``ChildAgentRequest.context`` key reaches it. A declared value that is not
+    an iterable of strings is treated the same as "undeclared" -- the parent
+    never trusts the runner's own honesty about the *shape* of its
+    declaration, only what it can verify. A ``str``/``bytes`` declaration is a
+    common typo for a single-element collection (e.g. ``"pr"`` meant to be
+    ``{"pr"}``) -- iterating it yields individual characters rather than the
+    intended key, so it is rejected outright rather than silently degraded.
+    """
+    declared = getattr(runner, "child_visible_context_keys", None)
+    if declared is None or isinstance(declared, (str, bytes)):
+        return frozenset()
+    try:
+        return frozenset(key for key in declared if isinstance(key, str))
+    except TypeError:
+        return frozenset()
+
+
+def filter_child_visible_context(
+    runner: Any, context: dict[str, Any]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Filter ``context`` down to ``runner``'s declared allowlist (issue #102).
+
+    Returns ``(filtered_context, dropped_keys)``: the dict actually safe to
+    hand to ``runner``, and the sorted tuple of dropped key *names* -- never
+    their values -- suitable for a metadata-only journal note. Called
+    parent-side (``vm.py``), immediately before a ``ChildAgentRequest`` crosses
+    the runner boundary; it never trusts the runner to self-filter.
+    """
+    allowed = child_visible_context_keys(runner)
+    filtered = {
+        key: value
+        for key, value in context.items()
+        if isinstance(key, str) and key in allowed
+    }
+    # Non-string keys can never match the str allowlist, so they are always
+    # dropped -- and they must not crash the sort (mixed-type ``sorted()``
+    # raises ``TypeError``): non-string names are journaled via ``repr``.
+    dropped = tuple(
+        sorted(
+            key if isinstance(key, str) else repr(key)
+            for key in context
+            if not (isinstance(key, str) and key in allowed)
+        )
+    )
+    return filtered, dropped
 
 
 class StubAgentRunner:
