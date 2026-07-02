@@ -40,6 +40,30 @@ def test_build_delegate_task_context_includes_schema_and_workflow_metadata():
     assert "Return ONLY a JSON object" in context
 
 
+def test_build_delegate_task_context_carries_wave_head_request_fields():
+    # Fields added after this adapter was first written (issues #101/#104):
+    # the resolved agent-type system prompt must lead the block as the child's
+    # role, and agent_type / tools must be stated so the delegated child's
+    # instructions match what the broker resolved and scoped.
+    request = ChildAgentRequest(
+        prompt="review this diff",
+        agent_type="reviewer",
+        system_prompt="You are a meticulous code reviewer.",
+        tools=("read_file",),
+    )
+
+    context = build_delegate_task_context(request)
+
+    assert context.startswith("You are a meticulous code reviewer.")
+    assert "agent_type: reviewer" in context
+    assert "allowed_tools: read_file" in context
+
+    bare = build_delegate_task_context(ChildAgentRequest(prompt="p", tools=()))
+    assert "allowed_tools: (none)" in bare
+    no_tools = build_delegate_task_context(ChildAgentRequest(prompt="p"))
+    assert "allowed_tools" not in no_tools
+
+
 def test_parse_delegate_task_json_summary_accepts_bare_and_fenced_objects():
     assert parse_delegate_task_json_summary('{"answer":"ok"}') == {"answer": "ok"}
     assert parse_delegate_task_json_summary('```json\n{"answer":"ok"}\n```') == {"answer": "ok"}

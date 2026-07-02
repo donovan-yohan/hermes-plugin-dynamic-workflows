@@ -41,14 +41,28 @@ _REDACTED = "[redacted]"
 def build_delegate_task_context(request: ChildAgentRequest) -> str:
     """Return a compact, explicit context block for a delegated workflow child."""
 
-    rows: list[str] = [
-        "You are a child agent spawned by a Dynamic Workflows script.",
-        "You do not have the parent conversation unless details are included below.",
-    ]
+    rows: list[str] = []
+    if request.system_prompt:
+        # The broker-resolved agent-type system prompt (issue #104) leads the
+        # block so it reads as the child's role, before the harness framing.
+        rows.append(request.system_prompt)
+    rows.extend(
+        [
+            "You are a child agent spawned by a Dynamic Workflows script.",
+            "You do not have the parent conversation unless details are included below.",
+        ]
+    )
+    if request.agent_type:
+        rows.append(f"agent_type: {request.agent_type}")
     if request.label:
         rows.append(f"label: {request.label}")
     if request.phase:
         rows.append(f"phase: {request.phase}")
+    if request.tools is not None:
+        # The tools allowlist (issue #101) is advisory over this seam until the
+        # dispatcher enforces scoping host-side; stating it keeps the child's
+        # instructions honest about what it may touch.
+        rows.append("allowed_tools: " + (", ".join(request.tools) if request.tools else "(none)"))
     if request.model:
         rows.append(f"requested_model: {request.model}")
     if request.effort:
