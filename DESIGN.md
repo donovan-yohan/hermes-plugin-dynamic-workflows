@@ -1332,16 +1332,23 @@ denial (§5.4) before the child runner is ever invoked.
 | `isolation` | string | must be a string | yes, always |
 | `context` | object | must be an object | yes, always |
 | `tools` | list/tuple of non-empty strings | must be a list/tuple whose items are all non-empty strings; deduped preserving first-occurrence order and normalized to a tuple | only when not `None` |
+| `agentType` | non-empty string | must be a non-empty string; resolved against the agent-type registry (§5.7.6, issue #104) — an unresolvable name denies before dispatch | only when not `None` |
 
-`tools` is the one option whose fingerprint participation is conditional. A
-differently-scoped `tools` allowlist for an otherwise-identical prompt/opts
-call must land in a distinct cache entry, so a provided `tools` list adds a
-`"tools"` key to the fingerprint payload. But a call that never sets `tools`
-(the overwhelming majority of calls, and every call recorded before this
-option existed) omits the key entirely rather than fingerprinting it as
-`"tools": null` — so every fingerprint minted before issue #101 stays
+`tools` and `agentType` are the two options whose fingerprint participation is
+conditional. A differently-scoped `tools` allowlist, or a different named
+`agentType`, for an otherwise-identical prompt/opts call must land in a
+distinct cache entry, so a provided value adds its key to the fingerprint
+payload. But a call that never sets the option (the overwhelming majority of
+calls, and every call recorded before the option existed) omits the key
+entirely rather than fingerprinting it as `null` — so every fingerprint
+minted before issue #101 (`tools`) or issue #92 (`agentType`) stays
 byte-identical, and the durable resume/replay cache (§5.7, §5.7.2) keeps
 serving those pre-existing entries without re-dispatching the child runner.
+This holds for `agentType` even though a bare `agent(prompt)` call *always*
+resolves the built-in `general-purpose` default (§5.7.6) — that resolution is
+not a script-supplied option, so it stays invisible to both the fingerprint
+and the `ChildAgentRequest.agent_type` field itself (`None`), only showing up
+in the *resolved* `system_prompt`/`model`/`effort` the broker dispatches.
 
 `StubAgentRunner`'s generic echo fallback for the legacy `agent(agent_id,
 input)` form already surfaces a `tools` key placed in `input` verbatim (it
@@ -1467,6 +1474,89 @@ timing/tampering assertions; the SQLite backend's behavioral parity with the
 file backend on those paths is established by the shared
 `ScriptRunStoreProtocol` contract plus the dedicated end-to-end fixtures this
 slice adds, not by re-running those suites' internals verbatim.
+
+### 5.7.6 File-based agent-type registry (issue #104)
+
+Issue #92 added the `agentType` opt to `agent(prompt, opts)` (§5.7.3); this
+section is what it resolves against — `agent_type_registry.py`'s
+`AgentTypeRegistry`. deepagents' CLI resolves `agentType` against
+project-then-user `agents/{name}/AGENTS.md` files; this is the equivalent for
+the script VM, kept deliberately boring and file-backed like the saved-script
+catalog (§5.6) it reuses path hygiene from.
+
+**Layout.** One definition file per agent type, `<root>/<agent-type-name>.md`:
+a `---`-delimited frontmatter block of flat `key: value` lines (`name`
+required; `description` / `model` / `effort` all optional) followed by the
+system-prompt body:
+
+```
+---
+name: reviewer
+description: Reviews code changes for correctness.
+model: opus
+effort: high
+---
+You are a meticulous code reviewer. Flag correctness bugs only.
+```
+
+**Resolution: ordered roots, first match wins.** `AgentTypeRegistry(roots=
+[...])` checks roots in the order given; the first root with a matching
+`<name>.md` wins. The registry itself has no notion of "project" vs "user" —
+that precedence is just "pass the project root before the user root" at
+construction time, exactly like `FileWorkflowScriptCatalog`'s root ordering
+(§5.6). Path hygiene is shared, not reimplemented: `safe_agent_type_name`
+delegates straight to `script_catalog.safe_script_name` (an agent-type id is,
+like a saved script name, one safe path segment), and root-escape checking
+uses the same `script_catalog.ensure_within_root` guard the script catalog
+itself uses (factored out to a module-level function for this reuse). A
+traversal attempt (`agentType="../../etc/passwd"`) or any other unsafe name
+fails the same way an unsafe script name would.
+
+**Explicit roots only — no implicit discovery.** Unlike
+`default_script_catalog_roots()` (§5.6, which layers an `HERMES_HOME`/cwd
+default), an `AgentTypeRegistry` never guesses at roots: the embedding host
+constructs one with explicit paths and injects it at `WorkflowVM`/
+`CapabilityBroker` construction (`run_workflow_script(...,
+agent_type_registry=...)`, threaded the same way `capability_registry`
+already is through `primitives.py`'s facade and `background.py`'s launcher).
+Omitted, the broker defaults to a registry with zero roots — the built-in
+`general-purpose` type (below) is still resolvable; any other name is a
+deterministic `unknown_agent_type` denial.
+
+**The `general-purpose` built-in default.** A bare `agent(prompt)` call (no
+`agentType`) always resolves `GENERAL_PURPOSE_AGENT_TYPE = "general-purpose"`
+— defined semantics for every pre-#92 call site, documented here so it does
+not have to be rediscovered: *bare prompt == `general-purpose`*. This is a
+Python-level fallback inside `AgentTypeRegistry.resolve`, tried only after
+every configured root has been checked for an on-disk `general-purpose.md` —
+so a project may still shadow the built-in default with its own definition,
+exactly like any other agent type name.
+
+**Broker-side resolution and defaulting (not the fingerprint).** The broker
+resolves the agent type *after* building the request from raw params but
+*before* computing the `v2:` fingerprint (§5.7.3) — the fingerprint is always
+computed from the unresolved request so every other call site that
+recomputes it from the same raw params (cache-hit lookup, success
+persistence) stays consistent. A **second**, resolved copy of the
+`ChildAgentRequest` — `system_prompt` stamped unconditionally (there is no opt
+to override it) and `model`/`effort` filled from the definition only when the
+script did not already supply them, i.e. **an explicit per-call opt always
+wins over the registry default** — is what actually crosses the
+`ChildAgentRunner` boundary. `StubAgentRunner`-style fakes used in tests
+(`FakeChildRunner`) receive this resolved request and can assert on
+`request.agent_type` (the raw opt, `None` when omitted) and
+`request.system_prompt` (always populated) directly.
+
+**Failure taxonomy (issue #103).** Both failure shapes are plain
+`CapabilityDenied` — `retryable=False` by construction (§5.4's default; only
+`runner_error` sets `True`) — surfaced as metadata-only diagnostics (agent-type
+name and a short reason, never file contents or a raw filesystem path):
+
+| Failure | `code` |
+| --- | --- |
+| Name absent from every configured root and not `general-purpose` | `unknown_agent_type` |
+| Unsafe name (path traversal, disallowed characters) | `agent_type_invalid` |
+| On-disk definition missing `---` frontmatter, an unparsable frontmatter line, or missing the required `name` field | `agent_type_invalid` |
 
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
@@ -1883,7 +1973,6 @@ Near-term and future work, roughly in priority order:
    - nested `workflow(name | {scriptPath}, args)` inline execution — the in-VM
      `workflow()` RPC currently always denies (`nested_denied`/`nested_unsupported`)
      rather than running a child workflow one level deep ([#91]);
-   - the `agentType` `agent()` option (custom subagent type selector) ([#92]);
    - a truncate-and-spill result tier (capped completion notification +
      on-demand spill) so the result is not delivered inline ([#93]);
    - a `parallel()`/`pipeline()` per-call element cap and `effort` enum

@@ -34,6 +34,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import errors as err, rpc
+from .agent_type_registry import (
+    AgentTypeDefinition,
+    AgentTypeRegistry,
+    AgentTypeRegistryError,
+    GENERAL_PURPOSE_AGENT_TYPE,
+)
 from .agents import (
     CHILD_AGENT_OPTION_KEYS,
     AgentRunner,
@@ -259,6 +265,7 @@ class CapabilityBroker:
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
+        agent_type_registry: Optional[AgentTypeRegistry] = None,
     ) -> None:
         self._runner = agent_runner
         self._child_runner = child_agent_runner
@@ -287,6 +294,11 @@ class CapabilityBroker:
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
         self._control_store = control_store
+        # File-based agent-type registry (issue #104) resolving ``agentType``
+        # (issue #92) at call time. Defaults to a registry with no configured
+        # roots -- the built-in ``general-purpose`` type is still resolvable,
+        # any other name is a deterministic ``unknown_agent_type`` denial.
+        self._agent_type_registry = agent_type_registry if agent_type_registry is not None else AgentTypeRegistry()
         # Absolute wall-clock deadline for this run, set at construction (a few ms
         # before the subprocess spawns and the _drive watchdog arms). A durable
         # Kanban await is bounded by *this* shared deadline rather than a fresh
@@ -970,6 +982,10 @@ class CapabilityBroker:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
         request = _prompt_agent_request(params)
+        # Resolve the agent type before spending budget/quota on this call --
+        # matches _handle_agent's legacy-agent-id validation, which also runs
+        # before the agent-call counter is incremented (issue #104).
+        definition = self._resolve_agent_type(request.agent_type)
         with self._lock:
             self._check_token_budget()
             # Count the script-visible prompt agent call once; schema retries below may
@@ -982,9 +998,33 @@ class CapabilityBroker:
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
             )
 
+        # The fingerprint is computed from the *unresolved* request (see
+        # _prompt_agent_fingerprint_payload) so it stays identical for every
+        # other call site that recomputes it from raw params (cache-hit
+        # lookup, success persistence) -- only the dispatched copy carries the
+        # resolved system prompt/model/effort defaults.
         fingerprint, _args_hash = _prompt_agent_cache_identity(request)
         self._emit_prompt_agent_event("agent_started", call_id, request, fingerprint, ok=True)
-        return self._invoke_prompt_agent_with_schema_retry(call_id, request)
+        resolved_request = _apply_agent_type_defaults(request, definition)
+        return self._invoke_prompt_agent_with_schema_retry(call_id, resolved_request)
+
+    def _resolve_agent_type(self, agent_type: Optional[str]) -> AgentTypeDefinition:
+        """Resolve ``agent_type`` (or the built-in default) against the registry.
+
+        A bare ``agent(prompt)`` call (``agent_type is None``) always resolves
+        the built-in :data:`GENERAL_PURPOSE_AGENT_TYPE` -- documented semantics
+        for issue #104's acceptance criteria ("bare prompt == general-purpose").
+        Converts a registry failure into the matching :class:`CapabilityDenied`:
+        ``unknown_agent_type`` for a name absent everywhere, ``agent_type_invalid``
+        for a path-unsafe name or a malformed on-disk definition -- both
+        deterministic, metadata-only, ``retryable=False`` (default) per the
+        #103 taxonomy.
+        """
+        lookup = agent_type if agent_type is not None else GENERAL_PURPOSE_AGENT_TYPE
+        try:
+            return self._agent_type_registry.resolve(lookup)
+        except AgentTypeRegistryError as exc:
+            raise CapabilityDenied(str(exc), code=exc.code) from exc
 
     def _invoke_prompt_agent_with_schema_retry(
         self, call_id: Any, request: ChildAgentRequest
@@ -1500,6 +1540,23 @@ def _optional_tools(params: dict[str, Any], key: str) -> Optional[tuple[str, ...
     return tuple(deduped)
 
 
+def _optional_agent_type(params: dict[str, Any], key: str) -> Optional[str]:
+    """Validate the ``agentType`` selector option (issue #92).
+
+    Unlike ``label``/``phase``/etc. (:func:`_optional_str`), an empty string is
+    rejected: ``agentType`` is a lookup key into the agent-type registry
+    (issue #104), and an empty key can never resolve to anything, so failing
+    fast here is a clearer deterministic ``bad_request`` denial than letting it
+    fall through to a confusing "unknown agentType: ''" from the registry.
+    """
+    value = params.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise CapabilityDenied(f"prompt agent option {key!r} must be a non-empty string", code="bad_request")
+
+
 def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
     """Validate and normalize the parent-side prompt-agent request."""
     prompt = params.get("prompt")
@@ -1526,6 +1583,7 @@ def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
         isolation=_optional_str(params, "isolation"),
         context=_optional_dict(params, "context") or {},
         tools=_optional_tools(params, "tools"),
+        agent_type=_optional_agent_type(params, "agentType"),
     )
 
 
@@ -1545,6 +1603,17 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     canonical JSON (and therefore the ``v2:`` hash) of every existing prompt-agent
     fingerprint, silently invalidating durable resume/replay caches recorded
     before this option existed.
+
+    ``agentType`` (issue #92/#104) follows the exact same "only when set"
+    rule, for the exact same reason: a bare ``agent(prompt)`` call always
+    resolves against the built-in ``general-purpose`` agent type (see
+    :mod:`hermes_workflows.agent_type_registry`), but that resolution is not a
+    script-supplied option, so it must stay invisible to the fingerprint --
+    every prompt-agent fingerprint minted before #92 stays byte-identical for
+    calls that never set ``agentType``. The resolved ``system_prompt`` is
+    never part of the payload at all (set or not): the agent-type *name*
+    already identifies the call, and the resolved prompt text is a
+    deterministic function of it for a given registry.
     """
     payload: dict[str, Any] = {
         "prompt": request.prompt,
@@ -1558,6 +1627,8 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     }
     if request.tools is not None:
         payload["tools"] = list(request.tools)
+    if request.agent_type is not None:
+        payload["agentType"] = request.agent_type
     return payload
 
 
@@ -1596,6 +1667,33 @@ def _request_with_schema_retry_context(
         isolation=request.isolation,
         context=context,
         tools=request.tools,
+        agent_type=request.agent_type,
+        system_prompt=request.system_prompt,
+    )
+
+
+def _apply_agent_type_defaults(request: ChildAgentRequest, definition: AgentTypeDefinition) -> ChildAgentRequest:
+    """Return ``request`` carrying its resolved agent-type defaults (issue #104).
+
+    Stamps the resolved ``system_prompt`` unconditionally (there is no opt to
+    override it) and fills ``model``/``effort`` from the definition *only*
+    when the script did not already supply them -- an explicit per-call opt
+    always wins over the registry default. Never mutates the fingerprint
+    identity: this is applied to a copy dispatched to the child runner, after
+    the fingerprint has already been computed from the unresolved ``request``.
+    """
+    return ChildAgentRequest(
+        prompt=request.prompt,
+        label=request.label,
+        phase=request.phase,
+        schema=request.schema,
+        model=request.model if request.model is not None else definition.model,
+        effort=request.effort if request.effort is not None else definition.effort,
+        isolation=request.isolation,
+        context=request.context,
+        tools=request.tools,
+        agent_type=request.agent_type,
+        system_prompt=definition.system_prompt,
     )
 
 
@@ -1633,6 +1731,7 @@ class WorkflowVM:
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
+        agent_type_registry: Optional[AgentTypeRegistry] = None,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._child_runner = child_agent_runner
@@ -1652,6 +1751,10 @@ class WorkflowVM:
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy
         self._control_store = control_store
+        # File-based agent-type registry (issue #104): forwarded to the broker,
+        # which resolves ``agentType`` (issue #92) at call time. Explicit roots
+        # only -- no implicit cwd discovery.
+        self._agent_type_registry = agent_type_registry
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -1692,6 +1795,7 @@ class WorkflowVM:
             capability_registry=self._capability_registry,
             capability_policy=self._capability_policy,
             control_store=self._control_store,
+            agent_type_registry=self._agent_type_registry,
         )
         try:
             result = self._drive(script, args, broker, calls)
@@ -2233,6 +2337,7 @@ def run_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    agent_type_registry: Optional[AgentTypeRegistry] = None,
 ) -> ScriptRunResult:
     """Construct a :class:`WorkflowVM` and run one script, optionally durable.
 
@@ -2343,6 +2448,7 @@ def run_script(
             capability_registry=capability_registry,
             capability_policy=capability_policy,
             control_store=control_store,
+            agent_type_registry=agent_type_registry,
         )
         return vm.run(script, args=args, validate=validate)
 
@@ -2394,6 +2500,7 @@ def run_script(
         capability_registry=capability_registry,
         capability_policy=capability_policy,
         control_store=control_store,
+        agent_type_registry=agent_type_registry,
     )
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id

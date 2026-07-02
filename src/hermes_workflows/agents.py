@@ -35,7 +35,7 @@ __all__ = [
 ]
 
 CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
-    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools"}
+    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools", "agentType"}
 )
 
 
@@ -150,6 +150,21 @@ class ChildAgentRequest:
     isolation: Optional[str] = None
     context: dict[str, Any] = field(default_factory=dict)
     tools: Optional[tuple[str, ...]] = None
+    # Named subagent type selector (issue #92), resolved against a file-based
+    # registry by the broker (issue #104) -- see
+    # :mod:`hermes_workflows.agent_type_registry`. ``None`` means the script
+    # never set ``agentType`` explicitly; the broker still resolves a system
+    # prompt/defaults for the dispatch (the built-in ``general-purpose``
+    # type), it just does not stamp this field or the replay fingerprint.
+    agent_type: Optional[str] = None
+    # Broker-resolved system prompt for the request's effective agent type
+    # (explicit ``agentType`` or the built-in ``general-purpose`` default).
+    # Never script-settable directly -- there is no matching opts key -- and
+    # never part of the replay fingerprint (see ``_prompt_agent_fingerprint_payload``
+    # in :mod:`hermes_workflows.vm`): the agent-type *name* already
+    # identifies the call; the resolved prompt text is a deterministic
+    # function of it for a given registry.
+    system_prompt: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the runner contract as a plain JSON-friendly dict."""
@@ -163,6 +178,8 @@ class ChildAgentRequest:
             "isolation": self.isolation,
             "context": copy.deepcopy(self.context),
             "tools": list(self.tools) if self.tools is not None else None,
+            "agent_type": self.agent_type,
+            "system_prompt": self.system_prompt,
         }
 
 
