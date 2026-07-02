@@ -537,14 +537,29 @@ class CapabilityBroker:
         the denial is deterministic and metadata-only (observed size, limit, call
         id; never the payload itself). Called *before* ``_persist_success`` so a
         cache write for this call never happens.
+
+        The measurement uses the exact encoder settings the persistence paths
+        use (:class:`script_store.CallRecorder.record` and the ``ret`` frame in
+        :mod:`rpc`): ``ensure_ascii=False`` so it does not over-count multi-byte
+        UTF-8 as ``\\uXXXX`` escapes, and ``default=str`` so a non-JSON-native
+        value is measured the same way it would actually be persisted rather
+        than bypassing the bound. ``sort_keys`` is omitted — ordering is
+        irrelevant to size, and sorting raises ``TypeError`` on a dict with
+        mixed-type (e.g. non-string) keys even though both persistence paths
+        serialize such a dict without issue. If serialization still raises
+        (a value ``default=str`` cannot stringify), that fails closed too,
+        mirroring :func:`capabilities._json_bytes`'s ``capability_result_invalid``.
         """
         limit = self._limits.max_result_bytes
         try:
-            encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        except TypeError:
-            # Not JSON-safe: a later serialization stage (writing the ret frame)
-            # is the right place to surface that distinct failure, not this bound.
-            return
+            encoded = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), default=str
+            ).encode("utf-8")
+        except TypeError as exc:
+            raise CapabilityDenied(
+                f"{method} result for call {call_id!r} is not JSON-safe: {exc}",
+                code="result_invalid",
+            ) from exc
         observed = len(encoded)
         if observed <= limit:
             return

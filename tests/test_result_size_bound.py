@@ -146,9 +146,40 @@ def test_result_too_large_error_message_carries_size_limit_and_call_id_only():
     message = res.error["message"]
     # Metadata-only: the observed/limit sizes and the call id are present...
     assert "256" in message
-    assert "1" in message  # call_id == 1 for a single top-level call.
+    assert "call 1" in message  # call_id == 1 for a single top-level call; an
+    # unambiguous token so this doesn't spuriously match a digit inside the
+    # observed-size number instead (e.g. a 2113-byte observed size).
     # ...but the payload content itself is never echoed back.
     assert "SECRET-PAYLOAD-MARKER" not in message
+
+
+def test_agent_result_with_non_string_dict_key_over_limit_fails_closed():
+    # ``sort_keys=True`` raises TypeError comparing a str key against an int
+    # key, which used to make the size check silently pass the whole result
+    # through uncapped; the ret-frame/cache encoders (no sort_keys) serialize
+    # this shape fine, so the bound must too.
+    def runner(agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {1: "z" * 100_000, "ok": True}
+
+    res = run_workflow_script(
+        _CATCH_SCRIPT_AGENT, agent_runner=runner, limits=VMLimits(max_result_bytes=256)
+    )
+    assert res.ok, res.error
+    assert res.value == {"code": "result_too_large"}
+
+
+def test_agent_result_with_non_json_native_value_over_limit_fails_closed():
+    # A non-JSON-native value (e.g. bytes) is still accepted by the replay
+    # cache's ``default=str`` encoder, so the size bound must measure it the
+    # same way rather than bailing out on the first TypeError.
+    def runner(agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"blob": b"z" * 100_000, "ok": True}
+
+    res = run_workflow_script(
+        _CATCH_SCRIPT_AGENT, agent_runner=runner, limits=VMLimits(max_result_bytes=256)
+    )
+    assert res.ok, res.error
+    assert res.value == {"code": "result_too_large"}
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +218,35 @@ def test_agent_result_over_limit_is_never_persisted_to_replay_cache():
     assert rep.ok, rep.error
     assert rep.value == {"code": "result_too_large"}
     assert rep.replayed_calls == 0
+
+
+def test_agent_result_with_non_json_native_value_over_limit_never_written_to_cache_file():
+    # With a deterministic runner the ``agent`` call is cacheable; the recorder
+    # (``script_store.CallRecorder.record``) uses ``default=str`` so it never
+    # raises on a non-JSON-native payload — confirm the size bound still fires
+    # *before* that write, so ``cache.jsonl`` never receives the oversized value.
+    def runner(agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"blob": b"z" * 100_000, "ok": True}
+
+    limits = VMLimits(max_result_bytes=256)
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        rec = run_workflow_script(
+            _CATCH_SCRIPT_AGENT,
+            store=store,
+            run_id="src",
+            agent_runner=runner,
+            limits=limits,
+            deterministic_runner=True,
+        )
+        assert rec.ok, rec.error
+        assert rec.value == {"code": "result_too_large"}
+
+        cache_path = store.root / "src" / "cache.jsonl"
+        cache_text = cache_path.read_text() if cache_path.exists() else ""
+
+    assert "zzzz" not in cache_text
+    assert len(cache_text.encode("utf-8")) < limits.max_result_bytes
 
 
 def test_prompt_agent_result_over_limit_is_never_cached_for_a_repeat_call():
