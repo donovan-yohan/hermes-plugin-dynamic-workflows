@@ -261,12 +261,8 @@ See [examples/README.md](examples/README.md) for runnable script VM, scoped gran
 
 `0.1.0` runs the script VM with Claude-style dynamic-workflow parity:
 
-<<<<<<< HEAD
-- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, and `context`; schema output is validated with bounded retry-on-mismatch before a typed failure. In Hermes plugin mode, callers can opt into `child_agent_backend="delegate_task"` or `"delegate_task_background"` to route these prompt agents through the host's `delegate_task` dispatcher.
-=======
-- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, `context`, `tools`, and `agentType`; schema output is validated with bounded retry-on-mismatch before a typed failure.
+- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, `context`, `tools`, and `agentType`; schema output is validated with bounded retry-on-mismatch before a typed failure. In Hermes plugin mode, callers can opt into `child_agent_backend="delegate_task"` or `"delegate_task_background"` to route these prompt agents through the host's `delegate_task` dispatcher.
 - **File-based agent-type registry** — `agentType` resolves against project-then-user file-based definitions (frontmatter `name`/`description`/`model`/optional `effort` + a system-prompt body); a bare `agent(prompt)` with no `agentType` always resolves the built-in `general-purpose` default, so it has defined semantics. An explicit per-call `model`/`effort` opt always wins over the resolved registry default. Unknown `agentType` and malformed/path-unsafe definitions fail closed with a deterministic, metadata-only error.
->>>>>>> origin/main
 - **Real bounded concurrency** — `parallel()` (barrier) and `pipeline()` (no-barrier item flow) execute on a thread pool sized to the operator-configurable `max_parallel`, with lifecycle-safe failure that drains in-flight parent work instead of returning terminal while it is still alive.
 - **Fingerprint resume cache** — a duplicate prompt/options call dedups to one child and replays via a `v2` prompt/options hash; `resume_from_run_id` replays an interrupted run's completed calls.
 - **Background runs** — scripts can launch/run/inspect/stop outside the main turn with fail-closed stop, terminal-state lifecycle, and operator-visible status. This local background runner is the workflow controller; Hermes `delegate_task` fanout is an optional foreground child-agent backend, not a replacement controller. `child_agent_backend` is rejected for local background script runs until delegate handles/completions are persisted into workflow status/control.
