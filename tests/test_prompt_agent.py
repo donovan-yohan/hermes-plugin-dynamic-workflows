@@ -888,6 +888,22 @@ def test_prompt_agent_non_iterable_declaration_fails_closed_instead_of_crashing(
     assert runner.requests[0].context == {}
 
 
+def test_filter_child_visible_context_tolerates_non_string_context_keys():
+    # ``_prompt_agent_request`` only validates that ``context`` is a dict, so a
+    # mixed-key dict can reach the filter. Non-string keys can never match the
+    # str allowlist -- they must be dropped (journaled via repr) without the
+    # mixed-type ``sorted()`` TypeError crashing the run.
+    from hermes_workflows.agents import filter_child_visible_context
+
+    runner = SpyChildRunner(frozenset({"pr"}))
+    filtered, dropped = filter_child_visible_context(
+        runner, {1: "x", "pr": 70, "secret": "y"}
+    )
+
+    assert filtered == {"pr": 70}
+    assert dropped == ("1", "secret")
+
+
 def test_prompt_agent_context_quarantine_journals_dropped_key_names_not_values():
     runner = SpyChildRunner(frozenset({"pr"}))
     script = META + (

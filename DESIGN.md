@@ -1503,7 +1503,9 @@ fail-closed default, `agents.child_visible_context_keys(runner)`:
 ```python
 def child_visible_context_keys(runner: Any) -> frozenset[str]:
     declared = getattr(runner, "child_visible_context_keys", None)
-    if declared is None:
+    if declared is None or isinstance(declared, (str, bytes)):
+        # A bare string declaration would iterate char-wise into a set of
+        # single-character "keys" -- fail closed like undeclared instead.
         return frozenset()
     try:
         return frozenset(key for key in declared if isinstance(key, str))

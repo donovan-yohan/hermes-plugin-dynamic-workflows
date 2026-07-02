@@ -224,8 +224,21 @@ def filter_child_visible_context(
     the runner boundary; it never trusts the runner to self-filter.
     """
     allowed = child_visible_context_keys(runner)
-    filtered = {key: value for key, value in context.items() if key in allowed}
-    dropped = tuple(sorted(key for key in context if key not in allowed))
+    filtered = {
+        key: value
+        for key, value in context.items()
+        if isinstance(key, str) and key in allowed
+    }
+    # Non-string keys can never match the str allowlist, so they are always
+    # dropped -- and they must not crash the sort (mixed-type ``sorted()``
+    # raises ``TypeError``): non-string names are journaled via ``repr``.
+    dropped = tuple(
+        sorted(
+            key if isinstance(key, str) else repr(key)
+            for key in context
+            if not (isinstance(key, str) and key in allowed)
+        )
+    )
     return filtered, dropped
 
 
