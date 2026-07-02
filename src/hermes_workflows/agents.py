@@ -35,7 +35,7 @@ __all__ = [
 ]
 
 CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
-    {"label", "phase", "schema", "model", "effort", "isolation", "context"}
+    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools"}
 )
 
 
@@ -149,6 +149,7 @@ class ChildAgentRequest:
     effort: Optional[str] = None
     isolation: Optional[str] = None
     context: dict[str, Any] = field(default_factory=dict)
+    tools: Optional[tuple[str, ...]] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the runner contract as a plain JSON-friendly dict."""
@@ -161,6 +162,7 @@ class ChildAgentRequest:
             "effort": self.effort,
             "isolation": self.isolation,
             "context": copy.deepcopy(self.context),
+            "tools": list(self.tools) if self.tools is not None else None,
         }
 
 

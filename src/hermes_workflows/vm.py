@@ -1474,6 +1474,32 @@ def _optional_dict(params: dict[str, Any], key: str) -> Optional[dict[str, Any]]
     raise CapabilityDenied(f"prompt agent option {key!r} must be an object", code="bad_request")
 
 
+def _optional_tools(params: dict[str, Any], key: str) -> Optional[tuple[str, ...]]:
+    """Validate + normalize the ``tools`` allowlist option (issue #101).
+
+    Strict shape: a list/tuple of non-empty strings, or omitted/``None`` (no
+    restriction). Any other shape -- wrong container type, non-string items,
+    empty-string items -- is a deterministic, metadata-only ``bad_request``
+    denial, matching every other malformed prompt-agent option. Duplicates are
+    deduped preserving first-occurrence order and the result is normalized to
+    an immutable tuple so it can live on the frozen :class:`ChildAgentRequest`.
+    """
+    value = params.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise CapabilityDenied(f"prompt agent option {key!r} must be a list of non-empty strings", code="bad_request")
+    deduped: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise CapabilityDenied(
+                f"prompt agent option {key!r} must be a list of non-empty strings", code="bad_request"
+            )
+        if item not in deduped:
+            deduped.append(item)
+    return tuple(deduped)
+
+
 def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
     """Validate and normalize the parent-side prompt-agent request."""
     prompt = params.get("prompt")
@@ -1499,6 +1525,7 @@ def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
         effort=_optional_str(params, "effort"),
         isolation=_optional_str(params, "isolation"),
         context=_optional_dict(params, "context") or {},
+        tools=_optional_tools(params, "tools"),
     )
 
 
@@ -1509,8 +1536,17 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     are excluded: label, phase, schema, model, effort, isolation, and context all
     participate alongside the prompt. Omitted and explicit ``None`` normalize to
     the same JSON ``null`` value.
+
+    ``tools`` (issue #101) participates too -- a differently-scoped allowlist for
+    an otherwise-identical call must be a distinct cache entry -- but the key is
+    only added to the payload when ``request.tools`` is not ``None``. This keeps
+    every fingerprint minted before #101 byte-identical for calls that never set
+    ``tools``: adding an always-present ``"tools": null`` key would change the
+    canonical JSON (and therefore the ``v2:`` hash) of every existing prompt-agent
+    fingerprint, silently invalidating durable resume/replay caches recorded
+    before this option existed.
     """
-    return {
+    payload: dict[str, Any] = {
         "prompt": request.prompt,
         "label": request.label,
         "phase": request.phase,
@@ -1520,6 +1556,9 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
         "isolation": request.isolation,
         "context": request.context,
     }
+    if request.tools is not None:
+        payload["tools"] = list(request.tools)
+    return payload
 
 
 def _prompt_agent_cache_identity(request: ChildAgentRequest) -> tuple[str, str]:
@@ -1556,6 +1595,7 @@ def _request_with_schema_retry_context(
         effort=request.effort,
         isolation=request.isolation,
         context=context,
+        tools=request.tools,
     )
 
 

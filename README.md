@@ -261,7 +261,7 @@ See [examples/README.md](examples/README.md) for runnable script VM, scoped gran
 
 `0.1.0` runs the script VM with Claude-style dynamic-workflow parity:
 
-- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, and `context`; schema output is validated with bounded retry-on-mismatch before a typed failure.
+- **Prompt-shaped child agents** — `agent(prompt, opts)` accepts `label`, `phase`, `schema`, `model`, `effort`, `isolation`, `context`, and `tools`; schema output is validated with bounded retry-on-mismatch before a typed failure.
 - **Real bounded concurrency** — `parallel()` (barrier) and `pipeline()` (no-barrier item flow) execute on a thread pool sized to the operator-configurable `max_parallel`, with lifecycle-safe failure that drains in-flight parent work instead of returning terminal while it is still alive.
 - **Fingerprint resume cache** — a duplicate prompt/options call dedups to one child and replays via a `v2` prompt/options hash; `resume_from_run_id` replays an interrupted run's completed calls.
 - **Background runs** — scripts can launch/run/inspect/stop outside the main turn with fail-closed stop, terminal-state lifecycle, and operator-visible status.

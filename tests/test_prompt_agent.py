@@ -68,6 +68,14 @@ def test_child_agent_request_as_dict_does_not_share_mutable_schema_or_context():
     assert request.context == {"items": [{"pr": 75}]}
 
 
+def test_child_agent_request_as_dict_serializes_tools_and_defaults_to_none():
+    without_tools = ChildAgentRequest(prompt="summarize")
+    assert without_tools.as_dict()["tools"] is None
+
+    with_tools = ChildAgentRequest(prompt="summarize", tools=("read_file", "grep"))
+    assert with_tools.as_dict()["tools"] == ["read_file", "grep"]
+
+
 def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_outputs():
     secret = "ghp_should_not_persist_secret"
     runner = FakeChildRunner({"answer": "ok", "token": secret, "nested": {"detail": secret}, "_tokens": 3})
@@ -331,6 +339,7 @@ def test_legacy_agent_id_option_key_payloads_stay_legacy_input_data():
         {"phase": "as data"},
         {"schema": {"x": "y"}},
         {"context": {"x": 1}},
+        {"tools": ["read_file"]},
     ):
         res = run_workflow_script(META + f"return await agent(\"hermes.echo\", {payload!r})\n")
         assert res.ok, res.error
@@ -585,6 +594,89 @@ def test_prompt_agent_semantic_options_change_fingerprint():
         fingerprints = [e["fingerprint"] for e in store.journal("labels") if e["type"] == "agent_started"]
         assert len(fingerprints) == 2
         assert fingerprints[0] != fingerprints[1]
+
+
+def test_prompt_agent_tools_round_trips_deduped_and_ordered_to_child_runner():
+    runner = FakeChildRunner({"answer": "ok"})
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "tools": ["read_file", "grep", "read_file"],\n'
+        '})\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+    assert res.ok, res.error
+    assert len(runner.requests) == 1
+    assert runner.requests[0].tools == ("read_file", "grep")
+
+
+def test_prompt_agent_without_tools_leaves_request_tools_none():
+    runner = FakeChildRunner()
+    res = run_workflow_script(META + 'return await agent("write a plan")\n', child_agent_runner=runner)
+    assert res.ok, res.error
+    assert runner.requests[0].tools is None
+
+
+def test_prompt_agent_tools_change_fingerprint():
+    runner = FakeChildRunner({"answer": "ok"})
+    script = META + (
+        'await agent("same prompt", {"schema": {"answer": "string"}, "tools": ["a"]})\n'
+        'await agent("same prompt", {"schema": {"answer": "string"}, "tools": ["b"]})\n'
+        'await agent("same prompt", {"schema": {"answer": "string"}})\n'
+        'return {}\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(script, store=store, run_id="tools_fp", child_agent_runner=runner)
+        assert res.ok, res.error
+        assert len(runner.requests) == 3
+        fingerprints = [e["fingerprint"] for e in store.journal("tools_fp") if e["type"] == "agent_started"]
+        assert len(fingerprints) == 3
+        assert len(set(fingerprints)) == 3
+
+
+def test_prompt_agent_fingerprint_without_tools_matches_pre_tools_baseline():
+    # Regression pin (issue #101): omitting `tools` must fingerprint identically
+    # to how it did before the option existed, so durable resume/replay caches
+    # recorded before #101 still hit. Reconstructs the payload the v2
+    # fingerprint used pre-#101 (no "tools" key at all, not even a null one) and
+    # asserts today's fingerprint for a tools-less call still matches it.
+    from hermes_workflows.script_store import canonical_hash
+    from hermes_workflows.vm import _prompt_agent_cache_identity
+
+    request = ChildAgentRequest(
+        prompt="summarize", label="x", schema={"answer": "string"}, model="sonnet"
+    )
+    fingerprint, _args_hash = _prompt_agent_cache_identity(request)
+
+    pre_tools_payload = {
+        "prompt": "summarize",
+        "label": "x",
+        "phase": None,
+        "schema": {"answer": "string"},
+        "model": "sonnet",
+        "effort": None,
+        "isolation": None,
+        "context": {},
+    }
+    expected = "v2:" + canonical_hash({"kind": "agent(prompt,opts)", "version": 2, "request": pre_tools_payload})
+    assert fingerprint == expected
+
+
+def test_prompt_agent_malformed_tools_rejected_deterministically_not_retryable():
+    runner = FakeChildRunner()
+    for bad_tools in ('"not-a-list"', "{'nested': 1}", "[1, 2]", '[""]', "[True]"):
+        script = META + (
+            'try:\n'
+            f'    await agent("summarize", {{"tools": {bad_tools}}})\n'
+            'except CapabilityError as e:\n'
+            '    return {"code": e.code, "retryable": e.retryable}\n'
+            'return {"code": "missing"}\n'
+        )
+        res = run_workflow_script(script, child_agent_runner=runner)
+        assert res.ok, res.error
+        assert res.value == {"code": "bad_request", "retryable": False}
+    assert runner.requests == []
 
 
 def test_prompt_agent_cache_drift_fails_closed():
