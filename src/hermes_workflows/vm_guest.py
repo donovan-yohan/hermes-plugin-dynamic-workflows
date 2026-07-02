@@ -308,10 +308,11 @@ def _build_script_globals(
     async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                      phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
                      model: Optional[str] = None, effort: Optional[str] = None,
-                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None) -> Any:
+                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None,
+                     tools: Optional[Any] = None) -> Any:
         explicit_opts = {
             "label": label, "phase": phase, "schema": schema, "model": model,
-            "effort": effort, "isolation": isolation, "context": context,
+            "effort": effort, "isolation": isolation, "context": context, "tools": tools,
         }
         legacy_agent_id = _looks_like_legacy_agent_id(target)
         opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
