@@ -172,7 +172,16 @@ class CapabilityRegistry:
             raw = capability.handler(context)
         except CapabilityDenied:
             raise
-        except Exception as exc:  # noqa: BLE001 - host handlers are contained at the capability boundary.
+        except KeyboardInterrupt:
+            raise  # let a genuine operator interrupt propagate.
+        except BaseException as exc:  # noqa: BLE001 - host handlers are contained at the capability
+            # boundary, including a deliberate SystemExit/GeneratorExit: a handler fault is a
+            # contract violation of *this* handler's own behavior, not a transient dispatch
+            # attempt against a live runner, so it stays retryable=False (issue #103) — unlike
+            # the broker's runner-exception containment in vm.py, which classifies
+            # retryable=True. Catching BaseException (not just Exception) keeps that
+            # distinction: without it, a handler-raised SystemExit would escape this boundary
+            # and fall into the broker's containment instead, misclassified as retryable=True.
             raise CapabilityDenied(
                 f"capability handler raised {type(exc).__name__}", code="capability_handler_error"
             ) from exc
