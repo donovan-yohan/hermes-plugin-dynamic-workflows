@@ -1245,11 +1245,14 @@ class ScriptRunStore:
         """Force any buffered ``async``/``exit`` journal events to disk.
 
         A no-op in ``sync`` mode (nothing is ever buffered) and a no-op if
-        nothing is pending. Requires ``self._lock`` already held.
+        nothing is pending. Requires ``self._lock`` already held. The buffer is
+        popped only after the write succeeds, so a transient disk failure during
+        a force-flush leaves the pending lines intact for a retried ``finish()``.
         """
-        pending = self._journal_buffer.pop(run_id, None)
+        pending = self._journal_buffer.get(run_id)
         if pending:
             self._write_journal_lines(run_id, pending)
+            self._journal_buffer.pop(run_id, None)
 
     def _run_dir(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
