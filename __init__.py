@@ -581,20 +581,19 @@ def _decide_call(control_store: FileControlStore, run_id: str, params: dict[str,
     """Wire ``action=decide_call`` to :func:`hermes_workflows.controls.decide_call`.
 
     ``target_ref`` doubles as the pending call id (the same field task_stop/retry
-    already use for a child call/task id). ``value``/``input`` are only forwarded
-    when non-null, matching how every other optional field on this schema treats
-    an absent JSON key and a JSON ``null`` the same way. One consequence: a
-    ``respond`` decision cannot hand back a literal ``None`` result through this
-    JSON tool surface (``decide_call``'s own sentinel then reports "value
-    required"); the Python API (``controls.decide_call(..., value=None)``)
-    supports it directly for a caller that needs it.
+    already use for a child call/task id). ``value``/``input`` forwarding is
+    keyed off the *decision kind*, not a non-null check: a ``respond`` decision
+    forwards ``value`` whenever the key is present — including a literal JSON
+    ``null``, which is a legitimate operator-supplied result
+    (``controls.decide_call(..., value=None)`` supports it directly) — and an
+    ``edit`` decision likewise forwards a present ``input``.
     """
     call_id = params.get("target_ref") or ""
     decision = params.get("decision")
     kwargs: dict[str, Any] = {"actor": params.get("actor"), "reason": params.get("reason")}
-    if params.get("input") is not None:
+    if decision == "edit" and "input" in params:
         kwargs["input"] = params.get("input")
-    if params.get("value") is not None:
+    if decision == "respond" and "value" in params:
         kwargs["value"] = params.get("value")
     return _controls.decide_call(control_store, run_id, call_id, decision, **kwargs)
 

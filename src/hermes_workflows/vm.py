@@ -1692,8 +1692,10 @@ def _approval_params_summary(params: dict[str, Any]) -> Any:
     raw_input = params.get("input") if isinstance(params.get("input"), dict) else {}
     redacted = safe_capability_metadata_value(raw_input)
     try:
-        encoded = json.dumps(redacted, ensure_ascii=False, separators=(",", ":"), default=str)
-    except TypeError:
+        # No default=str: a non-JSON-safe object must fail closed to the note
+        # below, not leak details through its __str__ into the summary.
+        encoded = json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
         return {"note": "input is not JSON-safe; summary omitted"}
     if len(encoded.encode("utf-8")) <= _APPROVAL_SUMMARY_MAX_BYTES:
         return redacted

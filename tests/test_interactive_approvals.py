@@ -845,3 +845,35 @@ def test_plugin_workflow_control_decide_call_requires_known_run(monkeypatch):
             ctl({"action": "decide_call", "run_id": "does-not-exist", "target_ref": "1", "decision": "approve"})
         )
         assert result["success"] is False
+
+
+def test_plugin_decide_call_forwards_a_literal_json_null_respond_value(monkeypatch):
+    # The tool surface must key value/input forwarding off the decision kind,
+    # not a non-null check: ``decision=respond`` with an explicit JSON null is
+    # a legitimate operator-supplied result (Copilot review, PR #128) and must
+    # reach controls.decide_call as value=None instead of tripping its
+    # value-required sentinel; absent keys must still stay absent.
+    plugin = _load_plugin_root()
+    captured: dict[str, Any] = {}
+
+    def fake_decide_call(store, run_id, call_id, decision, **kwargs):
+        captured.update({"call_id": call_id, "decision": decision, **kwargs})
+        return object()
+
+    monkeypatch.setattr(plugin._controls, "decide_call", fake_decide_call)
+
+    plugin._decide_call(
+        None, "run-1", {"target_ref": "1", "decision": "respond", "value": None}
+    )
+    assert captured["decision"] == "respond"
+    assert "value" in captured and captured["value"] is None
+
+    captured.clear()
+    plugin._decide_call(None, "run-1", {"target_ref": "1", "decision": "respond"})
+    assert "value" not in captured
+
+    captured.clear()
+    plugin._decide_call(
+        None, "run-1", {"target_ref": "1", "decision": "edit", "input": {"a": 1}}
+    )
+    assert captured["input"] == {"a": 1}
