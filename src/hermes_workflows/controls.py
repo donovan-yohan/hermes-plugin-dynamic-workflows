@@ -65,8 +65,10 @@ __all__ = [
     "CONTROL_ACTIONS",
     "CONTROL_OPERATIONS",
     "CONTROL_DECISION_CODES",
+    "APPROVAL_DECISION_KINDS",
     "ControlAction",
     "ControlOperation",
+    "ApprovalDecisionKind",
     "DesiredRunState",
     "WorkflowControl",
     "RunControlState",
@@ -81,6 +83,8 @@ __all__ = [
     "stop_run",
     "stop_task",
     "retry",
+    "decide_call",
+    "latest_call_decision",
     "record_control",
     "project_control_state",
     "evaluate_control_state",
@@ -90,6 +94,7 @@ __all__ = [
     "may_check_run",
     "waits_from_loop_status",
     "waits_from_kanban_states",
+    "waits_from_suspended_run",
     "summarize_run",
     "inspect_run",
     "list_runs",
@@ -98,10 +103,20 @@ __all__ = [
 ]
 
 # The closed set of operator intents. ``stop`` halts the whole run; ``task_stop``
-# halts one named child task; ``retry`` replaces a failed call/task. An unknown
-# action fails closed rather than being silently recorded.
-ControlAction = Literal["pause", "resume", "stop", "task_stop", "retry"]
-CONTROL_ACTIONS: tuple[str, ...] = ("pause", "resume", "stop", "task_stop", "retry")
+# halts one named child task; ``retry`` replaces a failed call/task; ``decide_call``
+# resolves one pending approval-gated call (issue #111) with an ``approve`` /
+# ``edit`` / ``reject`` / ``respond`` decision. An unknown action fails closed
+# rather than being silently recorded.
+ControlAction = Literal["pause", "resume", "stop", "task_stop", "retry", "decide_call"]
+CONTROL_ACTIONS: tuple[str, ...] = ("pause", "resume", "stop", "task_stop", "retry", "decide_call")
+
+# The closed set of interactive interrupt decisions a ``decide_call`` control may
+# carry (issue #111): ``approve`` runs the pending call as-is; ``edit`` runs it
+# with an operator-supplied ``input`` (journaled/replayed as authoritative);
+# ``reject`` denies the call deterministically without running it; ``respond``
+# returns an operator-supplied ``value`` without running it at all.
+ApprovalDecisionKind = Literal["approve", "edit", "reject", "respond"]
+APPROVAL_DECISION_KINDS: tuple[str, ...] = ("approve", "edit", "reject", "respond")
 
 # Projected desired control state of a run. This is intent, not enforcement.
 DesiredRunState = Literal["running", "paused", "stopped"]
@@ -141,9 +156,12 @@ class WorkflowControl:
 
     ``control_id`` is both the audit id and the idempotency key: appending a
     control whose id already exists for the run is a no-op that returns the
-    stored record. ``target_ref`` names the child call/task for ``task_stop`` and
-    ``retry``; ``replacement_ref`` + ``attempt`` carry the retry lineage. The
-    record is immutable — corrections are *new* records, never edits.
+    stored record. ``target_ref`` names the child call/task for ``task_stop``,
+    ``retry``, and ``decide_call`` (the pending call id); ``replacement_ref`` +
+    ``attempt`` carry the retry lineage. ``decision`` carries a ``decide_call``'s
+    kind (issue #111); its ``input`` (for ``edit``) and ``value`` (for
+    ``respond``) live in ``metadata`` since either may be an arbitrary JSON-safe
+    shape. The record is immutable — corrections are *new* records, never edits.
     """
 
     control_id: str
@@ -155,6 +173,7 @@ class WorkflowControl:
     target_ref: Optional[str] = None
     replacement_ref: Optional[str] = None
     attempt: Optional[int] = None
+    decision: Optional[ApprovalDecisionKind] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -177,6 +196,11 @@ class WorkflowControl:
         attempt = data.get("attempt")
         if attempt is not None and (not isinstance(attempt, int) or isinstance(attempt, bool)):
             raise ControlError("control attempt must be an integer or null")
+        decision = data.get("decision")
+        if action == "decide_call" and decision not in APPROVAL_DECISION_KINDS:
+            raise ControlError(f"decide_call control requires a valid decision: {decision!r}")
+        if action != "decide_call" and decision is not None:
+            raise ControlError(f"decision is only valid on decide_call, not {action!r}")
         metadata = data.get("metadata")
         return cls(
             control_id=control_id,
@@ -188,6 +212,7 @@ class WorkflowControl:
             target_ref=_opt_str(data.get("target_ref")),
             replacement_ref=_opt_str(data.get("replacement_ref")),
             attempt=attempt,
+            decision=decision,  # type: ignore[arg-type]
             metadata=metadata if isinstance(metadata, dict) else {},
         )
 
@@ -200,6 +225,9 @@ class RunControlState:
     terminal — a resume after a stop is recorded for audit but does not flip the
     run back to ``running``. ``stopped_tasks`` and ``retries`` expose the child
     level: which tasks were individually stopped and the retry lineage.
+    ``call_decisions`` (issue #111) carries every recorded ``decide_call``
+    (approve/edit/reject/respond) row, in recorded order; see
+    :func:`latest_call_decision` for the one an adapter actually applies.
     """
 
     run_id: str
@@ -212,6 +240,7 @@ class RunControlState:
     stopped_control_id: Optional[str] = None
     stopped_tasks: list[dict[str, Any]] = field(default_factory=list)
     retries: list[dict[str, Any]] = field(default_factory=list)
+    call_decisions: list[dict[str, Any]] = field(default_factory=list)
     last_control_id: Optional[str] = None
     last_action: Optional[ControlAction] = None
     controls_total: int = 0
@@ -431,6 +460,7 @@ def record_control(
     target_ref: Optional[str] = None,
     replacement_ref: Optional[str] = None,
     attempt: Optional[int] = None,
+    decision: Optional[ApprovalDecisionKind] = None,
     control_id: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
 ) -> WorkflowControl:
@@ -443,8 +473,12 @@ def record_control(
     if action not in CONTROL_ACTIONS:
         raise ControlError(f"unknown control action: {action!r}")
     _require_nonempty(run_id, "run_id")
-    if action in ("task_stop", "retry") and not _opt_str(target_ref):
+    if action in ("task_stop", "retry", "decide_call") and not _opt_str(target_ref):
         raise ControlError(f"{action} requires a target_ref (the child call/task id)")
+    if action == "decide_call" and decision not in APPROVAL_DECISION_KINDS:
+        raise ControlError(f"decide_call requires a decision, one of {APPROVAL_DECISION_KINDS}")
+    if action != "decide_call" and decision is not None:
+        raise ControlError(f"decision is only valid on decide_call, not {action!r}")
     control = WorkflowControl(
         control_id=control_id or f"ctl_{uuid.uuid4().hex[:16]}",
         run_id=run_id,
@@ -454,6 +488,7 @@ def record_control(
         target_ref=_opt_str(target_ref),
         replacement_ref=_opt_str(replacement_ref),
         attempt=attempt,
+        decision=decision,
         metadata=dict(metadata or {}),
     )
     return store.append(control)
@@ -562,6 +597,96 @@ def retry(
     )
 
 
+_NO_RESPOND_VALUE = object()  # sentinel: distinguishes an unset ``value`` from a legitimate ``None``.
+
+
+def decide_call(
+    store: ControlStore,
+    run_id: str,
+    call_id: str,
+    decision: ApprovalDecisionKind,
+    *,
+    input: Optional[dict[str, Any]] = None,
+    value: Any = _NO_RESPOND_VALUE,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+    control_id: Optional[str] = None,
+) -> WorkflowControl:
+    """Record an operator decision on one pending approval-gated call (issue #111).
+
+    ``call_id`` is the pending capability call's id, as surfaced by
+    :func:`waits_from_suspended_run` / ``workflow_control status``. ``decision``
+    is one of :data:`APPROVAL_DECISION_KINDS`:
+
+    * ``approve`` — run the call as-is. No ``input``/``value``.
+    * ``edit`` — run the call with the operator-supplied ``input`` in place of
+      the script's own arguments; this is journaled and feeds the replay
+      fingerprint as the *authoritative* arguments (issue #111 acceptance
+      criteria) — the original, unedited arguments are discarded from the
+      record of what actually happened.
+    * ``reject`` — deny the call deterministically (``retryable=False`` per the
+      issue #103 taxonomy) without ever running it. ``reason`` is the denial
+      message a script observes via ``CapabilityError``.
+    * ``respond`` — return the operator-supplied ``value`` to the script without
+      running the call at all. ``value`` may be any JSON-safe shape (including
+      ``None``); the adapter is responsible for bounding it like any other
+      result before it lands in run state.
+
+    Unlike :func:`retry`, this is **not** idempotent by ``call_id`` — an
+    operator issuing a correction (e.g. reject, then reconsider and approve)
+    before a run has actually consumed the decision is a legitimate append-only
+    audit trail, not a duplicate. :func:`latest_call_decision` resolves the
+    *last* recorded decision for a given call id, which is the one an adapter
+    applies; once applied its outcome is durably journaled/cached by the
+    adapter, so a later correction here has no effect on an already-decided
+    call.
+    """
+    if decision not in APPROVAL_DECISION_KINDS:
+        raise ControlError(f"unknown approval decision: {decision!r}; expected one of {APPROVAL_DECISION_KINDS}")
+    _require_nonempty(run_id, "run_id")
+    target = _opt_str(call_id)
+    if not target:
+        raise ControlError("decide_call requires a call_id (the pending capability call id)")
+
+    metadata: dict[str, Any] = {}
+    if decision == "edit":
+        if not isinstance(input, dict):
+            raise ControlError("an 'edit' decision requires an 'input' object (the operator-modified arguments)")
+        metadata["input"] = input
+    elif input is not None:
+        raise ControlError(f"'input' is only valid for an 'edit' decision, not {decision!r}")
+
+    if decision == "respond":
+        if value is _NO_RESPOND_VALUE:
+            raise ControlError("a 'respond' decision requires a 'value' (the operator-supplied result)")
+        metadata["value"] = value
+    elif value is not _NO_RESPOND_VALUE:
+        raise ControlError(f"'value' is only valid for a 'respond' decision, not {decision!r}")
+
+    return record_control(
+        store,
+        run_id,
+        "decide_call",
+        actor=actor,
+        reason=reason,
+        target_ref=target,
+        decision=decision,
+        control_id=control_id,
+        metadata=metadata,
+    )
+
+
+def latest_call_decision(control_state: RunControlState, call_id: str) -> Optional[dict[str, Any]]:
+    """Return the most recently recorded ``decide_call`` row for ``call_id``, if any.
+
+    An operator may append more than one decision for the same call (a
+    correction before it is consumed); the *last* one recorded is the one that
+    governs, mirroring how :func:`evaluate_control_state` resolves per-target
+    ``stopped_tasks``/``retries`` rows via ``_last_match``.
+    """
+    return _last_match(control_state.call_decisions, call_id)
+
+
 # ---------------------------------------------------------------------------
 # Projection.
 # ---------------------------------------------------------------------------
@@ -585,6 +710,7 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
     stopped_control_id: Optional[str] = None
     stopped_tasks: list[dict[str, Any]] = []
     retries: list[dict[str, Any]] = []
+    call_decisions: list[dict[str, Any]] = []
     last_control_id: Optional[str] = None
     last_action: Optional[ControlAction] = None
 
@@ -625,6 +751,19 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
                     "at": c.created_at,
                 }
             )
+        elif c.action == "decide_call":
+            row: dict[str, Any] = {
+                "target_ref": c.target_ref,
+                "decision": c.decision,
+                "control_id": c.control_id,
+                "reason": c.reason,
+                "at": c.created_at,
+            }
+            if c.decision == "edit":
+                row["input"] = c.metadata.get("input") if isinstance(c.metadata, dict) else None
+            if c.decision == "respond":
+                row["value"] = c.metadata.get("value") if isinstance(c.metadata, dict) else None
+            call_decisions.append(row)
 
     desired: DesiredRunState = "stopped" if stopped else ("paused" if paused else "running")
     return RunControlState(
@@ -638,6 +777,7 @@ def project_control_state(run_id: str, controls: Iterable[WorkflowControl]) -> R
         stopped_control_id=stopped_control_id,
         stopped_tasks=stopped_tasks,
         retries=retries,
+        call_decisions=call_decisions,
         last_control_id=last_control_id,
         last_action=last_action,
         controls_total=len(ordered),
@@ -842,6 +982,52 @@ def waits_from_kanban_states(states: Iterable[dict[str, Any]], *, run_id: str = 
             )
         )
     return out
+
+
+# A run suspended by the VM's interactive approval gate (issue #111) persists its
+# pending-call detail on the terminal ``error`` field of the run record.
+_APPROVAL_PENDING_ERROR_TYPE = "ApprovalPending"
+
+
+def waits_from_suspended_run(meta: Any) -> list[WaitSummary]:
+    """Extract the pending approval-gated call from one suspended run's metadata.
+
+    A run suspended by the VM's interactive capability-approval gate (issue
+    #111) is recorded with ``status="suspended"`` and a terminal ``error`` of
+    ``{"type": "ApprovalPending", "call_id", "method", "name",
+    "side_effect_class", "params_summary", ...}`` — metadata-only, redacted, and
+    size-bounded (never the raw capability arguments; see
+    ``vm.py``'s ``_approval_params_summary``). ``meta`` is anything with that
+    shape: a :class:`~hermes_workflows.script_store.ScriptRunMeta` (via
+    ``to_dict()``) or a plain dict (e.g. from a durable store scan). Returns an
+    empty list for any other/absent shape, mirroring
+    :func:`waits_from_loop_status` / :func:`waits_from_kanban_states`.
+    """
+    data = meta.to_dict() if hasattr(meta, "to_dict") else meta
+    if not isinstance(data, dict) or data.get("status") != "suspended":
+        return []
+    error = data.get("error")
+    if not isinstance(error, dict) or error.get("type") != _APPROVAL_PENDING_ERROR_TYPE:
+        return []
+    call_id = str(error.get("call_id") or "")
+    if not call_id:
+        return []
+    name = error.get("name")
+    return [
+        WaitSummary(
+            run_id=str(data.get("run_id") or ""),
+            wait_id=call_id,
+            kind="approval",
+            state="suspended",
+            summary=str(name or ""),
+            source="capability",
+            ref={
+                k: error[k]
+                for k in ("call_id", "method", "name", "side_effect_class", "params_summary")
+                if k in error
+            },
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

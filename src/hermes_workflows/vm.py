@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -47,10 +47,19 @@ from .agents import (
 from .capabilities import (
     CapabilityPolicy,
     CapabilityRegistry,
+    WorkflowCapability,
+    finalize_capability_result,
     normalize_capability_name,
     safe_capability_metadata_value,
 )
-from .controls import ControlStore, may_check_run, may_continue_task, may_start_work, project_control_state
+from .controls import (
+    ControlStore,
+    latest_call_decision,
+    may_check_run,
+    may_continue_task,
+    may_start_work,
+    project_control_state,
+)
 from .errors import (
     CapabilityDenied,
     CorruptScriptRunError,
@@ -310,6 +319,13 @@ class CapabilityBroker:
         # twice for identical prompt/options within one live run.
         self._prompt_results: dict[str, tuple[str, dict[str, Any]]] = {}
         self._recorded_prompt_fingerprints: set[str] = set()
+        # Interactive approval decisions (issue #111): when a ``decide_call``
+        # "edit" decision governs a capability call, the operator-modified
+        # arguments — not the script's original ones — must feed the replay
+        # fingerprint/journal (acceptance criteria). ``_handle_capability`` stages
+        # the effective params here; ``handle`` swaps them in for persistence
+        # right after dispatch, before the entry ever reaches the recorder/journal.
+        self._effective_params: dict[Any, dict[str, Any]] = {}
         self.should_abort = False
         self.abort_reason: Optional[str] = None
         # Durable suspend signal (issue #5): set when an unresolved paused Kanban
@@ -513,6 +529,15 @@ class CapabilityBroker:
             value = self._dispatch(call_id, method, params)
             if method in ("agent", "kanban_agent"):
                 self._check_result_size(call_id, method, value)
+            # An interactive "edit" decision (issue #111) may have substituted
+            # operator-modified arguments for this call; persistence below must
+            # use those, not the script's original params, per the acceptance
+            # criteria that edited params are authoritative for the replay
+            # fingerprint/journal.
+            with self._lock:
+                effective_params = self._effective_params.pop(call_id, None)
+            if effective_params is not None:
+                params = effective_params
             if transcript_started_at is not None:
                 self._transcript_result(call_id, method, params, transcript_started_at, transcript_start, value)
             # The effect has already happened. Persist (replay cache + journal)
@@ -524,6 +549,8 @@ class CapabilityBroker:
             self._persist_success(call_id, method, params, value)
             return ret
         except CapabilityDenied as denied:
+            with self._lock:
+                self._effective_params.pop(call_id, None)  # never persisted; do not leak the entry.
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, denied.code)
             self._emit(
@@ -542,6 +569,8 @@ class CapabilityBroker:
             # CapabilityDenied contract violation, this is a property of one dispatch
             # attempt against a live runner, not of the call's arguments — retryable=True
             # (issue #103) so a script may catch it and choose to retry or degrade.
+            with self._lock:
+                self._effective_params.pop(call_id, None)  # never persisted; do not leak the entry.
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, "runner_error")
             self._emit(
@@ -916,10 +945,60 @@ class CapabilityBroker:
                 "register it as replayable and honor the provided idempotency_key, or split it outside replay"
             )
             raise CapabilityDenied(self.abort_reason, code="capability_replay_unsafe")
+
+        policy = self._capability_policy
+        effective_params = params
+        decision = self._resolve_approval_decision(call_id, capability, params)
+        if decision is not None:
+            kind = decision.get("decision")
+            if kind == "reject":
+                reason = decision.get("reason") or (
+                    f"capability {capability.name!r} call {call_id!r} was rejected by an operator"
+                )
+                # Deterministic denial (issue #103 taxonomy): a script may catch it
+                # via CapabilityError, but it is not retryable — an operator's
+                # recorded rejection is durable and will not resolve differently
+                # on a later attempt.
+                raise CapabilityDenied(str(reason), code="capability_rejected", retryable=False)
+            if kind == "respond":
+                result = finalize_capability_result(
+                    decision.get("value"), side_effect_class=capability.side_effect_class, policy=policy
+                )
+                usage = _non_negative_token_usage(result)
+                if usage is not None:
+                    with self._lock:
+                        self._tokens += usage
+                _validate_output(result, params.get("schema"))
+                return result
+            control_id = decision.get("control_id")
+            synthetic_approval_id = f"decision:{control_id}"
+            policy = dataclass_replace(policy, approved_approval_ids=policy.approved_approval_ids + (synthetic_approval_id,))
+            if kind == "edit":
+                edited_input = decision.get("input")
+                if not isinstance(edited_input, dict):
+                    raise CapabilityDenied(
+                        f"edit decision for call {call_id!r} is missing a valid 'input' object",
+                        code="capability_denied",
+                    )
+                # Feed the dispatch the operator's arguments (with the synthetic
+                # approval id enforcement uses) but stage the *edited-without-the-
+                # synthetic-id* params for persistence — the journal/replay cache
+                # must reflect what an operator actually authorized, not our
+                # internal enforcement bypass token.
+                effective_params = {**params, "input": edited_input, "approval_id": synthetic_approval_id}
+                with self._lock:
+                    self._effective_params[call_id] = {**params, "input": edited_input}
+            elif kind == "approve":
+                effective_params = {**params, "approval_id": synthetic_approval_id}
+            else:  # pragma: no cover - defensive; APPROVAL_DECISION_KINDS is closed and validated on write.
+                raise CapabilityDenied(
+                    f"unknown decision {kind!r} recorded for call {call_id!r}", code="capability_denied"
+                )
+
         result = self._capability_registry.run(
             capability.name,
-            params,
-            policy=self._capability_policy,
+            effective_params,
+            policy=policy,
             run_context={
                 "idempotency_root": self._idempotency_root,
                 "call_id": call_id,
@@ -931,8 +1010,86 @@ class CapabilityBroker:
         if usage is not None:
             with self._lock:
                 self._tokens += usage
-        _validate_output(result, params.get("schema"))
+        _validate_output(result, effective_params.get("schema"))
         return result
+
+    def _resolve_approval_decision(
+        self, call_id: Any, capability: WorkflowCapability, params: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Consult the interactive approval-decision surface for one call (issue #111).
+
+        Returns ``None`` whenever the caller should fall through to the existing
+        :meth:`CapabilityRegistry.run` enforcement unchanged: the capability's
+        side effect class is not even allowed, is not approval-gated, is already
+        covered by a pre-provisioned ``approval_id`` (the non-interactive fast
+        path this policy has always supported), or the host has not opted into
+        ``CapabilityPolicy.interactive_approval`` with a ``control_store`` wired.
+
+        When interactive approval *is* active and the call needs a decision,
+        this returns the latest recorded ``decide_call`` row for ``call_id`` —
+        or, finding none, durably suspends the run (:attr:`should_suspend`) and
+        raises a deterministic, non-retryable ``capability_approval_pending``
+        denial. Resuming (``replay_from``) re-reaches this exact call and
+        re-consults the (durable) control store; once an operator has recorded a
+        decision it applies deterministically.
+        """
+        policy = self._capability_policy
+        if capability.side_effect_class not in policy.allowed_side_effect_classes:
+            return None  # not allowed at all; let the existing denial fire.
+        if capability.side_effect_class not in policy.approval_required_classes:
+            return None  # not approval-gated.
+        approval_id = params.get("approval_id")
+        if isinstance(approval_id, str) and approval_id in policy.approved_approval_ids:
+            return None  # pre-provisioned approval_id: the non-interactive fast path.
+        if not policy.interactive_approval or self._control_store is None:
+            return None  # interactive approval not wired; keep the prior fast-path denial.
+
+        row = self._pending_call_decision(call_id)
+        if row is not None:
+            return row
+        self._begin_approval_suspend(call_id, capability, params)
+        raise CapabilityDenied(
+            f"capability {capability.name!r} call {call_id!r} is awaiting an operator approval decision",
+            code="capability_approval_pending",
+        )
+
+    def _pending_call_decision(self, call_id: Any) -> Optional[dict[str, Any]]:
+        """Look up a call's decision by the *logical* run id, not the per-generation one.
+
+        Unlike :meth:`_control_state` (pause/resume/stop/task_stop, which
+        deliberately read the fresh replay run id — see ``__init__``), an
+        operator decides against the run they observed suspended. A stable call
+        id reproduces at the same point on every replay of the same script/args,
+        so decisions must key on :attr:`_idempotency_root` (the ultimate,
+        replay-of-a-replay-resolved source run) exactly like the Kanban
+        idempotency key does, or a chained resume would never see the decision
+        an operator recorded against the original suspended run.
+        """
+        assert self._control_store is not None
+        controls = self._control_store.list_for(self._idempotency_root)
+        state = project_control_state(self._idempotency_root, controls)
+        return latest_call_decision(state, str(call_id))
+
+    def _begin_approval_suspend(self, call_id: Any, capability: WorkflowCapability, params: dict[str, Any]) -> None:
+        """Flag the run for suspension on an undecided approval-gated call.
+
+        Mirrors :meth:`_begin_suspend` (issue #5's Kanban suspend): the VM
+        observes :attr:`should_suspend` after the (denial) ret frame and tears
+        the subprocess down, reporting a resumable *suspended* run. Unlike the
+        Kanban path there is no external backend to poll — the pending call
+        simply has no ``decide_call`` control recorded yet; the run resumes the
+        instant one is (via ``replay_from``, which re-reaches this exact call).
+        """
+        with self._lock:
+            self.should_suspend = True
+            self.suspend_info = {
+                "type": "ApprovalPending",
+                "call_id": call_id,
+                "method": "capability",
+                "name": capability.name,
+                "side_effect_class": capability.side_effect_class,
+                "params_summary": _approval_params_summary(params),
+            }
 
     def _check_token_budget(self) -> None:
         """Hard ceiling: once the token budget is spent, deny further effects."""
@@ -1456,6 +1613,37 @@ def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
     return None
 
 
+# Cap on the JSON-encoded size of the redacted "pending call" summary an
+# operator sees via workflow_control status while a run is suspended awaiting
+# an approval decision (issue #111). Mirrors the journal's metadata-only
+# convention: never the raw arguments, and never unbounded.
+_APPROVAL_SUMMARY_MAX_BYTES = 2048
+
+
+def _approval_params_summary(params: dict[str, Any]) -> Any:
+    """Redacted, size-bounded summary of a pending approval-gated call's input.
+
+    Used only to describe a *suspended* run's pending call to an operator
+    (``suspend_info["params_summary"]``, surfaced via
+    :func:`hermes_workflows.controls.waits_from_suspended_run`) — never
+    persisted to the metadata-only journal, which stays capability-name-only as
+    it always has. Credential-shaped values are redacted like any other
+    capability metadata (:func:`safe_capability_metadata_value`); an
+    oversized or non-JSON-safe input is replaced with a note rather than
+    truncated silently, so an operator is not misled about what they are
+    approving.
+    """
+    raw_input = params.get("input") if isinstance(params.get("input"), dict) else {}
+    redacted = safe_capability_metadata_value(raw_input)
+    try:
+        encoded = json.dumps(redacted, ensure_ascii=False, separators=(",", ":"), default=str)
+    except TypeError:
+        return {"note": "input is not JSON-safe; summary omitted"}
+    if len(encoded.encode("utf-8")) <= _APPROVAL_SUMMARY_MAX_BYTES:
+        return redacted
+    return {"note": f"input exceeds {_APPROVAL_SUMMARY_MAX_BYTES} bytes; summary omitted"}
+
+
 def _optional_str(params: dict[str, Any], key: str) -> Optional[str]:
     value = params.get(key)
     if value is None:
@@ -1975,13 +2163,20 @@ class WorkflowVM:
                 error={"type": "WorkflowPaused", **state_paused},
             )
         if state_suspended is not None:
-            # Durable, resumable suspension (issue #5) — not a failure. The error
-            # payload is metadata-safe (card id is a content-address, profile is a
-            # role name) so it can live on the operator-facing run.json.
+            # Durable, resumable suspension (issue #5, and issue #111's approval
+            # gate) — not a failure. The error payload is metadata-safe (card id
+            # is a content-address, profile is a role name, capability
+            # params_summary is redacted/bounded) so it can live on the
+            # operator-facing run.json. ``type`` defaults to the original
+            # (issue #5) shape for a suspend source that predates carrying its
+            # own type (e.g. a stub in a test); issue #111's approval suspend
+            # always sets ``"type": "ApprovalPending"`` itself.
+            suspend_info = dict(state_suspended)
+            suspend_type = suspend_info.pop("type", None) or "KanbanSuspended"
             return ScriptRunResult(
                 ok=False, suspended=True, meta=meta, calls=calls,
                 exit_code=exit_code, stderr=stderr_text,
-                error={"type": "KanbanSuspended", **state_suspended},
+                error={"type": suspend_type, **suspend_info},
             )
         if state_protocol_error is not None:
             return ScriptRunResult(
