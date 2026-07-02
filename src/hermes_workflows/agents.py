@@ -25,6 +25,8 @@ __all__ = [
     "ChildAgentRequest",
     "ChildAgentRunner",
     "CHILD_AGENT_OPTION_KEYS",
+    "child_visible_context_keys",
+    "filter_child_visible_context",
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
@@ -168,11 +170,76 @@ class ChildAgentRequest:
 
 @runtime_checkable
 class ChildAgentRunner(Protocol):
-    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``."""
+    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``.
+
+    A runner may additionally declare a ``child_visible_context_keys:
+    frozenset[str]`` attribute naming the ``ChildAgentRequest.context`` keys it
+    is allowed to receive (issue #102). This is not a formal Protocol member --
+    it is optional and resolved via ``getattr`` with a fail-closed default (see
+    :func:`child_visible_context_keys`) -- so existing runners that predate the
+    contract keep working unchanged; they simply see no context until they opt
+    in. The allowlist is enforced parent-side, in ``vm.py``, immediately before
+    a ``ChildAgentRequest`` crosses this boundary; the runner is never trusted
+    to police itself. This is the inverse of deepagents' ``private_state_keys``
+    denylist: an explicit, host-declared *allowlist* of what a child may see,
+    not a list of what to hide from it.
+    """
 
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         """Run one isolated child agent and return its final structured result."""
         ...
+
+
+def child_visible_context_keys(runner: Any) -> frozenset[str]:
+    """Resolve ``runner``'s declared child-visible-context allowlist (issue #102).
+
+    Fail-closed default: a runner that does not expose a
+    ``child_visible_context_keys`` attribute gets an empty allowlist, so no
+    ``ChildAgentRequest.context`` key reaches it. A declared value that is not
+    an iterable of strings is treated the same as "undeclared" -- the parent
+    never trusts the runner's own honesty about the *shape* of its
+    declaration, only what it can verify. A ``str``/``bytes`` declaration is a
+    common typo for a single-element collection (e.g. ``"pr"`` meant to be
+    ``{"pr"}``) -- iterating it yields individual characters rather than the
+    intended key, so it is rejected outright rather than silently degraded.
+    """
+    declared = getattr(runner, "child_visible_context_keys", None)
+    if declared is None or isinstance(declared, (str, bytes)):
+        return frozenset()
+    try:
+        return frozenset(key for key in declared if isinstance(key, str))
+    except TypeError:
+        return frozenset()
+
+
+def filter_child_visible_context(
+    runner: Any, context: dict[str, Any]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Filter ``context`` down to ``runner``'s declared allowlist (issue #102).
+
+    Returns ``(filtered_context, dropped_keys)``: the dict actually safe to
+    hand to ``runner``, and the sorted tuple of dropped key *names* -- never
+    their values -- suitable for a metadata-only journal note. Called
+    parent-side (``vm.py``), immediately before a ``ChildAgentRequest`` crosses
+    the runner boundary; it never trusts the runner to self-filter.
+    """
+    allowed = child_visible_context_keys(runner)
+    filtered = {
+        key: value
+        for key, value in context.items()
+        if isinstance(key, str) and key in allowed
+    }
+    # Non-string keys can never match the str allowlist, so they are always
+    # dropped -- and they must not crash the sort (mixed-type ``sorted()``
+    # raises ``TypeError``): non-string names are journaled via ``repr``.
+    dropped = tuple(
+        sorted(
+            key if isinstance(key, str) else repr(key)
+            for key in context
+            if not (isinstance(key, str) and key in allowed)
+        )
+    )
+    return filtered, dropped
 
 
 class StubAgentRunner:

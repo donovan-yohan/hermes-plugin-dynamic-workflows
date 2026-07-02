@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -40,6 +40,7 @@ from .agents import (
     ChildAgentRequest,
     ChildAgentRunner,
     StubAgentRunner,
+    filter_child_visible_context,
     is_known_agent,
     is_kanban_runner_id,
     kanban_runner_id,
@@ -982,9 +983,18 @@ class CapabilityBroker:
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
             )
 
+        # The v2: fingerprint is always minted over the pre-filter (script-supplied)
+        # context -- see _prompt_agent_cache_identity's docstring and DESIGN.md
+        # §5.7.5 (issue #102) -- so cache/replay identity never depends on which
+        # runner happens to be configured or what it declares. Only the copy
+        # that actually crosses the ChildAgentRunner boundary is quarantined.
         fingerprint, _args_hash = _prompt_agent_cache_identity(request)
-        self._emit_prompt_agent_event("agent_started", call_id, request, fingerprint, ok=True)
-        return self._invoke_prompt_agent_with_schema_retry(call_id, request)
+        filtered_context, dropped_keys = filter_child_visible_context(self._child_runner, request.context)
+        self._emit_prompt_agent_event(
+            "agent_started", call_id, request, fingerprint, ok=True, dropped_context_keys=dropped_keys
+        )
+        visible_request = _dataclass_replace(request, context=filtered_context)
+        return self._invoke_prompt_agent_with_schema_retry(call_id, visible_request)
 
     def _invoke_prompt_agent_with_schema_retry(
         self, call_id: Any, request: ChildAgentRequest
@@ -1361,6 +1371,7 @@ class CapabilityBroker:
         ok: bool,
         cache: Optional[str] = None,
         has_value: Optional[bool] = None,
+        dropped_context_keys: Optional[tuple[str, ...]] = None,
     ) -> None:
         event: dict[str, Any] = {
             "type": event_type,
@@ -1377,6 +1388,15 @@ class CapabilityBroker:
             event["cache"] = cache
         if has_value is not None:
             event["has_value"] = has_value
+        # Metadata-only quarantine note (issue #102): dropped key *names*, never
+        # their values, and only emitted when the runner's declared allowlist
+        # actually narrowed the script-supplied context. Key names are
+        # script-chosen strings, same as label/phase, so they go through the
+        # same credential-marker redaction before entering the journal.
+        if dropped_context_keys:
+            event["dropped_context_keys"] = [
+                safe_capability_metadata_value(key) for key in dropped_context_keys
+            ]
         self._emit(event)
 
     def _call_event(
@@ -1545,6 +1565,18 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     canonical JSON (and therefore the ``v2:`` hash) of every existing prompt-agent
     fingerprint, silently invalidating durable resume/replay caches recorded
     before this option existed.
+
+    ``context`` (issue #102) is always the *pre-filter*, script-supplied value,
+    never the copy narrowed by a ``ChildAgentRunner``'s declared
+    ``child_visible_context_keys`` allowlist -- every caller of this function
+    builds ``request`` straight from the RPC params, before the broker's
+    quarantine filter ever runs (see ``CapabilityBroker._handle_prompt_agent``
+    and DESIGN.md §5.7.5). This keeps cache/replay identity independent of
+    which runner happens to be configured for a given process (a runner swap
+    with a different declared allowlist must not silently invalidate every
+    durable fingerprint recorded against the same prompt/opts), and it means a
+    call whose context passes the allowlist entirely fingerprints exactly as it
+    did before this option existed.
     """
     payload: dict[str, Any] = {
         "prompt": request.prompt,
