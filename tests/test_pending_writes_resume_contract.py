@@ -233,6 +233,12 @@ def test_replay_drift_on_a_completed_sibling_aborts_the_resume_fail_closed():
         # see CapabilityBroker._maybe_replay's ``replay_mismatch`` guard.
         assert b.error["type"] == "WorkflowSubprocessError"
         assert "replay drift" in b.error["message"]
-        # The drift is caught before the drifted call is ever handed to a live
-        # runner — fail closed, not "run it live and hope".
-        assert resume_agent_runner.calls == []
+        # The drift is caught before the *drifted* call (branch 0) is ever
+        # handed to a live runner — fail closed, not "run it live and hope".
+        # This does not pin whether sibling branch 2 (a legitimate cache miss
+        # the contract permits to dispatch live) reaches the runner before the
+        # abort kills the run: the guest submits all four parallel call frames
+        # up front, and whether branch 2's frame is read before the abort wins
+        # the race is scheduling-dependent, not part of the drift-abort
+        # contract.
+        assert 0 not in resume_agent_runner.calls

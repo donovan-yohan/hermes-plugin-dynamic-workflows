@@ -1138,44 +1138,60 @@ hard cap is not re-checked on a faithful replay).
 
 LangGraph calls this "pending writes": siblings that already completed within a
 failed superstep are preserved on resume, not re-executed. §5.7's replay cache
-already gives us the mechanism — every RPC call's success is fsynced to
-`cache.jsonl` (or the prompt-fingerprint cache, below) the instant
+already gives us the mechanism — every *cacheable* RPC call's success is
+fsynced to `cache.jsonl` (or the prompt-fingerprint cache, below) the instant
 `CapabilityBroker.handle()` returns, **independent of whether the run as a
-whole later fails**. This section states the resulting guarantee explicitly
-and pins it with a fixture
-(`tests/test_pending_writes_resume_contract.py`).
+whole later fails**. Which calls are cacheable is gated by `_is_cacheable` /
+`is_replayable` (§5.7): `log`/`phase` always, but `agent(agent_id, input)` and
+`kanban_agent` only when the run's `deterministic_runner` is true (the default
+is `isinstance(runner, StubAgentRunner) and child_agent_runner is None` — i.e.
+true for the built-in stub runner, false for any live/custom `AgentRunner`
+unless the caller opts in explicitly). This section states the resulting
+guarantee, and its precondition, explicitly, and pins it with a fixture
+(`tests/test_pending_writes_resume_contract.py`, which passes
+`deterministic_runner=True` for exactly this reason).
 
 **The guarantee.** When a `parallel()` (or `pipeline()`) fan-out is
 interrupted mid-flight — a runner crash, an operator kill, a process death —
-the branches that had already returned successfully are not lost and are not
-re-run on `replay_from`:
+the *cacheable* branches that had already returned successfully are not lost
+and are not re-run on `replay_from`:
 
 - A **deterministic `agent(agent_id, input)`** branch that completed is served
   by its stable call id from `cache.jsonl` (§5.7), exactly like any other
   deterministic call — the resumed run never invokes the (possibly new/
-  different) injected runner for it.
+  different) injected runner for it. This half of the guarantee applies **only
+  when the source run recorded with `deterministic_runner=True`** (explicitly,
+  or implicitly via the `StubAgentRunner` default). A source run driven by a
+  live/custom `AgentRunner` with `deterministic_runner` left at its default
+  `False` caches no `agent(agent_id, ...)` results at all — every such branch,
+  completed or not, re-dispatches live on resume.
 - A **prompt-agent `agent(prompt, opts)`** branch that completed is served by
   its semantic `v2:` fingerprint (`_prompt_agent_cache_identity`), independent
   of `deterministic_runner` and independent of call id — it is recorded
   unconditionally on every successful prompt-agent call, so it survives even a
   run whose deterministic-agent cache is off (see README's "Fingerprint resume
-  cache").
+  cache"). This half of the guarantee holds regardless of runner configuration.
 - Branches that never completed before the crash (their RPC call never
   returned, or returned with an error) have no cache entry — deterministic or
   fingerprint — and re-dispatch live on resume, against whatever runner the
   resumed process is given.
 
-Because each call's persistence is independent of the others and of the run's
-terminal outcome, an *N-of-M* mid-`parallel()` crash resumes with exactly the
-N completed siblings cache-served and the M−N incomplete ones re-executed —
-never more, never fewer. The fixture drives this directly: a four-branch
-`parallel()` mixing one deterministic and one prompt-agent branch that
-complete with one of each that "crash" (a runner that raises, the same
-controlled-failure-injection pattern already used throughout
+Because each cacheable call's persistence is independent of the others and of
+the run's terminal outcome, an *N-of-M* mid-`parallel()` crash resumes with
+exactly the N completed **cacheable** siblings cache-served and the remaining
+ones re-executed — never more, never fewer *among calls the run's
+configuration made cacheable*; a live-runner deterministic-agent branch is
+outside that set regardless of whether it completed. The fixture drives this
+directly: a four-branch `parallel()` mixing one deterministic and one
+prompt-agent branch that complete with one of each that "crash" (a runner that
+raises, the same controlled-failure-injection pattern already used throughout
 `tests/test_vm_subprocess.py`), then asserts via **runner invocation
 counting** on *fresh* runner instances for the resumed run that the two
 completed branches never reach the new runners at all, and the two crashed
-branches do, exactly once each.
+branches do, exactly once each. (Only the `parallel()` half is pinned by a
+fixture; `pipeline()` shares the same per-call persistence mechanism — it is
+stage-agnostic, not `parallel()`-specific — but that sharing is not separately
+pinned.)
 
 **Drift-abort fail-closed still applies at the sibling level.** A completed
 sibling's cache entry is guarded by the same per-call integrity tag as any
@@ -1192,13 +1208,25 @@ doubtful hit is refused, not guessed at.
 
 **Boundary: this is call-result dedup, not side-effect dedup.** The guarantee
 above is about *not re-running a call whose success the parent already
-durably observed*. It says nothing about calls whose underlying effect fired
-but whose success was never durably recorded before the crash — e.g. a live
-(non-deterministic) `AgentRunner` that dispatched a real action and then the
-process died before the RPC response reached `_persist_success`, or a
-`capability()` handler with an `external_write` side-effect class that is not
-`replayable` (§5.3). Those re-dispatch live on resume like any cache miss and
-may repeat the external effect. Closing that gap needs effect-level
+durably observed*, and it only ever observes calls the run's configuration
+made cacheable in the first place. Two distinct ways a completed branch can
+still re-dispatch live on resume:
+
+- **Never cacheable, regardless of timing.** A live (non-deterministic)
+  `AgentRunner`'s `agent(agent_id, input)` results are not recorded to
+  `cache.jsonl` at all when `deterministic_runner` is (as it is by default for
+  any runner other than `StubAgentRunner`) `False` — not because of *when* the
+  process died, but because `_is_cacheable` never persists them in the first
+  place. Every such branch re-dispatches live on resume whether it completed
+  cleanly or crashed.
+- **Cacheable, but lost to a crash-window race.** For a call the run *does*
+  treat as cacheable, its underlying effect can still fire without being
+  durably recorded — e.g. the process died before the RPC response reached
+  `_persist_success`, or a `capability()` handler has an `external_write`
+  side-effect class that is not `replayable` (§5.3). Those re-dispatch live on
+  resume like any cache miss and may repeat the external effect.
+
+Closing that gap needs effect-level
 idempotency — already the honored contract for `kanban_agent` (§5.8) and for a
 *replayable* mutating capability handler (§5.3) — extended to *every*
 side-effecting call. That is the same "dedup of durable side effects" item the
