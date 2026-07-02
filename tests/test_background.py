@@ -64,7 +64,7 @@ def test_background_launch_returns_before_slow_agent_completes_and_persists_resu
         background_store = BackgroundRunStore(Path(tmp) / "background-runs")
         script_store = ScriptRunStore(Path(tmp) / "script-runs")
         manager = BackgroundWorkflowRunManager(background_store, script_store)
-        runner = _SlowRunner(delay=0.25)
+        runner = _SlowRunner(delay=1.0)
 
         started = time.monotonic()
         record = manager.launch_script(
@@ -76,7 +76,11 @@ def test_background_launch_returns_before_slow_agent_completes_and_persists_resu
         )
         elapsed = time.monotonic() - started
 
-        assert elapsed < 0.15
+        # The launch must return well before the 1.0s agent completes (2x margin
+        # on both sides — the previous absolute 0.15s bound proved flaky against
+        # fsync latency spikes, issue #119) and must not run the agent inline.
+        assert elapsed < 0.5
+        assert runner.calls == 0
         assert record.run_id == "wfs_background_slow"
         assert record.status in {"queued", "running"}
         assert background_store.get(record.run_id).status in {"queued", "running"}
