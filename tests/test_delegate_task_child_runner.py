@@ -1,0 +1,195 @@
+"""Tests for Hermes delegate_task-backed workflow child agents."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from hermes_workflows import ChildAgentRequest, DelegateTaskChildAgentRunner, run_workflow_script
+from hermes_workflows.delegation import build_delegate_task_context, parse_delegate_task_json_summary
+
+META = 'meta = {"name": "delegate-child", "description": "d"}\n'
+
+
+class FakeDispatcher:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, args: dict[str, Any]) -> str:
+        self.calls.append(args)
+        return json.dumps(self.payload)
+
+
+def test_build_delegate_task_context_includes_schema_and_workflow_metadata():
+    request = ChildAgentRequest(
+        prompt="summarize",
+        label="summary",
+        phase="analysis",
+        schema={"answer": "string"},
+        context={"issue": 97},
+        effort="medium",
+    )
+
+    context = build_delegate_task_context(request)
+
+    assert "label: summary" in context
+    assert "phase: analysis" in context
+    assert '"issue": 97' in context
+    assert '"answer": "string"' in context
+    assert "Return ONLY a JSON object" in context
+
+
+def test_build_delegate_task_context_carries_wave_head_request_fields():
+    # Fields added after this adapter was first written (issues #101/#104):
+    # the resolved agent-type system prompt must lead the block as the child's
+    # role, and agent_type / tools must be stated so the delegated child's
+    # instructions match what the broker resolved and scoped.
+    request = ChildAgentRequest(
+        prompt="review this diff",
+        agent_type="reviewer",
+        system_prompt="You are a meticulous code reviewer.",
+        tools=("read_file",),
+    )
+
+    context = build_delegate_task_context(request)
+
+    assert context.startswith("You are a meticulous code reviewer.")
+    assert "agent_type: reviewer" in context
+    assert "allowed_tools: read_file" in context
+
+    bare = build_delegate_task_context(ChildAgentRequest(prompt="p", tools=()))
+    assert "allowed_tools: (none)" in bare
+    no_tools = build_delegate_task_context(ChildAgentRequest(prompt="p"))
+    assert "allowed_tools" not in no_tools
+
+
+def test_parse_delegate_task_json_summary_accepts_bare_and_fenced_objects():
+    assert parse_delegate_task_json_summary('{"answer":"ok"}') == {"answer": "ok"}
+    assert parse_delegate_task_json_summary('```json\n{"answer":"ok"}\n```') == {"answer": "ok"}
+
+
+def test_delegate_task_runner_sync_parses_structured_summary():
+    dispatcher = FakeDispatcher(
+        {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": '{"answer": "ok", "_tokens": 5}',
+                    "api_calls": 3,
+                    "duration_seconds": 1.2,
+                }
+            ],
+            "total_duration_seconds": 1.2,
+        }
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher)
+
+    result = runner(ChildAgentRequest("answer as JSON", schema={"answer": "string"}))
+
+    assert result == {"answer": "ok", "_tokens": 5}
+    args = dispatcher.calls[0]
+    assert args["goal"] == "answer as JSON"
+    assert args["background"] is False
+    assert args["role"] == "leaf"
+    assert "structured_output_schema_json" in args["context"]
+
+
+def test_delegate_task_runner_without_schema_returns_summary_envelope():
+    dispatcher = FakeDispatcher(
+        {"results": [{"task_index": 0, "status": "completed", "summary": "done", "api_calls": 2}]}
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher)
+
+    result = runner(ChildAgentRequest("summarize"))
+
+    assert result["summary"] == "done"
+    assert result["status"] == "completed"
+    assert result["api_calls"] == 2
+
+
+def test_delegate_task_runner_background_returns_dispatch_handle_envelope():
+    dispatcher = FakeDispatcher(
+        {
+            "status": "dispatched",
+            "mode": "background",
+            "count": 1,
+            "delegation_id": "deleg_123",
+            "goals": ["do work"],
+            "note": "keep working",
+        }
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher, background=True)
+
+    result = runner(ChildAgentRequest("do work"))
+
+    assert result == {
+        "delegation_status": "dispatched",
+        "delegation_id": "deleg_123",
+        "mode": "background",
+        "count": 1,
+        "note": "keep working",
+    }
+    assert dispatcher.calls[0]["background"] is True
+
+
+def test_delegate_task_runner_background_inline_fallback_redacts_prompt_payload():
+    dispatcher = FakeDispatcher(
+        {
+            "results": [{"task_index": 0, "status": "completed", "summary": "done"}],
+            "goal": "secret prompt",
+            "context": "secret context",
+            "nested": {"tasks": [{"goal": "nested secret"}], "safe": "kept"},
+        }
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher, background=True)
+
+    result = runner(ChildAgentRequest("launch"))
+
+    assert result["delegation_status"] == "completed_inline"
+    payload = result["delegate_task"]
+    assert payload["goal"] == "[redacted]"
+    assert payload["context"] == "[redacted]"
+    assert payload["nested"] == {"tasks": "[redacted]", "safe": "kept"}
+    assert payload["results"][0]["summary"] == "done"
+
+
+def test_delegate_task_runner_rejects_extra_args_reserved_field_collision():
+    dispatcher = FakeDispatcher({"results": []})
+    runner = DelegateTaskChildAgentRunner(dispatcher, extra_args={"background": True})
+
+    try:
+        runner(ChildAgentRequest("do work"))
+    except ValueError as exc:
+        assert "reserved fields" in str(exc)
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("expected reserved field collision to fail")
+
+
+def test_delegate_task_runner_can_power_workflow_prompt_agent_sync():
+    dispatcher = FakeDispatcher(
+        {"results": [{"task_index": 0, "status": "completed", "summary": '{"answer": "ok"}'}]}
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher)
+    script = META + 'return await agent("return json", {"schema": {"answer": "string"}})\n'
+
+    result = run_workflow_script(script, child_agent_runner=runner)
+
+    assert result.ok, result.error
+    assert result.value == {"answer": "ok"}
+    assert dispatcher.calls
+
+
+def test_delegate_task_runner_background_can_power_prompt_agent_handle_result():
+    dispatcher = FakeDispatcher(
+        {"status": "dispatched", "mode": "background", "count": 1, "delegation_id": "deleg_bg"}
+    )
+    runner = DelegateTaskChildAgentRunner(dispatcher, background=True)
+    script = META + 'return await agent("launch", {"schema": {"delegation_status": "string", "delegation_id": "string"}})\n'
+
+    result = run_workflow_script(script, child_agent_runner=runner)
+
+    assert result.ok, result.error
+    assert result.value["delegation_status"] == "dispatched"
+    assert result.value["delegation_id"] == "deleg_bg"

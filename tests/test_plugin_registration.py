@@ -14,9 +14,19 @@ from typing import Any
 class FakeContext:
     def __init__(self) -> None:
         self.tools: dict[str, dict[str, Any]] = {}
+        self.dispatches: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        self.dispatch_payload: dict[str, Any] = {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": '{"answer": "ok"}'}
+            ]
+        }
 
     def register_tool(self, **kwargs: Any) -> None:
         self.tools[kwargs["name"]] = kwargs
+
+    def dispatch_tool(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        self.dispatches.append((tool_name, args, kwargs))
+        return json.dumps(self.dispatch_payload)
 
 
 def _load_plugin_root() -> ModuleType:
@@ -247,3 +257,134 @@ def test_workflow_control_status_surfaces_legacy_script_phase_strings():
         {"id": "phase_1", "title": "Plan", "detail": "", "status": "queued"},
         {"id": "phase_2", "title": "Build", "detail": "", "status": "queued"},
     ]
+
+
+def test_registered_workflow_handler_can_use_delegate_child_agent_backend():
+    old_state_dir = os.environ.get("HERMES_WORKFLOWS_STATE_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HERMES_WORKFLOWS_STATE_DIR"] = str(Path(tmp) / "runs")
+        try:
+            plugin = _load_plugin_root()
+            ctx = FakeContext()
+            plugin.register(ctx)
+            source = (
+                'meta = {"name": "delegate", "description": "plugin delegate"}\n'
+                'return await agent("return JSON", {"schema": {"answer": "string"}})\n'
+            )
+            payload = json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"script": source, "child_agent_backend": "delegate_task"},
+                    parent_agent=object(),
+                    plugin_context=object(),  # host may pass this too; registered ctx still wins
+                )
+            )
+        finally:
+            if old_state_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_STATE_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_STATE_DIR"] = old_state_dir
+
+    assert payload["success"] is True
+    assert payload["data"]["result"]["value"] == {"answer": "ok"}
+    assert ctx.dispatches
+    tool_name, args, kwargs = ctx.dispatches[0]
+    assert tool_name == "delegate_task"
+    assert args["background"] is False
+    assert "return JSON" == args["goal"]
+    assert set(kwargs) == {"parent_agent"}
+    assert kwargs["parent_agent"] is not None
+
+
+def test_registered_workflow_handler_delegate_background_returns_handle():
+    old_state_dir = os.environ.get("HERMES_WORKFLOWS_STATE_DIR")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["HERMES_WORKFLOWS_STATE_DIR"] = str(Path(tmp) / "runs")
+        try:
+            plugin = _load_plugin_root()
+            ctx = FakeContext()
+            ctx.dispatch_payload = {
+                "status": "dispatched",
+                "mode": "background",
+                "count": 1,
+                "delegation_id": "deleg_plugin",
+                "goals": ["launch"],
+            }
+            plugin.register(ctx)
+            source = (
+                'meta = {"name": "delegate-bg", "description": "plugin delegate"}\n'
+                'return await agent("launch", {"schema": {"delegation_status": "string", "delegation_id": "string"}})\n'
+            )
+            payload = json.loads(
+                ctx.tools["workflow"]["handler"](
+                    {"script": source, "child_agent_backend": "delegate_task_background"},
+                    parent_agent=object(),
+                )
+            )
+        finally:
+            if old_state_dir is None:
+                os.environ.pop("HERMES_WORKFLOWS_STATE_DIR", None)
+            else:
+                os.environ["HERMES_WORKFLOWS_STATE_DIR"] = old_state_dir
+
+    assert payload["success"] is True
+    value = payload["data"]["result"]["value"]
+    assert value["delegation_status"] == "dispatched"
+    assert value["delegation_id"] == "deleg_plugin"
+    assert "goals" not in value
+    assert ctx.dispatches[0][1]["background"] is True
+
+
+def test_delegate_child_agent_backend_rejects_local_background_runs():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {
+                "action": "run_script",
+                "name": "saved",
+                "child_agent_backend": "delegate_task_background",
+                "background": True,
+            },
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "not supported for local background" in payload["error"]["message"]
+    assert ctx.dispatches == []
+
+
+def test_delegate_child_agent_backend_is_script_run_only():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {"action": "catalog", "child_agent_backend": "delegate_task"},
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "only supported for script runs" in payload["error"]["message"]
+    assert ctx.dispatches == []
+
+
+def test_delegate_child_agent_backend_does_not_treat_script_name_as_facade_signal():
+    plugin = _load_plugin_root()
+    ctx = FakeContext()
+    plugin.register(ctx)
+
+    payload = json.loads(
+        ctx.tools["workflow"]["handler"](
+            {"script_name": "saved", "child_agent_backend": "delegate_task"},
+            parent_agent=object(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert "only supported for script runs" in payload["error"]["message"]
+    assert ctx.dispatches == []

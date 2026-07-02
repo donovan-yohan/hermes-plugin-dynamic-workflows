@@ -143,6 +143,7 @@ from .agents import (
     kanban_runner_id,
     is_kanban_runner_id,
 )
+from .delegation import DelegateTaskChildAgentRunner
 from .agent_type_registry import (
     AgentTypeDefinition,
     AgentTypeRegistry,
@@ -395,6 +396,7 @@ __all__ = [
     "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
+    "DelegateTaskChildAgentRunner",
     # file-based agent-type registry (issue #104)
     "AgentTypeDefinition",
     "AgentTypeRegistry",

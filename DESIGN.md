@@ -152,6 +152,7 @@ def workflow_status(
 | `runtime.py` | Deterministic interpreter over the validated AST (`agent`/`kanban_agent`/`if`/`parallel`/`pipeline`/`phase`). Never `eval()`s; never imports user-named modules. |
 | `registry.py` | `RunStore` Protocol + thread-safe `InMemoryRunStore`; file-backed run state for embedders; board-backed stores remain adapter work. |
 | `agents.py` | `AgentRunner` Protocol (`(agent_id, input_dict) -> output_dict`) + deterministic `StubAgentRunner`, including reserved `kanban.<profile>` outputs. |
+| `delegation.py` | Optional Hermes `delegate_task` child-agent adapter: converts script `agent(prompt, opts)` requests into host-dispatched delegate calls, parses foreground JSON summaries, and returns explicit background dispatch envelopes without pretending the child result is available. |
 | `loops.py` | Feedback-controller loop spec validation and synchronous loop runner over injected sensor/actuator adapters, with step/time/budget/stall brakes. |
 | `grants.py` | Backend-neutral scoped actuator grants: `GrantRequest` / `SessionGrant` / `GrantHandle` models, in-memory/file `GrantStore`, `StaticPolicyGrantBroker`, `request_grant` / `resolve_grant` / `validate_grant`, and a credential-leak guard. Wired into `loop_run` for fail-closed session-launch authorization. |
 | `resources.py` | Backend-neutral workflow resource/finalizer models: credential-free resource declarations, cleanup trigger/policy vocabulary, finalizer runner Protocol, action-string adapter registry, idempotent closeout result helpers, and credential-leak rejection. Wired into `loop_run` for terminal resource cleanup. |
@@ -1003,11 +1004,18 @@ redirects `sys.stdout` to stderr, so a stray `print`/traceback can never corrupt
 the stream the parent reads.
 
 The only capabilities that cross to the parent are `agent`, `kanban_agent`,
-`log`, `phase`, and `workflow`; `parallel`/`pipeline` are deterministic
-guest-side combinators (sequential in this slice). All `agent`/`kanban_agent`
-effects funnel through the same injected `AgentRunner` boundary as the JSON
-runtime (default `StubAgentRunner`), so script runs are reproducible and
-testable without a live Hermes.
+`capability`, `log`, `phase`, and `workflow`; `parallel`/`pipeline` are
+bounded deterministic guest-side combinators. Legacy `agent(agent_id, input)`
+effects funnel through the injected `AgentRunner` boundary as the JSON runtime
+(default `StubAgentRunner`), so script runs are reproducible and testable without
+a live Hermes. Prompt-shaped `agent(prompt, opts)` effects cross the separate
+`ChildAgentRunner` seam: by default they fail closed unless a host supplies a
+runner; the Hermes plugin can now explicitly supply a `delegate_task`-backed
+runner with `child_agent_backend="delegate_task"` (foreground structured summary
+parse) or `"delegate_task_background"` (redacted dispatch-handle envelope only).
+The adapter is intentionally foreground-script-only for now: local background
+script runs reject `child_agent_backend` until delegate handles, completions, and
+stop/retry visibility are persisted into workflow status/control.
 
 ### 5.3 Generic capability registry and policy (#29)
 
