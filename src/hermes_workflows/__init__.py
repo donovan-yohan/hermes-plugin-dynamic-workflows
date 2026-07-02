@@ -185,6 +185,10 @@ from .script_catalog import (
 )
 from .script_store import (
     ScriptRunStore,
+    FileScriptRunStore,
+    ScriptRunStoreProtocol,
+    CallRecorderProtocol,
+    TranscriptRecorderProtocol,
     ScriptRunMeta,
     ReplayCache,
     ReplayEntry,
@@ -194,6 +198,11 @@ from .script_store import (
     script_run_id,
     canonical_hash,
     is_replayable,
+)
+from .script_store_sqlite import (
+    SqliteScriptRunStore,
+    SqliteCallRecorder,
+    SQLITE_STORE_SCHEMA_VERSION,
 )
 from .kanban import (
     KanbanBackend,
@@ -406,12 +415,20 @@ __all__ = [
     "default_script_catalog_roots",
     # durable script run store + replay cache (issue #3)
     "ScriptRunStore",
+    "FileScriptRunStore",
+    "ScriptRunStoreProtocol",
+    "CallRecorderProtocol",
+    "TranscriptRecorderProtocol",
     "ScriptRunMeta",
     "ReplayCache",
     "ReplayEntry",
     "PromptReplayEntry",
     "CallRecorder",
     "SCRIPT_SCHEMA_VERSION",
+    # SQLite store backend (issue #110)
+    "SqliteScriptRunStore",
+    "SqliteCallRecorder",
+    "SQLITE_STORE_SCHEMA_VERSION",
     "script_run_id",
     "canonical_hash",
     "is_replayable",

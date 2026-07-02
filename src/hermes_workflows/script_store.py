@@ -51,7 +51,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from .errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
 from .registry import utc_now_iso
@@ -65,9 +65,13 @@ __all__ = [
     "ReplayEntry",
     "PromptReplayEntry",
     "ReplayCache",
+    "CallRecorderProtocol",
+    "TranscriptRecorderProtocol",
+    "ScriptRunStoreProtocol",
     "CallRecorder",
     "TranscriptRecorder",
     "ScriptRunStore",
+    "FileScriptRunStore",
     "canonical_hash",
     "script_sha256",
     "script_run_id",
@@ -626,6 +630,175 @@ class TranscriptRecorder:
 
     def _meta_path(self, agent_ref: str) -> Path:
         return self._dir / f"{agent_ref}.meta.json"
+
+
+@runtime_checkable
+class CallRecorderProtocol(Protocol):
+    """Contract for a run's append-only deterministic replay-cache writer.
+
+    :class:`CallRecorder` (file backend) and the SQLite adapter's recorder both
+    satisfy this structurally. Every method is durable the instant it returns
+    (cache writes are always immediately committed, independent of a store's
+    journal ``durability`` mode — see :class:`ScriptRunStoreProtocol`).
+    """
+
+    def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
+        """Persist one successful, replayable call outcome."""
+        ...
+
+    def record_failure(self, call_id: Any, method: str, args_hash: str, code: str, retryable: bool) -> None:
+        """Persist one cached *retryable* dispatch-failure outcome (issue #103)."""
+        ...
+
+    def record_prompt(self, fingerprint: str, method: str, args_hash: str, value: Any) -> None:
+        """Persist one completed prompt-agent result keyed by fingerprint."""
+        ...
+
+
+@runtime_checkable
+class TranscriptRecorderProtocol(Protocol):
+    """Contract for a run's per-subagent transcript artifact writer (issue #76)."""
+
+    def refs(self) -> dict[str, Any]:
+        """Return artifact refs/paths for every recorded subagent, without content."""
+        ...
+
+    def started(self, call_id: Any, method: str, params: dict[str, Any], *, started_at: str) -> str:
+        ...
+
+    def result(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        value: Any,
+        state: str = "succeeded",
+        event_name: str = "result",
+    ) -> str:
+        ...
+
+    def error(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        error_code: Optional[str],
+    ) -> str:
+        ...
+
+    def cache_hit(self, call_id: Any, method: str, params: dict[str, Any], *, at: str, value: Any) -> str:
+        ...
+
+
+@runtime_checkable
+class ScriptRunStoreProtocol(Protocol):
+    """The durable persistence contract every ``ScriptRunStore`` backend implements.
+
+    Extracted (issue #110) from the file-backed implementation that used to be
+    the *only* backend, so a pluggable backend (e.g. the SQLite adapter in
+    :mod:`hermes_workflows.script_store_sqlite`) can be verified structurally
+    against the same surface the rest of the package (``vm.py``, ``kanban.py``,
+    ``background.py``, the resume/replay path) actually calls. Grouped by the
+    concern each method covers:
+
+    * **Run lifecycle** — ``next_run_id`` / ``begin`` / ``finish`` / ``load_run``.
+    * **Metadata-only journal** — ``note_call`` (append) / ``journal`` (iterate,
+      most-recent-``limit``) / ``journal_path`` (operator-facing pointer).
+    * **Deterministic replay cache** — ``recorder`` (returns a
+      :class:`CallRecorderProtocol`) / ``load_cache``.
+    * **Transcript artifacts** (issue #76) — ``transcript_recorder`` (returns a
+      :class:`TranscriptRecorderProtocol`) / ``transcript_refs``.
+    * **Suspended-run index** (issue #5) — ``suspended_runs``.
+    * **Durable Kanban card state + event log** (issue #5) —
+      ``record_kanban_card_state`` / ``load_kanban_card_state`` / ``kanban_waits``
+      / ``append_kanban_event`` / ``read_kanban_events`` / ``latest_kanban_resolution``.
+
+    A backend also exposes a ``root: Path`` attribute (the store's directory;
+    some backends, like SQLite, keep all relational state in one file under it)
+    and a constructor accepting ``root`` plus the issue #108 ``durability`` /
+    ``async_flush_every`` knobs. The constructor is not part of the structural
+    Protocol (``__init__`` isn't checked by ``isinstance``), but every backend
+    must accept the same keyword arguments so callers can swap backends by
+    changing only which class they construct.
+
+    Every load failure across every backend is a typed
+    :class:`~hermes_workflows.errors.ScriptRunStoreError` subclass
+    (:class:`~hermes_workflows.errors.ScriptRunNotFound` /
+    :class:`~hermes_workflows.errors.CorruptScriptRunError`) — never a bare
+    backend-specific exception (``OSError``, ``sqlite3.Error``, ...).
+    """
+
+    root: Path
+
+    def next_run_id(self, script: str, args: Any = None) -> str: ...
+
+    def begin(
+        self,
+        run_id: str,
+        *,
+        script: str,
+        args: Any,
+        limits: Optional[dict[str, Any]],
+        deterministic_runner: bool,
+        meta: Optional[dict[str, Any]] = None,
+        replay_of: Optional[str] = None,
+    ) -> "ScriptRunMeta": ...
+
+    def note_call(self, run_id: str, event: dict[str, Any]) -> None: ...
+
+    def recorder(self, run_id: str) -> CallRecorderProtocol: ...
+
+    def transcript_recorder(self, run_id: str) -> TranscriptRecorderProtocol: ...
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        meta: Optional[dict[str, Any]],
+        value: Any,
+        error: Optional[dict[str, Any]],
+    ) -> None: ...
+
+    def load_run(self, run_id: str) -> "ScriptRunMeta": ...
+
+    def load_cache(self, run_id: str) -> "ReplayCache": ...
+
+    def journal(self, run_id: str, *, limit: int = 200) -> list[dict[str, Any]]: ...
+
+    def journal_path(self, run_id: str) -> Path: ...
+
+    def transcript_refs(self, run_id: str) -> dict[str, Any]: ...
+
+    def suspended_runs(self) -> list["ScriptRunMeta"]: ...
+
+    def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None: ...
+
+    def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]: ...
+
+    def kanban_waits(self) -> list[dict[str, Any]]: ...
+
+    def append_kanban_event(
+        self,
+        card_id: str,
+        *,
+        status: str,
+        result: Optional[dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        profile: str = "",
+    ) -> dict[str, Any]: ...
+
+    def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]: ...
+
+    def latest_kanban_resolution(self, card_id: str) -> Optional[dict[str, Any]]: ...
 
 
 class ScriptRunStore:
@@ -1336,3 +1509,11 @@ class ScriptRunStore:
 # A journal sink the VM accepts is just ``Callable[[dict], None]``; the store's
 # ``note_call`` is adapted into one by :mod:`hermes_workflows.vm`.
 JournalSink = Callable[[dict[str, Any]], None]
+
+# ``ScriptRunStore`` is the file backend and remains the default/public name for
+# backward compatibility (every existing embedder constructs it directly). This
+# alias names it explicitly now that :mod:`hermes_workflows.script_store_sqlite`
+# adds a second backend satisfying the same :class:`ScriptRunStoreProtocol`
+# (issue #110) — pick the constructor for the backend you want; nothing selects
+# a backend implicitly, and the file backend's behavior is unchanged.
+FileScriptRunStore = ScriptRunStore

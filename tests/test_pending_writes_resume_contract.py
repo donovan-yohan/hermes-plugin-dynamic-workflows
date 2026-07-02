@@ -29,9 +29,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import pytest
+
 from hermes_workflows import ChildAgentRequest, ScriptRunStore, VMLimits, run_workflow_script
+from hermes_workflows.script_store_sqlite import SqliteScriptRunStore
 
 META = 'meta = {"name": "pending-writes", "description": "d"}\n'
+
+# Backend registry (issue #110): the crash/resume half of this contract only
+# touches the store through its public API, so it is parametrized over both
+# backends. The drift-abort half (below) tampers ``cache.jsonl`` bytes
+# directly and stays file-backend-only — see
+# ``tests/test_script_store_sqlite.py`` for its SQLite-native counterpart.
+STORE_BACKENDS = {"file": ScriptRunStore, "sqlite": SqliteScriptRunStore}
+
+
+@pytest.fixture(params=sorted(STORE_BACKENDS))
+def backend(request):
+    return STORE_BACKENDS[request.param]
 
 # Four-branch fan-out: index 0 (deterministic) and index 1 (prompt-agent)
 # complete; index 2 (deterministic) and index 3 (prompt-agent) are the ones
@@ -97,9 +112,9 @@ class _ResumeChildRunner:
         return {"answer": f"resumed-{request.label}", "_tokens": 2}
 
 
-def test_completed_parallel_siblings_are_cache_served_after_a_mid_run_crash():
+def test_completed_parallel_siblings_are_cache_served_after_a_mid_run_crash(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
 
         # -- Run A: dies mid-parallel. Branches 0 and 1 complete (and are
         #    durably persisted the instant they succeed); branches 2 and 3
