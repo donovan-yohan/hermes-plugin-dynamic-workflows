@@ -111,11 +111,32 @@ def test_resolve_path_traversal_and_unsafe_names_rejected(bad_name):
 
 def test_safe_agent_type_name_reuses_script_catalog_hygiene():
     assert safe_agent_type_name("reviewer") == "reviewer"
-    assert safe_agent_type_name("reviewer.md") == "reviewer"
     with pytest.raises(ValueError):
         safe_agent_type_name("../evil")
     with pytest.raises(ValueError):
         safe_agent_type_name("")
+
+
+def test_safe_agent_type_name_rejects_suffixed_spellings():
+    # agentType is a name, not a filename -- "reviewer", "reviewer.md", and
+    # "reviewer.workflow.py" must not silently alias the same definition (that
+    # aliasing would still mint distinct ChildAgentRequest fingerprints, since
+    # the request stores the raw spelling).
+    with pytest.raises(ValueError):
+        safe_agent_type_name("reviewer.md")
+    with pytest.raises(ValueError):
+        safe_agent_type_name("reviewer.workflow.py")
+
+
+def test_resolve_rejects_suffixed_agent_type_spelling():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "agents"
+        _write(root, "reviewer", REVIEWER_DEFINITION)
+        registry = AgentTypeRegistry(roots=[root])
+        assert registry.resolve("reviewer").system_prompt.startswith("You are a meticulous")
+        with pytest.raises(AgentTypeRegistryError) as exc_info:
+            registry.resolve("reviewer.md")
+        assert exc_info.value.code == "agent_type_invalid"
 
 
 def test_resolve_malformed_frontmatter_missing_delimiters_rejected():
@@ -152,6 +173,34 @@ def test_resolve_malformed_frontmatter_unclosed_block_rejected():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "agents"
         _write(root, "broken", "---\nname: reviewer\nSome prompt with no closing delimiter.\n")
+        registry = AgentTypeRegistry(roots=[root])
+        with pytest.raises(AgentTypeRegistryError) as exc_info:
+            registry.resolve("broken")
+        assert exc_info.value.code == "agent_type_invalid"
+
+
+def test_resolve_malformed_frontmatter_error_never_leaks_line_content():
+    # A malformed line may contain arbitrary file content (secrets, tokens);
+    # the script-visible diagnostic must carry only the line number and a
+    # structural reason, never the offending text itself.
+    secret = "SECRET_TOKEN=abc123-do-not-leak"
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "agents"
+        _write(root, "broken", f"---\nname: reviewer\n{secret}\n---\nSome prompt.\n")
+        registry = AgentTypeRegistry(roots=[root])
+        with pytest.raises(AgentTypeRegistryError) as exc_info:
+            registry.resolve("broken")
+        message = str(exc_info.value)
+        assert exc_info.value.code == "agent_type_invalid"
+        assert secret not in message
+        assert "abc123" not in message
+        assert "line 3" in message
+
+
+def test_resolve_empty_system_prompt_body_rejected():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "agents"
+        _write(root, "broken", "---\nname: x\n---\n")
         registry = AgentTypeRegistry(roots=[root])
         with pytest.raises(AgentTypeRegistryError) as exc_info:
             registry.resolve("broken")

@@ -78,14 +78,24 @@ def safe_agent_type_name(name: str) -> str:
     An agent-type id is, like a saved script name, one safe path segment --
     reuses :func:`hermes_workflows.script_catalog.safe_script_name` for that
     vetted hygiene (no ``/``/``\\``/``..``, restricted charset, no leading
-    dot) rather than re-implementing it, per issue #104. Strips a trailing
-    ``.md`` (the on-disk definition suffix) instead of ``.workflow(.py)``.
+    dot) rather than re-implementing it, per issue #104.
+
+    A trailing ``.md`` or ``.workflow.py`` suffix is rejected outright rather
+    than stripped: ``agentType`` is a name, not a filename, and silently
+    normalizing a suffixed spelling would let ``"reviewer"``,
+    ``"reviewer.md"``, and (via :func:`~hermes_workflows.script_catalog
+    .safe_script_name`'s own script-catalog suffix handling) ``"reviewer
+    .workflow.py"`` all resolve the same on-disk definition while still
+    minting distinct ``ChildAgentRequest`` fingerprints (the request stores
+    the raw spelling) -- fragmenting the prompt-agent cache for what is
+    semantically one call.
     """
     if not isinstance(name, str) or not name:
         raise ValueError("agent_type must be a non-empty string")
-    stripped = name[: -len(".md")] if name.endswith(".md") else name
+    if name.endswith(".md") or name.endswith(".workflow.py"):
+        raise ValueError(f"agent_type must not include a file suffix: {name!r}")
     try:
-        return safe_script_name(stripped)
+        return safe_script_name(name)
     except ValueError as exc:
         raise ValueError(f"unsafe agent_type: {name!r}") from exc
 
@@ -108,7 +118,11 @@ def _split_frontmatter(text: str) -> tuple[Optional[dict[str, str]], str]:
     Returns ``(None, text)`` when ``text`` has no opening/closing ``---``
     delimiter pair (no frontmatter present at all). Raises ``ValueError`` for
     a frontmatter block that is present but structurally broken (a line with
-    no ``:`` separator).
+    no ``:`` separator). The ``ValueError`` message carries only the 1-based
+    line number, never the offending line's text -- this diagnostic is
+    forwarded verbatim into a script-visible ``CapabilityDenied`` (see
+    :meth:`AgentTypeRegistry.resolve` / :class:`AgentTypeRegistryError`), so
+    it must stay metadata-only even when the file contains secrets.
     """
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -121,18 +135,18 @@ def _split_frontmatter(text: str) -> tuple[Optional[dict[str, str]], str]:
     if end is None:
         return None, text
     frontmatter: dict[str, str] = {}
-    for line in lines[1:end]:
+    for line_no, line in enumerate(lines[1:end], start=2):
         if not line.strip():
             continue
         if ":" not in line:
-            raise ValueError(f"malformed frontmatter line (missing ':'): {line!r}")
+            raise ValueError(f"malformed frontmatter line {line_no} (missing ':')")
         key, _, value = line.partition(":")
         key = key.strip()
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
         if not key:
-            raise ValueError(f"malformed frontmatter line (empty key): {line!r}")
+            raise ValueError(f"malformed frontmatter line {line_no} (empty key)")
         frontmatter[key] = value
     body = "\n".join(lines[end + 1 :]).strip("\n")
     return frontmatter, body
@@ -210,6 +224,10 @@ class AgentTypeRegistry:
         if not isinstance(fm_name, str) or not fm_name:
             raise AgentTypeRegistryError(
                 f"agent type definition {name!r} frontmatter is missing a non-empty 'name'", code="agent_type_invalid"
+            )
+        if not body.strip():
+            raise AgentTypeRegistryError(
+                f"agent type definition {name!r} has an empty system prompt body", code="agent_type_invalid"
             )
         return AgentTypeDefinition(
             name=name,

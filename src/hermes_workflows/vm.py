@@ -112,6 +112,19 @@ _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "capability", "log", "pha
 # so the broker must fall through to a live dispatch.
 _MISS = object()
 
+# CapabilityDenied codes that, despite not touching an AgentRunner, are NOT
+# purely a function of the call's own arguments and the run's own in-memory
+# state -- they also read the on-disk AgentTypeRegistry (issue #104), which is
+# mutable host configuration that can change between a source run and a later
+# replay. Unlike every other CapabilityDenied code (an argument/limit/schema
+# contract violation that re-evaluates identically live), re-dispatching one
+# of these live on replay can silently diverge if the registry root has
+# gained/lost/changed a definition file since the source run -- so they are
+# buffered via _persist_failure exactly like a runner_error, ensuring replay
+# reproduces the denial the source run actually observed regardless of
+# registry drift.
+_REGISTRY_DEPENDENT_DENIAL_CODES = frozenset({"unknown_agent_type", "agent_type_invalid"})
+
 # Cap on how many distinct result-contract violations one kanban_agent call records
 # (journal marker + card comment). Under on_block="pause" a misbehaving worker can
 # re-complete with bad output rapidly; the await is deadline-bounded, but this keeps
@@ -541,6 +554,13 @@ class CapabilityBroker:
             self._emit(
                 self._call_event(call_id, method, params, ok=False, error=denied.code, retryable=denied.retryable)
             )
+            if denied.code in _REGISTRY_DEPENDENT_DENIAL_CODES:
+                # Buffer into the replay cache too, exactly like runner_error --
+                # see _REGISTRY_DEPENDENT_DENIAL_CODES / _persist_failure. Without
+                # this, a replay whose registry root has since gained (or lost) a
+                # definition file would re-resolve live and diverge from the
+                # denial the source run actually observed and handled.
+                self._persist_failure(call_id, method, params, code=denied.code, retryable=denied.retryable)
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
                 "error": {"code": denied.code, "message": str(denied), "retryable": denied.retryable},
@@ -665,18 +685,29 @@ class CapabilityBroker:
     def _persist_failure(
         self, call_id: Any, method: str, params: dict[str, Any], *, code: str, retryable: bool
     ) -> None:
-        """Buffer a *caught* retryable dispatch failure for the replay cache (issue #103).
+        """Buffer a *caught* dispatch failure for the replay cache (issue #103).
 
-        Only ``runner_error`` (``retryable=True``) failures are recorded: every
-        other :class:`CapabilityDenied` code is a contract violation over the
-        call's own arguments and the run's own state (unknown agent id, schema/
-        budget/limit exhaustion, replay drift) — re-evaluating it live on replay
-        reproduces the identical denial without help, since it never touches an
-        ``AgentRunner``. A ``runner_error`` is different: it is a property of one
-        live dispatch attempt, so without this the replayed attempt could
-        silently *succeed* (or fail differently) against a runner whose behavior
-        has since changed, diverging from the source run's outcome for a failure
-        the script already observed and handled.
+        Two shapes of failure are recorded here, both because live
+        re-evaluation on replay is not guaranteed to reproduce the source
+        run's outcome:
+
+        * ``runner_error`` (``retryable=True``): a property of one live
+          dispatch attempt against an ``AgentRunner``, so without this the
+          replayed attempt could silently *succeed* (or fail differently)
+          against a runner whose behavior has since changed.
+        * ``unknown_agent_type`` / ``agent_type_invalid`` (issue #104): a
+          property of the on-disk :class:`~hermes_workflows.agent_type_registry
+          .AgentTypeRegistry` state at resolve time, which is mutable host
+          configuration -- see :data:`_REGISTRY_DEPENDENT_DENIAL_CODES` --
+          so without this a replay whose registry root has since gained or
+          lost a definition file would re-resolve live and diverge.
+
+        Every *other* :class:`CapabilityDenied` code is a contract violation
+        purely over the call's own arguments and the run's own in-memory
+        state (unknown legacy agent id, schema/budget/limit exhaustion,
+        replay drift) — re-evaluating it live on replay reproduces the
+        identical denial without help, so those are intentionally not
+        buffered.
 
         Unlike a success, this does **not** write to the recorder immediately:
         the broker cannot tell, at the moment it catches the runner exception,
@@ -690,12 +721,25 @@ class CapabilityBroker:
         outcome proves the failure was truly handled, not fatal.
 
         Buffered metadata-only — call id, method, canonical args hash, code,
-        retryable — never a payload. Gated by the same :meth:`_is_cacheable`
-        predicate as a success: a live ``kanban_agent`` call is a durable
-        external effect, not a pure function, so it always re-dispatches on
-        replay regardless (cached failure or not).
+        retryable — never a payload. A ``runner_error`` is gated by
+        :meth:`_is_cacheable`, the same predicate a success uses: a live
+        ``kanban_agent`` call is a durable external effect, not a pure
+        function, so it always re-dispatches on replay regardless (cached
+        failure or not), and ``agent``/``kanban_agent`` results are only
+        replay-safe when the injected runner is a deterministic pure
+        function (``deterministic_runner``). A registry-dependent denial
+        (:data:`_REGISTRY_DEPENDENT_DENIAL_CODES`) is exempt from that
+        second, runner-determinism half of the gate: it is recorded
+        whenever a recorder is configured, regardless of
+        ``deterministic_runner``, because the value being frozen is never a
+        function of the (possibly non-deterministic) runner at all -- the
+        call never reached one -- only of the registry's on-disk state at
+        resolve time, which this buffering exists specifically to insulate
+        replay from.
         """
-        if self._recorder is None or not self._is_cacheable(method, params):
+        if self._recorder is None:
+            return
+        if code not in _REGISTRY_DEPENDENT_DENIAL_CODES and not self._is_cacheable(method, params):
             return
         self._pending_failures.append((call_id, method, replay_args_hash(method, params), code, retryable))
 
@@ -821,12 +865,14 @@ class CapabilityBroker:
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
 
-        Returns the ``ret`` frame on a hit — a success frame, or (issue #103) the
-        same error frame for a recorded ``runner_error`` failure the source run
-        caught and handled, so replay never silently re-dispatches a retryable
-        failure live and diverges. Raises :class:`CapabilityDenied`
-        (``replay_mismatch``, abort) on a method/args drift, or returns
-        :data:`_MISS` when there is no cached entry (the caller dispatches live).
+        Returns the ``ret`` frame on a hit — a success frame, or (issue #103,
+        and issue #104 for the registry-dependent denial codes -- see
+        :data:`_REGISTRY_DEPENDENT_DENIAL_CODES`) the same error frame for a
+        recorded failure the source run caught and handled, so replay never
+        silently re-dispatches a buffered failure live and diverges. Raises
+        :class:`CapabilityDenied` (``replay_mismatch``, abort) on a
+        method/args drift, or returns :data:`_MISS` when there is no cached
+        entry (the caller dispatches live).
         """
         entry = self._replay.get(call_id)  # type: ignore[union-attr]
         if entry is None:
@@ -863,8 +909,10 @@ class CapabilityBroker:
             self._replayed_calls += 1
             budget = self._budget_info()
         if not entry.ok:
-            # A recorded caught-and-handled runner_error: serve the identical
-            # denial without touching the runner at all (see _persist_failure).
+            # A recorded caught-and-handled failure (runner_error, or a
+            # registry-dependent denial -- see _REGISTRY_DEPENDENT_DENIAL_CODES):
+            # serve the identical denial without touching the runner or the
+            # agent-type registry at all (see _persist_failure).
             code = entry.code or "runner_error"
             self._emit(
                 self._call_event(call_id, method, params, ok=False, error=code, retryable=entry.retryable, replayed=True)

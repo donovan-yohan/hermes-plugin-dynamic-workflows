@@ -1510,7 +1510,12 @@ like a saved script name, one safe path segment), and root-escape checking
 uses the same `script_catalog.ensure_within_root` guard the script catalog
 itself uses (factored out to a module-level function for this reuse). A
 traversal attempt (`agentType="../../etc/passwd"`) or any other unsafe name
-fails the same way an unsafe script name would.
+fails the same way an unsafe script name would. A trailing `.md` or
+`.workflow.py` suffix is rejected outright rather than stripped — `agentType`
+is a name, not a filename, and stripping it would let `"reviewer"`,
+`"reviewer.md"`, and `"reviewer.workflow.py"` all resolve the same on-disk
+definition while still minting distinct fingerprints/cache entries (the
+`ChildAgentRequest` stores the raw spelling).
 
 **Explicit roots only — no implicit discovery.** Unlike
 `default_script_catalog_roots()` (§5.6, which layers an `HERMES_HOME`/cwd
@@ -1550,13 +1555,27 @@ wins over the registry default** — is what actually crosses the
 **Failure taxonomy (issue #103).** Both failure shapes are plain
 `CapabilityDenied` — `retryable=False` by construction (§5.4's default; only
 `runner_error` sets `True`) — surfaced as metadata-only diagnostics (agent-type
-name and a short reason, never file contents or a raw filesystem path):
+name and, for a malformed on-disk definition, a 1-based line number and
+structural reason — never the line's text, file contents, or a raw filesystem
+path):
 
 | Failure | `code` |
 | --- | --- |
 | Name absent from every configured root and not `general-purpose` | `unknown_agent_type` |
-| Unsafe name (path traversal, disallowed characters) | `agent_type_invalid` |
-| On-disk definition missing `---` frontmatter, an unparsable frontmatter line, or missing the required `name` field | `agent_type_invalid` |
+| Unsafe name (path traversal, disallowed characters, or a suffixed spelling like `"reviewer.md"`) | `agent_type_invalid` |
+| On-disk definition missing `---` frontmatter, an unparsable frontmatter line, missing the required `name` field, or an empty/whitespace-only system-prompt body | `agent_type_invalid` |
+
+**Replay determinism despite mutable registry state.** Unlike every other
+`CapabilityDenied` code the broker raises — a pure function of the call's own
+arguments and the run's own in-memory state, so re-evaluating it live on
+replay reproduces the identical denial — `unknown_agent_type` and
+`agent_type_invalid` also depend on the on-disk `AgentTypeRegistry`, which is
+mutable host configuration that can drift between a source run and a later
+replay (a definition file added, removed, or fixed). So the broker buffers
+these two codes into the replay cache exactly like a caught `runner_error`
+(issue #103's `_persist_failure`/`flush_pending_failures`, `vm.py`): a replay
+serves the recorded denial without re-touching the registry at all,
+regardless of what is on disk at replay time.
 
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 

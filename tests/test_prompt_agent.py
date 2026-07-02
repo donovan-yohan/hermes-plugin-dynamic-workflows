@@ -884,6 +884,59 @@ def test_prompt_agent_unknown_agent_type_rejected_deterministically_not_retryabl
     assert runner.requests == []
 
 
+def test_prompt_agent_registry_denial_replays_deterministically_despite_registry_drift():
+    # Regression for a review finding: unknown_agent_type/agent_type_invalid
+    # depend on mutable on-disk AgentTypeRegistry state at resolve time,
+    # unlike every other CapabilityDenied code (a pure function of the call's
+    # own arguments and the run's own state). So they must be frozen into the
+    # replay cache exactly like a caught runner_error -- otherwise a replay
+    # whose registry root has since gained a definition file re-resolves live
+    # and diverges from what the source run actually observed and handled.
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "agents"
+        root.mkdir()
+        script = META + (
+            'try:\n'
+            '    await agent("write a plan", {"agentType": "reviewer"})\n'
+            '    branch = "resolved"\n'
+            'except CapabilityError as e:\n'
+            '    branch = "denied"\n'
+            'return {"branch": branch}\n'
+        )
+        with TemporaryDirectory() as tmp2:
+            store = ScriptRunStore(Path(tmp2) / "runs")
+            src_runner = FakeChildRunner({"answer": "ok"})
+            rec = run_workflow_script(
+                script,
+                store=store,
+                run_id="src",
+                child_agent_runner=src_runner,
+                agent_type_registry=AgentTypeRegistry(roots=[root]),
+            )
+            assert rec.ok, rec.error
+            assert rec.value == {"branch": "denied"}
+            assert src_runner.requests == []
+
+            # An unrelated later deploy adds a "reviewer" definition to the
+            # same root -- this must not retroactively change a *replay* of
+            # the earlier run.
+            (root / "reviewer.md").write_text(REVIEWER_DEFINITION, encoding="utf-8")
+
+            replay_runner = FakeChildRunner({"answer": "ok"})
+            rep = run_workflow_script(
+                script,
+                store=store,
+                run_id="replay",
+                replay_from="src",
+                child_agent_runner=replay_runner,
+                agent_type_registry=AgentTypeRegistry(roots=[root]),
+            )
+    assert rep.ok, rep.error
+    assert rep.value == {"branch": "denied"}
+    # Serving the recorded denial must never dispatch a live child agent.
+    assert replay_runner.requests == []
+
+
 def test_prompt_agent_agent_type_path_traversal_rejected_deterministically():
     runner = FakeChildRunner()
     script = META + (
