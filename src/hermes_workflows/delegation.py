@@ -71,16 +71,30 @@ def build_delegate_task_context(request: ChildAgentRequest) -> str:
         rows.append(f"requested_isolation: {request.isolation}")
     if request.context:
         rows.append("workflow_context_json:")
-        rows.append(json.dumps(request.context, ensure_ascii=False, sort_keys=True))
+        rows.append(_strict_json(request.context, what="workflow context"))
     if request.schema:
         rows.extend(
             [
                 "structured_output_schema_json:",
-                json.dumps(request.schema, ensure_ascii=False, sort_keys=True),
+                _strict_json(request.schema, what="structured output schema"),
                 "Return ONLY a JSON object matching the schema. Do not wrap it in prose.",
             ]
         )
     return "\n".join(rows)
+
+
+def _strict_json(value: Any, *, what: str) -> str:
+    """Serialize strictly (no ``default=``), failing closed with a clean error.
+
+    Script-supplied values always crossed the JSON RPC wire and cannot be
+    non-serializable; an in-process host constructing ``ChildAgentRequest``
+    directly can pass one, and a ``default=str`` fallback would leak object
+    reprs into the delegated child's instructions instead of failing here.
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"delegate_task {what} is not JSON-serializable") from exc
 
 
 def parse_delegate_task_json_summary(summary: str) -> dict[str, Any]:
