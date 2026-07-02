@@ -43,6 +43,7 @@ from typing import Any, Optional
 
 from . import errors as err
 from .models import Diagnostic
+from . import schema_subset
 
 __all__ = [
     "ENTRY_NAME",
@@ -202,6 +203,7 @@ def validate_script(source: str) -> ScriptValidation:
 
     meta = _validate_meta(body, diags)
     _walk_forbidden(entry, diags)
+    _walk_schema_literals(entry, diags)
 
     errors = [d for d in diags if d.severity == "error"]
     return ScriptValidation(ok=not errors, diagnostics=diags, meta=meta if not errors else meta)
@@ -410,6 +412,44 @@ def _walk_forbidden(entry: ast.AST, diags: list[Diagnostic]) -> None:
         elif isinstance(node, ast.keyword):
             # ``f(**kwargs)`` is fine; nothing to check beyond the value (walked).
             pass
+
+
+# Capability globals whose ``schema=`` keyword argument is worth a static,
+# fail-closed check (issue #107) — every one of them forwards ``schema`` to
+# the parent broker's output validator.
+_SCHEMA_CAPABILITY_CALLS: frozenset[str] = frozenset({"agent", "kanban_agent", "capability"})
+
+
+def _walk_schema_literals(entry: ast.AST, diags: list[Diagnostic]) -> None:
+    """Reject a malformed literal ``schema=`` argument before launch.
+
+    A workflow script is arbitrary Python, so a ``schema`` built from a
+    variable, a function call, or merged from an options dict positional
+    argument is not statically knowable here — those are left to the parent
+    broker's runtime enforcement, which validates every call's schema (however
+    it was constructed) against the same shared subset before ever trusting
+    its output. When the ``schema=`` keyword *is* a pure literal, though,
+    there is no reason to wait for a live run to reject an unsupported
+    keyword or a bad ``type``: catch it here, statically, so a broken schema
+    never reaches launch.
+    """
+    for node in ast.walk(entry):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id not in _SCHEMA_CAPABILITY_CALLS:
+            continue
+        for kw in node.keywords:
+            if kw.arg != "schema" or kw.value is None:
+                continue
+            try:
+                schema_value = ast.literal_eval(kw.value)
+            except (ValueError, SyntaxError, TypeError):
+                continue  # not a pure literal; the runtime enforces this call.
+            error = schema_subset.check_schema(schema_value)
+            if error is not None:
+                diags.append(
+                    _e(err.E_SCRIPT_BAD_SCHEMA, f"invalid 'schema' argument: {error}", _line(node))
+                )
 
 
 def _check_name(name: str, node: ast.AST, diags: list[Diagnostic]) -> None:

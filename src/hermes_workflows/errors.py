@@ -40,6 +40,7 @@ __all__ = [
     "E_POLICY_NETWORK",
     "E_POLICY_FILESYSTEM",
     "E_DISALLOWED_CAPABILITY",
+    "E_SCHEMA_OUTPUT_SCHEMA",
     "W_NO_OUTPUT_SCHEMA",
     "W_UNDECLARED_INPUT",
     "W_POLICY_DEFAULT",
@@ -57,6 +58,7 @@ __all__ = [
     "E_SCRIPT_DUNDER",
     "E_SCRIPT_INTERNAL_ATTR",
     "E_SCRIPT_FORBIDDEN_NODE",
+    "E_SCRIPT_BAD_SCHEMA",
 ]
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,7 @@ E_CYCLE = "E_CYCLE"  # cyclic depends_on / pipeline edge.
 E_POLICY_NETWORK = "E_POLICY_NETWORK"  # policy.network requested true.
 E_POLICY_FILESYSTEM = "E_POLICY_FILESYSTEM"  # policy.filesystem requested true.
 E_DISALLOWED_CAPABILITY = "E_DISALLOWED_CAPABILITY"  # unknown capability key.
+E_SCHEMA_OUTPUT_SCHEMA = "E_SCHEMA_OUTPUT_SCHEMA"  # output_schema uses an unsupported keyword/shape.
 
 # Warnings (promoted to errors under strict=True) --------------------------
 W_NO_OUTPUT_SCHEMA = "W_NO_OUTPUT_SCHEMA"  # agent step lacks output_schema.
@@ -102,6 +105,7 @@ E_SCRIPT_FORBIDDEN_NAME = "E_SCRIPT_FORBIDDEN_NAME"  # dangerous builtin referen
 E_SCRIPT_DUNDER = "E_SCRIPT_DUNDER"  # dunder name/attribute traversal.
 E_SCRIPT_INTERNAL_ATTR = "E_SCRIPT_INTERNAL_ATTR"  # frame/code/generator/coroutine internals.
 E_SCRIPT_FORBIDDEN_NODE = "E_SCRIPT_FORBIDDEN_NODE"  # disallowed syntax construct.
+E_SCRIPT_BAD_SCHEMA = "E_SCRIPT_BAD_SCHEMA"  # literal 'schema=' argument is malformed (issue #107).
 
 
 class WorkflowError(Exception):
