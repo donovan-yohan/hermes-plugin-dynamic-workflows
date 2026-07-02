@@ -189,11 +189,12 @@ def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
     Drops the free-text ``message`` (which a workflow script controls and could
     fill with input/output-derived data) and keeps the structural ``type`` /
-    ``code`` / ``line``, honoring the journal's metadata-only contract.
+    ``code`` / ``line`` / ``retryable`` (issue #103), honoring the journal's
+    metadata-only contract.
     """
     if not isinstance(error, dict):
         return error
-    return {k: error[k] for k in ("type", "code", "line") if k in error}
+    return {k: error[k] for k in ("type", "code", "line", "retryable") if k in error}
 
 
 def _fsync_dir(path: Path) -> None:
@@ -711,7 +712,7 @@ class ScriptRunStore:
         for key in (
             "agent_id", "profile", "capability", "label", "phase", "phase_title", "parallel_index",
             "pipeline_item_index", "pipeline_stage_index",
-            "fingerprint", "error", "replayed", "cache", "has_value", "attempt", "max_retries",
+            "fingerprint", "error", "retryable", "replayed", "cache", "has_value", "attempt", "max_retries",
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)

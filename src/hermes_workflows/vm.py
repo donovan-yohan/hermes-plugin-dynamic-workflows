@@ -508,22 +508,34 @@ class CapabilityBroker:
         except CapabilityDenied as denied:
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, denied.code)
-            self._emit(self._call_event(call_id, method, params, ok=False, error=denied.code))
+            self._emit(
+                self._call_event(call_id, method, params, ok=False, error=denied.code, retryable=denied.retryable)
+            )
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
-                "error": {"code": denied.code, "message": str(denied)}, "budget": self._budget_info(),
+                "error": {"code": denied.code, "message": str(denied), "retryable": denied.retryable},
+                "budget": self._budget_info(),
             }
         except KeyboardInterrupt:
             raise  # let a genuine operator interrupt propagate.
         except BaseException as exc:  # noqa: BLE001 — an AgentRunner (even one raising
             # SystemExit/CancelledError) must NOT escape and crash the parent run; it is
-            # contained here and reported to the script as a structured error.
+            # contained here and reported to the script as a structured error. Unlike a
+            # CapabilityDenied contract violation, this is a property of one dispatch
+            # attempt against a live runner, not of the call's arguments — retryable=True
+            # (issue #103) so a script may catch it and choose to retry or degrade.
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, "runner_error")
-            self._emit(self._call_event(call_id, method, params, ok=False, error="runner_error"))
+            self._emit(
+                self._call_event(call_id, method, params, ok=False, error="runner_error", retryable=True)
+            )
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
-                "error": {"code": "runner_error", "message": f"{type(exc).__name__} raised while dispatching brokered call"},
+                "error": {
+                    "code": "runner_error",
+                    "message": f"{type(exc).__name__} raised while dispatching brokered call",
+                    "retryable": True,
+                },
                 "budget": self._budget_info(),
             }
 
@@ -1267,6 +1279,7 @@ class CapabilityBroker:
         *,
         ok: bool,
         error: Optional[str] = None,
+        retryable: Optional[bool] = None,
         replayed: bool = False,
         event_type: str = "rpc_call",
     ) -> dict[str, Any]:
@@ -1297,6 +1310,11 @@ class CapabilityBroker:
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if error:
             event["error"] = error
+            # retryable is call-classification metadata (issue #103), journaled
+            # alongside the error code so replay/audit consumers see the same
+            # classification a script observed via ``CapabilityError.retryable``.
+            if retryable is not None:
+                event["retryable"] = retryable
         if replayed:
             event["replayed"] = True
         if not self._redact:

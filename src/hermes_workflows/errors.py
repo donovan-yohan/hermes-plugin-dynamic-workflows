@@ -186,10 +186,21 @@ class CapabilityDenied(WorkflowScriptError):
     malformed request, an unresolved agent id, or an exceeded budget/limit. The
     denial is serialized back to the subprocess as a structured RPC error so the
     script observes an exception rather than a silent success.
+
+    ``retryable`` (issue #103) classifies whether the *same call* could plausibly
+    succeed on a fresh attempt: it defaults to ``False`` because every denial
+    raised in this module today is a contract violation or a resolvable-only-in
+    -code condition (unknown agent id, schema/budget/limit exhaustion, a replay
+    drift) — re-issuing the identical call would fail the identical way. Only
+    the broker's *runner*-exception containment path (a live ``AgentRunner``
+    raising, surfaced to the script as ``code="runner_error"``) sets this
+    ``True``: that failure is a property of one dispatch attempt, not of the
+    call's arguments.
     """
 
-    def __init__(self, message: str, *, code: str = "capability_denied") -> None:
+    def __init__(self, message: str, *, code: str = "capability_denied", retryable: bool = False) -> None:
         self.code = code
+        self.retryable = retryable
         super().__init__(message)
 
 

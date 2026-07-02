@@ -98,10 +98,20 @@ class CapabilityError(RuntimeError):
 
     Injected as a script global so a workflow may ``try/except CapabilityError``
     around brokered calls (e.g. to handle a budget/limit denial gracefully).
+
+    ``retryable`` (issue #103) mirrors the parent's classification of *this
+    specific call*: ``False`` for a contract violation (unknown agent id,
+    schema/budget/limit exhaustion, a replay drift) where re-issuing the same
+    call would fail identically, and ``True`` only when the parent's runner
+    itself raised while dispatching (``code="runner_error"``) — a transient
+    failure of one dispatch attempt a script may reasonably retry. Defaults to
+    ``False`` so every existing catch site remains correct without inspecting
+    the attribute.
     """
 
-    def __init__(self, message: str, code: Optional[str] = None) -> None:
+    def __init__(self, message: str, code: Optional[str] = None, retryable: bool = False) -> None:
         self.code = code
+        self.retryable = retryable
         super().__init__(message)
 
 
@@ -113,6 +123,7 @@ class PipelineStageError(RuntimeError):
         self.stage_index = stage_index
         self.cause_type = type(exc).__name__
         self.code = exc.code if isinstance(exc, CapabilityError) else None
+        self.retryable = exc.retryable if isinstance(exc, CapabilityError) else False
         super().__init__(
             f"pipeline item {item_index} stage {stage_index} failed: {type(exc).__name__}: {exc}"
         )
@@ -187,7 +198,11 @@ class _Connection:
         if frame.get("ok"):
             return frame.get("value")
         error = frame.get("error") or {}
-        raise CapabilityError(error.get("message", "capability denied"), code=error.get("code"))
+        raise CapabilityError(
+            error.get("message", "capability denied"),
+            code=error.get("code"),
+            retryable=bool(error.get("retryable", False)),
+        )
 
     async def acall(self, method: str, params: dict[str, Any]) -> Any:
         """Send one capability call without blocking sibling async tasks."""
@@ -229,7 +244,13 @@ class _Connection:
                 fut.set_result(frame.get("value"))
             else:
                 error = frame.get("error") or {}
-                fut.set_exception(CapabilityError(error.get("message", "capability denied"), code=error.get("code")))
+                fut.set_exception(
+                    CapabilityError(
+                        error.get("message", "capability denied"),
+                        code=error.get("code"),
+                        retryable=bool(error.get("retryable", False)),
+                    )
+                )
         self._reader_task = None
 
     def _fail_pending(self, exc: BaseException) -> None:
@@ -468,14 +489,17 @@ def _error_payload(exc: BaseException) -> dict[str, Any]:
     """Build a metadata-only error payload (no full traceback to the parent)."""
     line = _script_line(exc)
     payload: dict[str, Any] = {"type": type(exc).__name__, "message": str(exc)}
-    if isinstance(exc, CapabilityError) and exc.code:
-        payload["code"] = exc.code
+    if isinstance(exc, CapabilityError):
+        if exc.code:
+            payload["code"] = exc.code
+        payload["retryable"] = exc.retryable
     if isinstance(exc, PipelineStageError):
         payload["item_index"] = exc.item_index
         payload["stage_index"] = exc.stage_index
         payload["cause_type"] = exc.cause_type
         if exc.code:
             payload["code"] = exc.code
+        payload["retryable"] = exc.retryable
     if line is not None:
         payload["line"] = line
     return payload
