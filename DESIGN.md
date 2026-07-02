@@ -776,6 +776,28 @@ Representative checks and codes:
 With `strict=True`, warnings are promoted to errors, so a strict caller rejects
 any definition that is not fully typed and policy-clean.
 
+**Known-agent resolution (`E_UNKNOWN_AGENT`).** `agent` steps are checked
+against `hermes_workflows.agents.is_known_agent`, which recognises exactly two
+sources: the fixed `KNOWN_AGENTS` roster (the ids the bundled examples/tests
+use, e.g. `hermes.greeter`, `hermes.github.pr_head`) and any id an embedding
+host has explicitly added via `register_known_agent(agent_id)`. There is no
+bare `hermes.*` wildcard fallback — a typo like `hermes.summarzier` fails
+`workflow_validate` with `E_UNKNOWN_AGENT` (error severity, not a warning) the
+same way any other unresolvable id does, instead of validating silently. This
+was previously a wildcard: any id starting with `hermes.` passed, which meant
+a typo'd agent id flowed all the way to the runner unnoticed — a quiet
+exception to the hard-rejection principle enforced everywhere else (unknown
+workflow capabilities, disallowed builtins, reserved `kanban.<profile>` runner
+ids). Error, not warning, was chosen for consistency with that existing
+behavior: every other "id the runtime cannot resolve" case in this table is
+already an error, so a demoted-to-warning `hermes.*` special case would just
+reintroduce a smaller version of the same silent-acceptance gap. Hosts that
+extend the roster at runtime call `register_known_agent` once per id at
+startup; registration is additive and process-lifetime (no unregister).
+`kanban.<profile>` ids remain excluded from ordinary `agent` steps regardless
+of registration — they are reserved for `kanban_agent` via `kanban_runner_id`
+and rejected up front by `is_kanban_runner_id`.
+
 ### 3.3 Allowed vs blocked
 
 **Allowed (skeleton):**
