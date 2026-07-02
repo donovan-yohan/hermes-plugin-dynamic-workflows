@@ -864,7 +864,10 @@ class CapabilityBroker:
         #    value is ignored — the hard cap is not re-enforced on a faithful
         #    replay, so a tampered _tokens must not skew the budget downward).
         with self._lock:
-            if method == "agent":
+            if method in ("agent", "agent_start"):
+                # agent_start counts against the same max_agent_calls ceiling as a
+                # live dispatch (see _handle_agent_start) -- a cache hit must trip
+                # the cap at the identical point a partially-replayed run would.
                 self._agent_calls += 1
             elif method == "kanban_agent":
                 self._kanban_calls += 1
@@ -1417,10 +1420,19 @@ class CapabilityBroker:
             raise CapabilityDenied(
                 "no async child agent runner configured for agent_start", code="async_child_agent_unavailable"
             )
+        handle = self._async_agent_handle(call_id)
         with self._lock:
             self._check_token_budget()
-        handle = self._async_agent_handle(call_id)
-        request = AsyncChildAgentRequest(target=target, input=input_payload, opts=opts)
+            # Count against the same soft ceiling as agent()/kanban_agent() --
+            # agent_start launches a real background child-agent run through the
+            # host runner and must not be a free, uncounted fan-out path (a
+            # script could otherwise start far more background children than
+            # the blocking path's own max_agent_calls would ever allow). See the
+            # matching accounting in _maybe_replay for cache-hit parity.
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        request = AsyncChildAgentRequest(target=target, input=input_payload, opts=opts, idempotency_key=handle)
         token = self._async_runner.start(request)
         with self._lock:
             self._async_agents[handle] = {
@@ -1434,17 +1446,24 @@ class CapabilityBroker:
         return {"handle": handle, "state": "pending"}
 
     def _require_async_record(self, handle: Any) -> dict[str, Any]:
+        """Return a lock-consistent snapshot of one async agent record.
+
+        A *copy*, not the live dict -- callers that branch on ``state`` and
+        then read ``result``/``error`` must see all three fields as of one
+        atomic instant, never a torn read where ``state`` reflects a write
+        that has started but ``result``/``error`` do not yet (or vice versa).
+        """
         if not isinstance(handle, str) or not handle:
             raise CapabilityDenied("call requires a non-empty 'handle'", code="bad_request")
         with self._lock:
             record = self._async_agents.get(handle)
-        if record is None:
-            # Either the handle never existed, or (see the module note above)
-            # this call was live-dispatched past a replayed prefix whose
-            # agent_start was itself served from the cache without populating
-            # self._async_agents -- the documented durable-suspend boundary.
-            raise CapabilityDenied(f"unknown async agent handle {handle!r}", code="unknown_handle")
-        return record
+            if record is None:
+                # Either the handle never existed, or (see the module note above)
+                # this call was live-dispatched past a replayed prefix whose
+                # agent_start was itself served from the cache without populating
+                # self._async_agents -- the documented durable-suspend boundary.
+                raise CapabilityDenied(f"unknown async agent handle {handle!r}", code="unknown_handle")
+            return dict(record)
 
     def _handle_agent_check(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         record = self._require_async_record(params.get("handle"))
@@ -1487,14 +1506,32 @@ class CapabilityBroker:
         return {"handles": items}
 
     def _apply_async_status(self, handle: str, status: Any, *, context: str) -> None:
+        """Commit one poll()/cancel() status, unless the record is already terminal.
+
+        Terminal states are sticky: once ``record["state"]`` lands in
+        ``_ASYNC_TERMINAL_STATES`` it never changes again, no matter what a
+        *later-arriving* status says. Without this, a check-then-act race
+        between a concurrent ``agent_check`` (poll) and ``agent_cancel`` --
+        both of which read the pre-call state, release the lock, call the
+        runner, and only then reach here -- can resurrect a cancelled handle
+        back to "done" (or clobber a completed result to "cancelled" with a
+        null result) depending on which call's runner round-trip finishes
+        last. Discarding a stale update here instead makes the terminal state
+        idempotent, matching the documented "idempotent once terminal"
+        contract, regardless of dispatch order.
+        """
         state, result, error = _parse_async_status(status, context=context)
         with self._lock:
             record = self._async_agents.get(handle)
-            if record is None:
+            if record is None or record["state"] in _ASYNC_TERMINAL_STATES:
                 return
             record["state"] = state
             record["result"] = result
             record["error"] = error
+            if state == "done" and result is not None:
+                usage = _non_negative_token_usage(result)
+                if usage is not None:
+                    self._tokens += usage
 
     def _async_state_view(self, record: dict[str, Any]) -> dict[str, Any]:
         view: dict[str, Any] = {"state": record["state"]}
@@ -1573,9 +1610,14 @@ class CapabilityBroker:
         if method in ("capability",):
             event["capability"] = safe_capability_metadata_value(params.get("name"))
         if method in ("agent_check", "agent_cancel"):
-            # The handle is a content-addressed id (never raw target/input), so
-            # it is safe on the metadata-only journal like a Kanban card id.
-            event["handle"] = params.get("handle")
+            # A live agent_start's handle is a content-addressed id (never raw
+            # target/input), safe on the metadata-only journal like a Kanban
+            # card id. But this event is emitted on every path -- including
+            # bad_request/unknown_handle denials -- so the guest-supplied
+            # ``handle`` here has not necessarily gone through that broker
+            # derivation; route it through the same redaction/size guard as
+            # phase_title/label rather than trusting it verbatim.
+            event["handle"] = safe_capability_metadata_value(params.get("handle"))
         if method in ("phase",):
             event["phase_title"] = safe_capability_metadata_value(params.get("title"))
         if params.get("label"):
@@ -1986,7 +2028,7 @@ class WorkflowVM:
             elif frame.get("method") == "capability":
                 info["capability"] = safe_capability_metadata_value(params.get("name"))
             elif frame.get("method") in ("agent_check", "agent_cancel"):
-                info["handle"] = params.get("handle")
+                info["handle"] = safe_capability_metadata_value(params.get("handle"))
             return info
 
         def _set_protocol_error(message: str) -> None:

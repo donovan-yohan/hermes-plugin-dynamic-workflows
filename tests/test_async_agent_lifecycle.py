@@ -20,6 +20,8 @@ except where a fake runner is needed to force a specific broker path.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -218,6 +220,94 @@ def test_broker_agent_check_and_cancel_deny_a_pending_handle_if_the_runner_disap
     assert cancelled["ok"] is False and cancelled["error"]["code"] == "async_child_agent_unavailable"
 
 
+def test_terminal_cancel_state_is_sticky_against_a_racing_in_flight_check():
+    """Broker-level probe: a poll() left in flight when cancel() commits must
+    not resurrect the handle once it finally returns (issue #112 review: the
+    cancel-racing-completion hazard -- ``_apply_async_status`` must not
+    overwrite an already-terminal record)."""
+    poll_may_return = threading.Event()
+    poll_called = threading.Event()
+
+    class _BlockingPollRunner:
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            return "tok"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            poll_called.set()
+            poll_may_return.wait(timeout=5)
+            return {"state": "done", "result": {"late": True}}
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            return {"state": "cancelled"}
+
+    broker = _broker(_BlockingPollRunner())
+    started = broker.handle(_call("agent_start", {"target": "hermes.echo", "input": {}}, call_id=1))
+    handle = started["value"]["handle"]
+
+    check_result: dict[str, Any] = {}
+
+    def _run_check() -> None:
+        check_result["ret"] = broker.handle(_call("agent_check", {"handle": handle}, call_id=2))
+
+    checker = threading.Thread(target=_run_check)
+    checker.start()
+    assert poll_called.wait(timeout=5), "agent_check never reached the blocking poll()"
+
+    cancel_ret = broker.handle(_call("agent_cancel", {"handle": handle}, call_id=3))
+    assert cancel_ret["ok"] is True and cancel_ret["value"] == {"state": "cancelled"}
+
+    # Only now let the racing poll() return "done" -- cancel has already committed.
+    poll_may_return.set()
+    checker.join(timeout=5)
+    assert check_result["ret"]["ok"] is True
+
+    final = broker.handle(_call("agent_check", {"handle": handle}, call_id=4))
+    assert final["ok"] is True and final["value"] == {"state": "cancelled"}
+
+
+def test_terminal_done_state_is_sticky_against_a_racing_cancel():
+    """Mirror of the above with the interleaving reversed: a cancel() left in
+    flight when a poll() commits "done" must not wipe the completed result."""
+    cancel_may_return = threading.Event()
+    cancel_called = threading.Event()
+
+    class _BlockingCancelRunner:
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            return "tok"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            return {"state": "done", "result": {"ok": True}}
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            cancel_called.set()
+            cancel_may_return.wait(timeout=5)
+            return {"state": "cancelled"}
+
+    broker = _broker(_BlockingCancelRunner())
+    started = broker.handle(_call("agent_start", {"target": "hermes.echo", "input": {}}, call_id=1))
+    handle = started["value"]["handle"]
+
+    cancel_result: dict[str, Any] = {}
+
+    def _run_cancel() -> None:
+        cancel_result["ret"] = broker.handle(_call("agent_cancel", {"handle": handle}, call_id=2))
+
+    canceller = threading.Thread(target=_run_cancel)
+    canceller.start()
+    assert cancel_called.wait(timeout=5), "agent_cancel never reached the blocking cancel()"
+
+    check_ret = broker.handle(_call("agent_check", {"handle": handle}, call_id=3))
+    assert check_ret["ok"] is True and check_ret["value"] == {"state": "done", "result": {"ok": True}}
+
+    # Only now let the racing cancel() return -- the "done" result has already committed.
+    cancel_may_return.set()
+    canceller.join(timeout=5)
+    assert cancel_result["ret"]["ok"] is True
+
+    final = broker.handle(_call("agent_check", {"handle": handle}, call_id=4))
+    assert final["ok"] is True and final["value"] == {"state": "done", "result": {"ok": True}}
+
+
 def test_broker_agent_check_result_over_limit_fails_closed_with_structured_error():
     class HugeResultRunner:
         def start(self, request: AsyncChildAgentRequest) -> Any:
@@ -316,6 +406,131 @@ def test_broker_surfaces_a_failed_status_with_metadata_only_error():
     assert res.value == {"state": "failed", "error": {"type": "Boom", "message": "kaboom", "code": "boom_code"}}
 
 
+def test_agent_list_orders_by_call_id_deterministically_even_out_of_insertion_order():
+    """Unlike the concurrent-``parallel()`` end-to-end test above (which relies
+    on thread-scheduling luck to ever actually put entries out of order), this
+    forges ``_async_agents`` directly with insertion order reversed relative to
+    call id, so the ``items.sort(...)`` line in ``_handle_agent_list`` is
+    load-bearing for *this* assertion no matter how the threads happen to
+    interleave."""
+    broker = _broker(StubAsyncAgentRunner())
+    broker._async_agents["ah_c"] = {
+        "token": "t3", "target": "third", "state": "pending", "result": None, "error": None, "call_id": 3,
+    }
+    broker._async_agents["ah_a"] = {
+        "token": "t1", "target": "first", "state": "pending", "result": None, "error": None, "call_id": 1,
+    }
+    broker._async_agents["ah_b"] = {
+        "token": "t2", "target": "second", "state": "pending", "result": None, "error": None, "call_id": 2,
+    }
+    listed = broker.handle(_call("agent_list", {}, call_id=4))
+    assert listed["ok"] is True
+    assert [item["handle"] for item in listed["value"]["handles"]] == ["ah_a", "ah_b", "ah_c"]
+    assert [item["target"] for item in listed["value"]["handles"]] == ["first", "second", "third"]
+
+
+# --------------------------------------------------------------------------- #
+# Governance: agent_start counts against max_agent_calls, and a "done" async
+# result feeds the token budget like any other brokered result
+# --------------------------------------------------------------------------- #
+
+def test_agent_start_counts_against_max_agent_calls():
+    script = META + (
+        'started = []\n'
+        'codes = []\n'
+        'for i in range(3):\n'
+        '    try:\n'
+        '        h = await agent_start("hermes.echo", {"i": i})\n'
+        '        started.append(h["handle"])\n'
+        '        codes.append(None)\n'
+        '    except CapabilityError as e:\n'
+        '        codes.append(e.code)\n'
+        'return {"started": started, "codes": codes}\n'
+    )
+    res = run_workflow_script(script, async_child_runner=StubAsyncAgentRunner(), limits=VMLimits(max_agent_calls=1))
+    assert res.ok, res.error
+    assert len(res.value["started"]) == 1
+    assert res.value["codes"] == [None, "limit_agent", "limit_agent"]
+
+
+def test_agent_start_denial_does_not_start_a_background_run():
+    class _CountingRunner:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            self.starts += 1
+            return f"tok-{self.starts}"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            return {"state": "pending"}
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            return {"state": "cancelled"}
+
+    runner = _CountingRunner()
+    broker = _broker(runner, max_agent_calls=1)
+    first = broker.handle(_call("agent_start", {"target": "hermes.echo", "input": {}}, call_id=1))
+    assert first["ok"] is True
+    second = broker.handle(_call("agent_start", {"target": "hermes.echo", "input": {}}, call_id=2))
+    assert second["ok"] is False and second["error"]["code"] == "limit_agent"
+    assert runner.starts == 1  # the denied call never reached the runner.
+
+
+def test_cache_hit_replay_of_agent_start_trips_max_agent_calls_at_the_same_point():
+    """A partially-replayed run's cached ``agent_start`` hits must advance the
+    same counter a live dispatch would, so a call live-dispatched past the
+    cached prefix trips ``max_agent_calls`` at the identical point the source
+    run would have (issue #112 review)."""
+    script = META + (
+        'a = await agent_start("hermes.echo", {"i": 0})\n'
+        'b = await agent_start("hermes.echo", {"i": 1})\n'
+        'try:\n'
+        '    c = await agent_start("hermes.echo", {"i": 2})\n'
+        '    return {"code": None}\n'
+        'except CapabilityError as e:\n'
+        '    return {"code": e.code}\n'
+    )
+    limits = VMLimits(max_agent_calls=2)
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        source = run_workflow_script(
+            script, store=store, run_id="src", async_child_runner=StubAsyncAgentRunner(), limits=limits
+        )
+        assert source.ok, source.error
+        assert source.value == {"code": "limit_agent"}
+
+        replayed = run_workflow_script(
+            script, store=store, replay_from="src", async_child_runner=_ExplodingAsyncRunner(), limits=limits
+        )
+        assert replayed.ok, replayed.error
+        assert replayed.value == {"code": "limit_agent"}
+
+
+def test_a_done_async_result_feeds_the_token_budget():
+    """Broker-level probe: a "done" ``agent_check`` result's ``_tokens`` must
+    land in ``self._tokens`` like any other brokered result, so the async path
+    cannot be used to bypass ``token_budget`` (issue #112 review)."""
+
+    class _TokenRunner:
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            return "tok"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            return {"state": "done", "result": {"value": 1, "_tokens": 1000}}
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            return {"state": "cancelled"}
+
+    broker = _broker(_TokenRunner())
+    started = broker.handle(_call("agent_start", {"target": "hermes.echo", "input": {}}, call_id=1))
+    handle = started["value"]["handle"]
+    assert broker._tokens == 0
+    checked = broker.handle(_call("agent_check", {"handle": handle}, call_id=2))
+    assert checked["ok"] is True and checked["value"]["state"] == "done"
+    assert broker._tokens == 1000
+
+
 # --------------------------------------------------------------------------- #
 # Replay: a completed handle replays from cache without touching the runner
 # --------------------------------------------------------------------------- #
@@ -397,3 +612,102 @@ def test_async_lifecycle_methods_are_replayable_regardless_of_deterministic_runn
     for method in ("agent_start", "agent_check", "agent_cancel", "agent_list"):
         assert is_replayable(method, deterministic_runner=False) is True
         assert is_replayable(method, deterministic_runner=True) is True
+
+
+# --------------------------------------------------------------------------- #
+# Runner-seam idempotency identity
+# --------------------------------------------------------------------------- #
+
+def test_agent_start_passes_the_deterministic_handle_as_the_request_idempotency_key():
+    """The broker-derived handle must cross the runner seam so a host can
+    dedupe/reattach a duplicate dispatch (issue #112 review) -- e.g. a
+    re-dispatch on resume of an agent_start recorded inside a crashed
+    parallel() branch under the #109 pending-writes contract."""
+
+    class _RecordingRunner:
+        def __init__(self) -> None:
+            self.requests: list[AsyncChildAgentRequest] = []
+
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            self.requests.append(request)
+            return "tok"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            return {"state": "pending"}
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            return {"state": "cancelled"}
+
+    runner = _RecordingRunner()
+    res = run_workflow_script(META + 'return await agent_start("hermes.echo", {})\n', async_child_runner=runner)
+    assert res.ok, res.error
+    assert len(runner.requests) == 1
+    assert runner.requests[0].idempotency_key == res.value["handle"]
+    assert runner.requests[0].as_dict()["idempotency_key"] == res.value["handle"]
+
+
+def test_stub_async_agent_runner_gives_independent_lifecycles_to_identical_requests():
+    """Two independent ``start()`` calls with byte-identical requests must not
+    collide on one token (issue #112 review) -- cancelling one must not affect
+    the other, and each keeps its own poll count."""
+    runner = StubAsyncAgentRunner()
+    request = AsyncChildAgentRequest(target="hermes.echo", input={"x": 1}, opts={})
+    token_a = runner.start(request)
+    token_b = runner.start(request)
+    assert token_a != token_b
+
+    runner.cancel(token_a)
+    assert runner.poll(token_a) == {"state": "cancelled"}
+    # b is untouched by a's cancellation and keeps polling toward its own
+    # (identically-derived, since the request is identical) required count.
+    status_b = runner.poll(token_b)
+    assert status_b["state"] in ("pending", "done")
+    assert status_b != {"state": "cancelled"}
+
+
+# --------------------------------------------------------------------------- #
+# Documented durable-suspend boundary (DESIGN.md; follow-up tracked separately)
+# --------------------------------------------------------------------------- #
+
+def test_resume_with_a_live_agent_check_past_a_cached_agent_start_denies_unknown_handle():
+    """Pins the exact boundary DESIGN.md documents: a source run's agent_start
+    completes and is durably cached, but its agent_check never completes (the
+    async runner raises mid-poll and the script does not catch it, so the run
+    dies with the call unrecorded -- mirroring how #109's pending-writes
+    contract already proves an uncaught runner failure is never flushed to the
+    cache, see test_pending_writes_resume_contract.py). Resuming with
+    replay_from replays the cached agent_start without touching
+    self._async_agents, then live-dispatches the never-recorded agent_check --
+    which fails closed with the typed unknown_handle denial rather than
+    crashing or guessing."""
+    script = META + (
+        'h = await agent_start("hermes.echo", {"x": 1})\n'
+        'checked = await agent_check(h["handle"])\n'
+        'return {"checked": checked}\n'
+    )
+
+    class _CrashesOnPollRunner:
+        def start(self, request: AsyncChildAgentRequest) -> Any:
+            return "tok"
+
+        def poll(self, token: Any) -> dict[str, Any]:
+            raise RuntimeError("simulated process death mid agent_check")
+
+        def cancel(self, token: Any) -> dict[str, Any]:
+            return {"state": "cancelled"}
+
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        source = run_workflow_script(script, store=store, run_id="src", async_child_runner=_CrashesOnPollRunner())
+        # The run dies uncaught: agent_start succeeded (and is durably cached
+        # the instant it did), but agent_check never completed and is not
+        # flushed to the cache (a failed call that crashes the run is never
+        # recorded -- see _persist_failure/flush_pending_failures).
+        assert source.ok is False
+        assert source.error["code"] == "runner_error"
+
+        resumed = run_workflow_script(
+            script, store=store, replay_from="src", async_child_runner=StubAsyncAgentRunner()
+        )
+        assert resumed.ok is False
+        assert resumed.error["code"] == "unknown_handle"

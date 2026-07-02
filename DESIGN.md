@@ -1791,19 +1791,25 @@ background children, `parallel()` other work, then collect via `agent_check`"
 surviving an ordinary replay/resume of a *fully-recorded* run untouched by the
 boundary below.
 
-**Boundary this slice leaves for a follow-up: no durable suspend on an
-unresolved handle.** §5.10 made an unresolved *paused Kanban await* suspend the
-run durably (`ScriptRunResult(suspended=True)`, `store.suspended_runs()`,
-resumable via `replay_from`) by reusing the existing card/event-log plumbing —
-the await already knew how to block-then-give-up. The async lifecycle globals
-never block at all (`agent_check` is a single non-blocking poll), so there is
-no analogous "give up and suspend" moment to hook into, and unlike a Kanban
-card there is no durable, host-external store of the async run's identity this
-slice can reattach to from a fresh process. Landing that properly needs its own
-durable async-run store (a `token`/`handle` -> host-run-id index a fresh
-process can query), which is deliberately out of scope here per the issue's own
-"land start/check/cancel/list + journaling + replay + in-process completion
-first" cut. Concretely, today:
+**Boundary this slice leaves for a follow-up (tracked as issue #129): no
+durable suspend on an unresolved handle.** §5.10 made an unresolved *paused
+Kanban await* suspend the run durably (`ScriptRunResult(suspended=True)`,
+`store.suspended_runs()`, resumable via `replay_from`) by reusing the existing
+card/event-log plumbing — the await already knew how to block-then-give-up.
+The async lifecycle globals never block at all (`agent_check` is a single
+non-blocking poll), so there is no analogous "give up and suspend" moment to
+hook into, and unlike a Kanban card there is no durable, host-external store
+of the async run's identity this slice can reattach to from a fresh process.
+Landing that properly needs its own durable async-run store (a `token`/
+`handle` -> host-run-id index a fresh process can query).
+
+This is a real reduction from issue #112's own proposal, which said
+unresolved handles "participate in durable suspend exactly like Kanban
+awaits" (AC #2: "Process death with unresolved handles suspends durably;
+resume re-attaches idempotently") — not something #112's text pre-authorized
+cutting. The cut is ratified on #112 itself (see the issue comment on this
+PR) and the closing work is filed as its own issue, #129, rather than left as
+an undocumented gap. Concretely, today:
 
 - A script that ends with an unresolved (`pending`) handle just ends unresolved
   — the run is **not** suspended; it reports its ordinary terminal status.
@@ -1816,15 +1822,67 @@ first" cut. Concretely, today:
   cache hit) and fails closed with a typed, deterministic `unknown_handle`
   denial rather than crashing or guessing. A script that depends on checking a
   handle across a resume boundary is not yet supported; only "the whole
-  relevant prefix stayed within the replay cache" is.
+  relevant prefix stayed within the replay cache" is. This exact boundary --
+  a cached `agent_start` followed by a live-dispatched `agent_check` past it
+  -- is pinned by
+  `test_resume_with_a_live_agent_check_past_a_cached_agent_start_denies_unknown_handle`
+  in `tests/test_async_agent_lifecycle.py`, which forces the source run to
+  die with the `agent_check` call itself unrecorded (an uncaught runner
+  failure mid-poll, mirroring the #109 pending-writes crash pattern) so the
+  resumed run's `agent_check` is a genuine live dispatch past the cached
+  prefix, not merely a second cache hit.
 
-A future slice can close this the same way §5.10 closed the Kanban gap: add a
+Issue #129 closes this the same way §5.10 closed the Kanban gap: add a
 durable async-run index alongside `ScriptRunStore`, make an unresolved handle
 at script end request the same `should_suspend`/`suspend_info` teardown the
 broker already exposes for Kanban (`CapabilityBroker._begin_suspend` and
 `WorkflowVM._drive`'s handling of it), and have a resumed run's live
 `agent_check`/`agent_cancel` reattach through that index instead of requiring
 `self._async_agents` to already hold the token.
+
+**Adversarial review of this slice, before #129.** A follow-up review of the
+landed slice (still ahead of the durable-suspend work above) found and fixed
+four issues, each now regression-tested in `tests/test_async_agent_lifecycle.py`:
+
+- **Terminal states were not sticky.** `_handle_agent_check`/
+  `_handle_agent_cancel` read `record["state"]`, released the lock, called the
+  runner, and only then wrote the result back — a poll racing a cancel on the
+  same handle could resurrect a just-cancelled handle to `"done"` (or clobber
+  a completed result back to `"cancelled"` with a null result), whichever
+  runner round-trip happened to finish last. `_apply_async_status` now
+  discards an update once the record is already terminal, and
+  `_require_async_record` returns a lock-consistent snapshot instead of the
+  live dict, so a caller can no longer observe a torn read across `state`/
+  `result`/`error`.
+- **`agent_start` bypassed governance limits.** It launched a real background
+  child-agent run through the host runner without incrementing any counter —
+  `agent()`/`kanban_agent()`/`capability()` all count against
+  `max_agent_calls`/`max_kanban_calls`/`max_capability_calls`, but
+  `agent_start` only hit the shared `max_rpc_calls` ceiling (1000 by default,
+  versus `max_agent_calls`'s 200). It now counts against `max_agent_calls`
+  like `agent()`, with matching cache-hit accounting in `_maybe_replay` so a
+  partially-replayed run trips the cap at the same point. A `"done"` async
+  result's `_tokens` now also feeds `token_budget` (previously silently
+  dropped), closing a second bypass of the same governance surface.
+- **No idempotency identity crossed the runner seam.** `AsyncChildAgentRequest`
+  now carries the broker-derived deterministic handle as `idempotency_key`
+  (mirroring `kanban_agent`'s `kanban_idempotency_key`), so a host runner can
+  dedupe/reattach a re-dispatch of the same logical `agent_start` — e.g. one
+  recorded inside a crashed `parallel()` branch under the #109 pending-writes
+  contract and re-dispatched fresh on resume — instead of starting a second
+  background run with no way to tell it apart from a first.
+- **`StubAsyncAgentRunner` collided identical requests onto one token.**
+  Two independent `agent_start` calls with byte-identical `(target, input,
+  opts)` shared a token (a pure content digest), so cancelling one silently
+  cancelled the other. `start()` now appends a per-digest sequence number to
+  the token, keeping each call's lifecycle independent while the required
+  poll count (derived from the request content alone) stays reproducible.
+
+A guest-supplied `handle` on `agent_check`/`agent_cancel` is also now routed
+through `safe_capability_metadata_value` before it is journaled (it was
+previously written verbatim, including on the `bad_request`/`unknown_handle`
+denial paths where it has not gone through the broker's own content-addressed
+derivation), matching the `phase_title`/`label` precedent.
 
 **Runner seam and deterministic test stub.** `agents.AsyncChildAgentRunner` is
 the `Protocol` a host implements (`start`/`poll`/`cancel`); `run_workflow_script`

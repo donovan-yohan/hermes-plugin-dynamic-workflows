@@ -310,6 +310,17 @@ class AsyncChildAgentRequest:
     target: str
     input: dict[str, Any] = field(default_factory=dict)
     opts: dict[str, Any] = field(default_factory=dict)
+    # The broker-derived, deterministic ``agent_start`` handle (see
+    # ``CapabilityBroker._async_agent_handle``), passed through so a host
+    # runner can dedupe/reattach a duplicate dispatch of the *same logical*
+    # agent_start rather than starting a second background run. This matters
+    # under the #109 pending-writes contract: an agent_start recorded inside a
+    # crashed parallel() branch is discarded and re-dispatched fresh on
+    # resume, minting the identical handle both times -- without an
+    # idempotency identity crossing the runner seam, the host has no way to
+    # tell the resumed dispatch apart from a brand-new one. Mirrors
+    # ``kanban_agent``'s ``kanban_idempotency_key`` for the same reason.
+    idempotency_key: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the runner contract as a plain JSON-friendly dict."""
@@ -317,6 +328,7 @@ class AsyncChildAgentRequest:
             "target": self.target,
             "input": copy.deepcopy(self.input),
             "opts": copy.deepcopy(self.opts),
+            "idempotency_key": self.idempotency_key,
         }
 
 
@@ -356,19 +368,31 @@ class StubAsyncAgentRunner:
     """Deterministic, network-free default :class:`AsyncChildAgentRunner`.
 
     Completes after a fixed number of ``poll()`` calls derived only from a
-    stable hash of the request (never wall-clock/randomness), so the same
+    stable hash of the request (never wall-clock/randomness), so a given
     ``(target, input, opts)`` always takes the same number of polls to
     resolve and every test using it is reproducible. ``cancel()`` is terminal
     and idempotent; a cancelled token stays cancelled even if polled again.
+
+    Each ``start()`` call gets its own independent lifecycle, even for two
+    calls with byte-identical requests: the token is the request's content
+    digest plus a per-digest monotonic sequence number (``f"{digest}:{n}"``),
+    still fully deterministic but no longer shared -- without the sequence
+    number, two independent ``agent_start`` calls with identical arguments
+    would collide on one token, so cancelling one would silently cancel the
+    other too.
     """
 
     def __init__(self) -> None:
         self._requests: dict[str, AsyncChildAgentRequest] = {}
         self._poll_counts: dict[str, int] = {}
         self._cancelled: set[str] = set()
+        self._start_counts: dict[str, int] = {}
 
     def start(self, request: AsyncChildAgentRequest) -> Any:
-        token = self._digest(request)
+        digest = self._digest(request)
+        n = self._start_counts.get(digest, 0)
+        self._start_counts[digest] = n + 1
+        token = f"{digest}:{n}"
         self._requests[token] = request
         self._poll_counts.setdefault(token, 0)
         return token
