@@ -51,7 +51,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from .errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
 from .registry import utc_now_iso
@@ -59,6 +59,8 @@ from .script_validator import normalize_meta_phases
 
 __all__ = [
     "SCRIPT_SCHEMA_VERSION",
+    "JournalDurability",
+    "JOURNAL_DURABILITY_MODES",
     "ScriptRunMeta",
     "ReplayEntry",
     "PromptReplayEntry",
@@ -95,6 +97,21 @@ _ALWAYS_REPLAYABLE = frozenset({"log", "phase"})
 # Methods that cross the AgentRunner boundary: replayable only when the runner
 # is declared deterministic for the run.
 _RUNNER_METHODS = frozenset({"agent", "kanban_agent"})
+
+# Run-journal (``journal.jsonl``) durability policy (issue #108). ``sync`` fsyncs
+# every event (today's behavior, and the default — zero change unless an
+# embedder opts in). ``async`` buffers events in memory and fsyncs them in one
+# batch every ``async_flush_every`` events (a deterministic *count* trigger —
+# never a wall-clock interval, per the module's no-wall-clock contract).
+# ``exit`` buffers every event and only reaches disk on the run's terminal
+# force-flush. Suspend/finish/abort always force-flush the buffer regardless of
+# mode (see :meth:`ScriptRunStore.finish`); only an actual process crash before
+# that point can lose buffered ``async``/``exit`` events. Never applies to
+# ``run.json`` (always fsynced) or the per-card kanban event log.
+JournalDurability = Literal["exit", "async", "sync"]
+JOURNAL_DURABILITY_MODES: frozenset[str] = frozenset({"exit", "async", "sync"})
+_DEFAULT_JOURNAL_DURABILITY: JournalDurability = "sync"
+_DEFAULT_ASYNC_FLUSH_EVERY = 8
 
 
 def canonical_hash(obj: Any) -> str:
@@ -585,9 +602,38 @@ class ScriptRunStore:
     its subprocess) still has no filesystem authority. Concurrent writers within
     one process are serialised by a single lock. ``root`` defaults are chosen by
     the caller (e.g. ``$HERMES_HOME/dynamic-workflows/script-runs``).
+
+    ``durability`` (issue #108) governs only the ``journal.jsonl`` write policy
+    (never ``run.json``, which is always fsynced, and never the per-card kanban
+    event log): ``"sync"`` (default) fsyncs every event — today's behavior,
+    unchanged unless an embedder opts in. ``"async"`` buffers events in memory
+    and fsyncs them together every ``async_flush_every`` events (a deterministic
+    *count* trigger, never a wall-clock interval). ``"exit"`` buffers every
+    event and only reaches disk on the run's terminal force-flush. Regardless of
+    mode, :meth:`finish` (suspend, succeed, fail, stop, pause — every terminal
+    status) always force-flushes any buffered events before returning.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        durability: JournalDurability = _DEFAULT_JOURNAL_DURABILITY,
+        async_flush_every: int = _DEFAULT_ASYNC_FLUSH_EVERY,
+    ) -> None:
+        if durability not in JOURNAL_DURABILITY_MODES:
+            raise ValueError(
+                f"unsupported journal durability: {durability!r} (expected one of "
+                f"{sorted(JOURNAL_DURABILITY_MODES)})"
+            )
+        if not isinstance(async_flush_every, int) or isinstance(async_flush_every, bool) or async_flush_every < 1:
+            raise ValueError(f"async_flush_every must be a positive int, got {async_flush_every!r}")
+        self._durability: JournalDurability = durability
+        self._async_flush_every = async_flush_every
+        # Buffered, not-yet-fsynced journal lines per run id (``async``/``exit``
+        # modes only; always empty in ``sync`` mode). Only touched under
+        # ``self._lock``.
+        self._journal_buffer: dict[str, list[str]] = {}
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -729,6 +775,11 @@ class ScriptRunStore:
                 "done",
                 {"status": status, "has_value": value is not None, "error": _redact_error(error)},
             )
+            # Every terminal status (succeeded/failed/suspended/stopped/paused)
+            # force-flushes the journal regardless of durability mode (issue
+            # #108): a run that is about to go quiet must not leave events
+            # sitting unflushed in memory.
+            self._flush_journal_locked(run_id)
 
     # -- reads ------------------------------------------------------------
     def load_run(self, run_id: str) -> ScriptRunMeta:
@@ -1161,11 +1212,47 @@ class ScriptRunStore:
         _fsync_dir(run_dir)
 
     def _append_journal(self, run_id: str, event_type: str, data: dict[str, Any]) -> None:
+        """Append one journal event, applying the store's durability policy.
+
+        Called with ``self._lock`` already held by every caller (:meth:`begin`,
+        :meth:`note_call`, :meth:`finish`). ``sync`` (the default) is written and
+        fsynced immediately — byte-for-byte the store's original behavior.
+        ``async``/``exit`` instead buffer the serialized line in memory;
+        ``async`` additionally force-flushes every ``async_flush_every`` events
+        (a deterministic count trigger, never a wall-clock interval).
+        """
         event = {"ts": utc_now_iso(), "type": event_type, "run_id": run_id, **data}
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        if self._durability == "sync":
+            self._write_journal_lines(run_id, [line])
+            return
+        buffer = self._journal_buffer.setdefault(run_id, [])
+        buffer.append(line)
+        if self._durability == "async" and len(buffer) >= self._async_flush_every:
+            self._flush_journal_locked(run_id)
+
+    def _write_journal_lines(self, run_id: str, lines: list[str]) -> None:
+        """Append+fsync ``lines`` to ``run_id``'s journal in a single write."""
+        if not lines:
+            return
         with self._journal_path(run_id).open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            for line in lines:
+                f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+    def _flush_journal_locked(self, run_id: str) -> None:
+        """Force any buffered ``async``/``exit`` journal events to disk.
+
+        A no-op in ``sync`` mode (nothing is ever buffered) and a no-op if
+        nothing is pending. Requires ``self._lock`` already held. The buffer is
+        popped only after the write succeeds, so a transient disk failure during
+        a force-flush leaves the pending lines intact for a retried ``finish()``.
+        """
+        pending = self._journal_buffer.get(run_id)
+        if pending:
+            self._write_journal_lines(run_id, pending)
+            self._journal_buffer.pop(run_id, None)
 
     def _run_dir(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
