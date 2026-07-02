@@ -1134,6 +1134,79 @@ script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
 
+### 5.7.1 Pending-writes resume contract: completed `parallel()`/`pipeline()` siblings survive a mid-run crash (issue #109)
+
+LangGraph calls this "pending writes": siblings that already completed within a
+failed superstep are preserved on resume, not re-executed. §5.7's replay cache
+already gives us the mechanism — every RPC call's success is fsynced to
+`cache.jsonl` (or the prompt-fingerprint cache, below) the instant
+`CapabilityBroker.handle()` returns, **independent of whether the run as a
+whole later fails**. This section states the resulting guarantee explicitly
+and pins it with a fixture
+(`tests/test_pending_writes_resume_contract.py`).
+
+**The guarantee.** When a `parallel()` (or `pipeline()`) fan-out is
+interrupted mid-flight — a runner crash, an operator kill, a process death —
+the branches that had already returned successfully are not lost and are not
+re-run on `replay_from`:
+
+- A **deterministic `agent(agent_id, input)`** branch that completed is served
+  by its stable call id from `cache.jsonl` (§5.7), exactly like any other
+  deterministic call — the resumed run never invokes the (possibly new/
+  different) injected runner for it.
+- A **prompt-agent `agent(prompt, opts)`** branch that completed is served by
+  its semantic `v2:` fingerprint (`_prompt_agent_cache_identity`), independent
+  of `deterministic_runner` and independent of call id — it is recorded
+  unconditionally on every successful prompt-agent call, so it survives even a
+  run whose deterministic-agent cache is off (see README's "Fingerprint resume
+  cache").
+- Branches that never completed before the crash (their RPC call never
+  returned, or returned with an error) have no cache entry — deterministic or
+  fingerprint — and re-dispatch live on resume, against whatever runner the
+  resumed process is given.
+
+Because each call's persistence is independent of the others and of the run's
+terminal outcome, an *N-of-M* mid-`parallel()` crash resumes with exactly the
+N completed siblings cache-served and the M−N incomplete ones re-executed —
+never more, never fewer. The fixture drives this directly: a four-branch
+`parallel()` mixing one deterministic and one prompt-agent branch that
+complete with one of each that "crash" (a runner that raises, the same
+controlled-failure-injection pattern already used throughout
+`tests/test_vm_subprocess.py`), then asserts via **runner invocation
+counting** on *fresh* runner instances for the resumed run that the two
+completed branches never reach the new runners at all, and the two crashed
+branches do, exactly once each.
+
+**Drift-abort fail-closed still applies at the sibling level.** A completed
+sibling's cache entry is guarded by the same per-call integrity tag as any
+other replayed call (§5.7): if the recorded `method`/`args_hash` for a
+completed branch's call id no longer matches what the resumed script would
+send — in practice a tampered/corrupted `cache.jsonl` line, since
+`replay_from` already refuses a whole-run `script_sha256`/`args_hash` identity
+mismatch before any subprocess spawns — the resume aborts the subprocess
+(`replay_mismatch` / `WorkflowSubprocessError`) rather than silently serving
+or re-running a poisoned value. The same rule governs the prompt-agent
+fingerprint path (`"prompt replay drift at fingerprint ..."`). Pending-writes
+recovery is opt-in to a determinism guarantee, not a best-effort cache — a
+doubtful hit is refused, not guessed at.
+
+**Boundary: this is call-result dedup, not side-effect dedup.** The guarantee
+above is about *not re-running a call whose success the parent already
+durably observed*. It says nothing about calls whose underlying effect fired
+but whose success was never durably recorded before the crash — e.g. a live
+(non-deterministic) `AgentRunner` that dispatched a real action and then the
+process died before the RPC response reached `_persist_success`, or a
+`capability()` handler with an `external_write` side-effect class that is not
+`replayable` (§5.3). Those re-dispatch live on resume like any cache miss and
+may repeat the external effect. Closing that gap needs effect-level
+idempotency — already the honored contract for `kanban_agent` (§5.8) and for a
+*replayable* mutating capability handler (§5.3) — extended to *every*
+side-effecting call. That is the same "dedup of durable side effects" item the
+roadmap (§8, item 3) and the README's "the script VM can replay completed
+deterministic RPC calls, but general partial-run resume is still evolving"
+limitation already flag as open; this issue narrows and pins the *call-result*
+half of that story, it does not close the *side-effect* half.
+
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
 `kanban.py` upgrades `kanban_agent` from a synchronous stub call into a
