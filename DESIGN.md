@@ -1314,7 +1314,48 @@ deterministic RPC calls, but general partial-run resume is still evolving"
 limitation already flag as open; this issue narrows and pins the *call-result*
 half of that story, it does not close the *side-effect* half.
 
-### 5.7.3 Pluggable store backend: SQLite adapter (issue #110)
+### 5.7.3 Prompt-agent (`agent(prompt, opts)`) option matrix (issue #101)
+
+`ChildAgentRequest` (`agents.py`) is the parent-normalized contract every
+`agent(prompt, opts)` call crosses the injected `ChildAgentRunner` boundary as.
+`CHILD_AGENT_OPTION_KEYS` is the exhaustive allowlist `_prompt_agent_request`
+validates `opts` against — any other key is a deterministic `bad_request`
+denial (§5.4) before the child runner is ever invoked.
+
+| Option | Shape | Broker validation | Feeds the `v2:` fingerprint (§5.7)? |
+| --- | --- | --- | --- |
+| `label` | string | must be a string | yes, always |
+| `phase` | string | must be a string | yes, always |
+| `schema` | object | must be an object; also independently checked by `schema_subset.normalize_schema` | yes, always |
+| `model` | string | must be a string | yes, always |
+| `effort` | string | must be a string | yes, always |
+| `isolation` | string | must be a string | yes, always |
+| `context` | object | must be an object | yes, always |
+| `tools` | list/tuple of non-empty strings | must be a list/tuple whose items are all non-empty strings; deduped preserving first-occurrence order and normalized to a tuple | only when not `None` |
+
+`tools` is the one option whose fingerprint participation is conditional. A
+differently-scoped `tools` allowlist for an otherwise-identical prompt/opts
+call must land in a distinct cache entry, so a provided `tools` list adds a
+`"tools"` key to the fingerprint payload. But a call that never sets `tools`
+(the overwhelming majority of calls, and every call recorded before this
+option existed) omits the key entirely rather than fingerprinting it as
+`"tools": null` — so every fingerprint minted before issue #101 stays
+byte-identical, and the durable resume/replay cache (§5.7, §5.7.2) keeps
+serving those pre-existing entries without re-dispatching the child runner.
+
+`StubAgentRunner`'s generic echo fallback for the legacy `agent(agent_id,
+input)` form already surfaces a `tools` key placed in `input` verbatim (it
+echoes the whole `input` dict) — the allowlist is only a first-class,
+broker-validated option on the `agent(prompt, opts)` path.
+
+An explicit `"tools": []` is a valid, distinct allowlist — the most
+restrictive one, "no tools at all" — not an alias for omitting `tools`
+entirely. It normalizes to `()`, is forwarded to the child runner as `()`,
+and (per the table above) still feeds the fingerprint since it is not
+`None`, so it lands in its own cache entry rather than reusing the
+tools-less one.
+
+### 5.7.4 Pluggable store backend: SQLite adapter (issue #110)
 
 §5.7's `ScriptRunStore` was local-file only, acknowledged as the multi-host
 gap (§8's roadmap item 4, and the trust-boundary note above). This slice extracts the
