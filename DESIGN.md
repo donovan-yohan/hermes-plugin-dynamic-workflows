@@ -1314,6 +1314,119 @@ deterministic RPC calls, but general partial-run resume is still evolving"
 limitation already flag as open; this issue narrows and pins the *call-result*
 half of that story, it does not close the *side-effect* half.
 
+### 5.7.3 Pluggable store backend: SQLite adapter (issue #110)
+
+§5.7's `ScriptRunStore` was local-file only, acknowledged as the multi-host
+gap (§8's roadmap item 4, and the trust-boundary note above). This slice extracts the
+store contract that class already implied into an explicit structural
+interface, `ScriptRunStoreProtocol` (`script_store.py`, `@runtime_checkable
+Protocol` — plus `CallRecorderProtocol` / `TranscriptRecorderProtocol` for the
+two writer objects a store hands out), and ships a second backend against it:
+`SqliteScriptRunStore` (`script_store_sqlite.py`), stdlib `sqlite3` only —
+zero-dependency posture unchanged.
+
+**What moved into the interface.** Every method the rest of the package
+(`vm.py`, `kanban.py`, `kanban_notify.py`, `background.py`, the resume/replay
+path in `primitives.py`) actually calls on a store: run lifecycle
+(`next_run_id` / `begin` / `finish` / `load_run`), the metadata-only journal
+(`note_call` / `journal` / `journal_path`), the deterministic replay cache
+(`recorder` / `load_cache`), transcript artifacts (`transcript_recorder` /
+`transcript_refs`, issue #76), the suspended-run index (`suspended_runs`,
+issue #5), and the durable Kanban card state + event log
+(`record_kanban_card_state` / `load_kanban_card_state` / `kanban_waits` /
+`append_kanban_event` / `read_kanban_events` / `latest_kanban_resolution`,
+issue #5). `ScriptRunStore` (the file backend) is unchanged behaviorally and
+remains the default; `FileScriptRunStore` is an alias naming it explicitly now
+that a second backend exists. **Nothing selects a backend implicitly** — an
+embedder constructs whichever store class it wants (both accept the same
+`root` / `durability` / `async_flush_every` constructor keywords), and passes
+it to `run_workflow_script(..., store=...)` like today.
+
+**Store layout: one database per store root.** Where the file backend persists
+one directory per run (`<root>/<run_id>/{run.json,journal.jsonl,cache.jsonl}`),
+the SQLite backend persists **one file**, `<root>/store.sqlite3`, opened in
+`PRAGMA journal_mode=WAL` with `synchronous=FULL`. Six tables carry the same
+information the file backend's three per-run files did: `runs` (one row per
+run — `run.json`'s fields), `journal` (`run_id, seq, data_json` — one row per
+`journal.jsonl` line, `data_json` holding the exact same event dict the file
+backend would have written, so `store.journal(run_id)` returns
+byte-identical-in-content event dicts across both backends — see the
+`test_journal_event_payloads_match_the_file_backend_byte_for_byte` fixture),
+`cache_calls` / `cache_prompts` (the two halves of `cache.jsonl`'s call-id and
+fingerprint entries), and `kanban_card_state` / `kanban_events` (the
+`_kanban/<card_id>.json` latest-state file and `.events.jsonl` durable log).
+**One piece deliberately stays on the filesystem even on this backend:**
+per-subagent transcript artifacts (issue #76, `transcript_recorder` /
+`transcript_refs`) are large-ish, append-mostly, non-relational blobs, so this
+adapter reuses the file backend's `TranscriptRecorder` unmodified, writing to
+`<root>/<run_id>/transcripts/` exactly as before. `journal_path(run_id)`
+therefore returns the shared database file (not a per-run file, since there
+isn't one) — an operator-facing pointer to *where the data lives*, honestly
+different in shape from the file backend's per-run pointer but present and
+real on disk either way.
+
+**Schema versioning and the migration story.** `PRAGMA user_version` stamps
+the database's schema generation (`SQLITE_STORE_SCHEMA_VERSION`, starting at
+1) — independent of `SCRIPT_SCHEMA_VERSION`, which still separately gates the
+shape of an individual `runs` row (checked per-load, exactly like the file
+backend checks per-`run.json`). A fresh (empty) database is initialized and
+stamped on first open. Opening a database stamped with a *different, non-zero*
+version fails closed at construction time with a typed
+`CorruptScriptRunError` (`reason="schema_version"`) — the store-wide analogue
+of `load_run`'s per-record check, just performed once instead of on every
+read, since SQLite's schema is a property of the whole database rather than
+of one row. There is no schema generation 2 yet; when one ships, the expected
+shape (documented here so it does not have to be rediscovered) is: bump
+`SQLITE_STORE_SCHEMA_VERSION`, add an `ALTER TABLE`/rebuild migration keyed off
+the *stored* `user_version` read at open time (never assume "0 or current" —
+a real migration path branches on every version between the stored one and
+current), and keep the migration forward-only and additive where possible so
+a downgrade never gets attempted implicitly. Until then, an incompatible
+`user_version` is refused rather than guessed at, matching this store's
+existing fail-closed posture toward every other form of stale/corrupt state.
+
+**Durability modes onto SQL transaction boundaries (issue #108).** The
+`"exit" | "async" | "sync"` knob (§5.7.1) governs the same thing on this
+backend — only the `journal` table's writes — via explicit transaction
+boundaries instead of buffered file lines:
+
+| Mode | SQL behavior |
+| --- | --- |
+| `sync` (default) | Each journal row is inserted inside its own `BEGIN`/`COMMIT` before the call returns — immediately visible to any other connection/query, matching `journal.jsonl`'s per-event fsync. |
+| `async` | Journal rows are buffered in memory (never written to the table) and committed together — one `BEGIN` + `executemany INSERT` + `COMMIT` — once `async_flush_every` rows have accumulated (the same deterministic *count* trigger as the file backend, never a wall-clock timer). |
+| `exit` | Journal rows are buffered in memory and only committed at the run's terminal `finish()`. |
+
+Exactly as in the file backend, `run.json`'s role (the `runs` table) and the
+replay cache (`cache_calls` / `cache_prompts`) and the Kanban card
+state/event log are **always** committed immediately, in every durability
+mode — those tables' writers never buffer. And exactly as in the file
+backend, `finish()` always force-commits any buffered journal rows before
+returning, so suspend/succeed/fail/stop/pause all get the same durability
+guarantee (`tests/test_script_store_sqlite.py`'s
+`test_finish_force_commits_every_terminal_status_in_exit_and_async_modes`
+pins this, the SQLite analogue of §5.7.1's file-backend fixture).
+
+**Test coverage.** `tests/test_script_store.py` and
+`tests/test_pending_writes_resume_contract.py` parametrize their
+API-surface-only tests (the ones that only call store methods, never reach
+past the store to read/tamper with its on-disk representation directly) over
+a `backend` fixture covering both `ScriptRunStore` and `SqliteScriptRunStore`.
+Tests that simulate corruption by editing a JSONL/JSON file's bytes directly
+stay file-backend-only — a SQLite database has no "edit one line" equivalent
+— and `tests/test_script_store_sqlite.py` supplies the SQLite-native
+counterparts (raw `UPDATE`s against the store's own tables) for the same
+failure classes, plus the schema/WAL/versioning/transaction-boundary tests
+above and end-to-end replay/pending-writes/suspend-resume fixtures re-run
+directly against the SQLite backend. This is a deliberate scope boundary
+(documented rather than silently narrowed): full parametrization of every
+store-touching test module across the codebase (the Kanban suspend/resume and
+durable-resume suites, in particular) was judged too invasive for one slice,
+since several of *those* fixtures also reach past the store's API for
+timing/tampering assertions; the SQLite backend's behavioral parity with the
+file backend on those paths is established by the shared
+`ScriptRunStoreProtocol` contract plus the dedicated end-to-end fixtures this
+slice adds, not by re-running those suites' internals verbatim.
+
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
 `kanban.py` upgrades `kanban_agent` from a synchronous stub call into a

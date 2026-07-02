@@ -15,11 +15,26 @@ Covered:
   stale ``schema_version`` raise typed errors and never corrupt parent state.
 
 All effects route through deterministic runners, so the suite is reproducible.
+
+**Backend parametrization (issue #110).** Tests that only exercise the store
+through its public :class:`~hermes_workflows.script_store.ScriptRunStoreProtocol`
+surface (``begin``/``finish``/``load_run``/``load_cache``/``journal``/...) are
+parametrized over ``STORE_BACKENDS`` via the ``backend`` fixture, so they run
+against both the file backend and :class:`~hermes_workflows.script_store_sqlite.
+SqliteScriptRunStore`. Tests that simulate corruption by reaching *past* the
+store's API to tamper with its on-disk representation directly (writing bytes
+into ``run.json``/``cache.jsonl``) are inherently file-backend-specific — a
+SQLite database has no equivalent "edit one JSONL line" shape — and stay
+unparametrized; :mod:`tests.test_script_store_sqlite` covers the same failure
+classes (missing/corrupt/stale-schema) via SQLite-native tampering (raw SQL
+against the store's own database) instead.
 """
 
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
 
 from hermes_workflows import run_workflow_script
 from hermes_workflows.errors import CorruptScriptRunError, ScriptRunNotFound
@@ -33,6 +48,17 @@ from hermes_workflows.script_store import (
     replay_args_hash,
     script_run_id,
 )
+from hermes_workflows.script_store_sqlite import SqliteScriptRunStore
+
+# Backend registry for parametrized tests (issue #110): every test that takes
+# the ``backend`` fixture is run once per entry here.
+STORE_BACKENDS = {"file": ScriptRunStore, "sqlite": SqliteScriptRunStore}
+
+
+@pytest.fixture(params=sorted(STORE_BACKENDS))
+def backend(request):
+    """The store class under test for this parametrized run."""
+    return STORE_BACKENDS[request.param]
 
 META = 'meta = {"name": "demo", "description": "d"}\n'
 PHASE_META = (
@@ -133,9 +159,9 @@ def test_run_persists_metadata_only_journal_with_stable_ids():
         assert "do-not-persist" not in (run_dir / "journal.jsonl").read_text(encoding="utf-8")
 
 
-def test_load_run_returns_terminal_metadata():
+def test_load_run_returns_terminal_metadata(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         res = run_workflow_script(FULL_SCRIPT, args={"who": "world"}, store=store, run_id="run_b")
         assert res.ok, res.error
 
@@ -164,9 +190,9 @@ def test_script_run_snapshot_persists_declared_phase_metadata():
         assert phase_call["phase_title"] == "Plan"
 
 
-def test_script_run_snapshot_persists_legacy_string_phase_metadata():
+def test_script_run_snapshot_persists_legacy_string_phase_metadata(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         script = LEGACY_PHASE_META + 'phase("Plan")\nreturn {"ok": True}\n'
         res = run_workflow_script(script, store=store, run_id="run_legacy_phases")
         assert res.ok, res.error
@@ -177,9 +203,9 @@ def test_script_run_snapshot_persists_legacy_string_phase_metadata():
         assert loaded.phases == [{"title": "Plan"}, {"title": "Build"}]
 
 
-def test_validate_false_preserves_valid_phase_metadata_on_static_error():
+def test_validate_false_preserves_valid_phase_metadata_on_static_error(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         script = LEGACY_PHASE_META + "import os\n"
         res = run_workflow_script(script, store=store, run_id="run_invalid_with_meta", validate=False)
         assert not res.ok
@@ -189,9 +215,9 @@ def test_validate_false_preserves_valid_phase_metadata_on_static_error():
         assert loaded.phases == [{"title": "Plan"}, {"title": "Build"}]
 
 
-def test_minted_run_id_is_used_when_omitted():
+def test_minted_run_id_is_used_when_omitted(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         res = run_workflow_script(META + 'return {"x": 1}\n', store=store)
         assert res.run_id and res.run_id.startswith("wfs_")
         assert store.load_run(res.run_id).status == "succeeded"
@@ -201,9 +227,9 @@ def test_minted_run_id_is_used_when_omitted():
 # Replay: hit (no re-dispatch)
 # --------------------------------------------------------------------------- #
 
-def test_replay_serves_deterministic_calls_without_invoking_runner():
+def test_replay_serves_deterministic_calls_without_invoking_runner(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         # Record with the deterministic default stub: every call is cached.
         rec = run_workflow_script(FULL_SCRIPT, args={"who": "world"}, store=store, run_id="src")
         assert rec.ok, rec.error
@@ -233,9 +259,9 @@ def test_replay_serves_deterministic_calls_without_invoking_runner():
 # Replay: miss -> rerun live (non-deterministic source runner)
 # --------------------------------------------------------------------------- #
 
-def test_replay_reruns_calls_that_were_not_cached():
+def test_replay_reruns_calls_that_were_not_cached(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         script = META + 'r = await agent("hermes.echo", {"i": 1})\nlog("done")\nreturn {"r": r}\n'
 
         # Record with an explicitly non-deterministic runner: agent output is NOT
@@ -343,9 +369,9 @@ def test_finish_tolerates_corrupt_run_json_without_escaping():
 # Typed load failures (fail closed, no parent corruption)
 # --------------------------------------------------------------------------- #
 
-def test_missing_run_raises_typed_not_found():
+def test_missing_run_raises_typed_not_found(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         try:
             store.load_cache("nope")
         except ScriptRunNotFound:
@@ -471,9 +497,9 @@ def test_replay_from_requires_a_store():
     raise AssertionError("expected ValueError when replay_from has no store")
 
 
-def test_duplicate_run_id_is_rejected():
+def test_duplicate_run_id_is_rejected(backend):
     with TemporaryDirectory() as tmp:
-        store = ScriptRunStore(Path(tmp) / "runs")
+        store = backend(Path(tmp) / "runs")
         run_workflow_script(META + 'return {}\n', store=store, run_id="dup")
         try:
             run_workflow_script(META + 'return {}\n', store=store, run_id="dup")
@@ -483,10 +509,10 @@ def test_duplicate_run_id_is_rejected():
         raise AssertionError("expected ValueError on duplicate run_id")
 
 
-def test_unsafe_run_id_is_rejected_without_writing():
+def test_unsafe_run_id_is_rejected_without_writing(backend):
     with TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        store = ScriptRunStore(tmp_path / "runs")
+        store = backend(tmp_path / "runs")
         try:
             run_workflow_script(META + 'return {}\n', store=store, run_id="../escape")
         except ValueError as exc:
