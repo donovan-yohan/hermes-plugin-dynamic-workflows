@@ -551,6 +551,40 @@ def test_journal_event_payloads_match_the_file_backend_byte_for_byte():
                 assert shaped == baseline
 
 
+def test_dropped_context_keys_journal_note_matches_the_file_backend():
+    """Issue #102 quarantine note round-trips identically on both backends.
+
+    ``note_call``'s explicit per-backend key whitelist (see both stores'
+    ``note_call``) must include ``dropped_context_keys`` or the SQLite backend
+    would silently drop the metadata-only quarantine note the file backend
+    records. Runs a prompt-agent call whose ``context`` only partially passes
+    the runner's declared allowlist through both backends and asserts the
+    ``agent_started`` event's ``dropped_context_keys`` matches.
+    """
+
+    class _SpyChildRunner:
+        child_visible_context_keys = frozenset({"pr"})
+
+        def __call__(self, request):
+            return {"answer": "ok"}
+
+    script = META + (
+        'return await agent("summarize", {"context": {"pr": 70, "secret": "leak"}})\n'
+    )
+    seen = None
+    for store_cls in (ScriptRunStore, SqliteScriptRunStore):
+        with TemporaryDirectory() as tmp:
+            store = store_cls(Path(tmp) / "runs")
+            res = run_workflow_script(script, store=store, run_id="r", child_agent_runner=_SpyChildRunner())
+            assert res.ok, res.error
+            started = next(e for e in store.journal("r") if e["type"] == "agent_started")
+            dropped = started["dropped_context_keys"]
+            if seen is None:
+                seen = dropped
+            else:
+                assert dropped == seen == ["secret"]
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end resume/replay/suspend parity on SQLite
 # --------------------------------------------------------------------------- #

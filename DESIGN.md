@@ -843,6 +843,13 @@ In production this is the Hermes fan-out wiring. In the skeleton it defaults to
 `StubAgentRunner`, a deterministic stub. Because every effect funnels through this
 one injected callable, the trust boundary is small, auditable, and easy to mock.
 
+The prompt-shaped sibling boundary, `ChildAgentRunner` (`agent(prompt, opts)`,
+§5.7.3), carries the same isolation posture one step further: the injected
+runner may declare a `child_visible_context_keys` allowlist naming exactly
+which `ChildAgentRequest.context` keys it may see, enforced parent-side before
+dispatch and defaulting to empty (fail-closed) when undeclared — see §5.7.5
+for the full host-declared child-visible-context quarantine contract.
+
 ---
 
 ## 4. Run stores, task adapters, and notification boundaries
@@ -1487,6 +1494,137 @@ timing/tampering assertions; the SQLite backend's behavioral parity with the
 file backend on those paths is established by the shared
 `ScriptRunStoreProtocol` contract plus the dedicated end-to-end fixtures this
 slice adds, not by re-running those suites' internals verbatim.
+
+### 5.7.5 Host-declared child-visible-context quarantine (issue #102)
+
+`ChildAgentRequest.context` (§5.7.3) is a free-form dict the script fully
+controls — it is exactly the kind of parent-scoped payload the "single effect
+boundary" (§3.4) is supposed to constrain, but historically it crossed the
+`ChildAgentRunner` boundary unfiltered: whatever the script's `context=`
+option contained, the injected runner received verbatim. That is the one gap
+in an otherwise verified allowlist-only posture — "The subprocess guest never
+receives parent chat history or credentials" (`agents.py`'s
+`ChildAgentRequest` docstring) is a claim about the *subprocess*/parent RPC
+boundary, but said nothing about what a live runner (issue #97) is allowed to
+forward into a *further* child call once `context` reaches it.
+
+**The contract, inverted from deepagents.** deepagents' `private_state_keys`
+is a *denylist* — everything not explicitly hidden flows through by default.
+This project rejects that shape everywhere else (unknown agent ids, unknown
+`opts` keys, unresolved capabilities all fail closed), so the fix here is the
+inverse: a `ChildAgentRunner` may declare a
+`child_visible_context_keys: frozenset[str]` attribute naming exactly the
+`context` keys it is allowed to see. This is *not* a formal `ChildAgentRunner`
+Protocol member (adding one would force every existing runner, including
+every test double already in this codebase, to declare it just to keep
+matching the Protocol's shape) — it is resolved via `getattr` with a
+fail-closed default, `agents.child_visible_context_keys(runner)`:
+
+```python
+def child_visible_context_keys(runner: Any) -> frozenset[str]:
+    declared = getattr(runner, "child_visible_context_keys", None)
+    if declared is None or isinstance(declared, (str, bytes)):
+        # A bare string declaration would iterate char-wise into a set of
+        # single-character "keys" -- fail closed like undeclared instead.
+        return frozenset()
+    try:
+        return frozenset(key for key in declared if isinstance(key, str))
+    except TypeError:
+        return frozenset()
+```
+
+Undeclared → empty allowlist → **no** `context` key reaches that runner. A
+declared value that is not an iterable of strings is treated identically to
+"undeclared" rather than raising — the parent never trusts the runner's
+*shape* any more than its intent, so a malformed declaration fails closed
+instead of crashing the run.
+
+**Enforcement is parent-side, in `vm.py`, and never trusts the runner.**
+`agents.filter_child_visible_context(runner, context)` — called from
+`CapabilityBroker._handle_prompt_agent`, immediately after the child runner is
+confirmed configured and before the request is dispatched — returns the
+filtered `dict` plus the sorted tuple of *dropped key names*. The broker
+rebuilds the `ChildAgentRequest` handed to
+`_invoke_prompt_agent_with_schema_retry` with the filtered `context`
+(`dataclasses.replace(request, context=filtered_context)`), so every
+subsequent dispatch on that call — including every schema-retry attempt
+(§5.7.3) — carries only the allowed keys. A runner cannot widen its own
+visibility by lying about what it received; the filtering happens before the
+runner is ever invoked, and the runner's return value is never consulted to
+decide what it "should" have seen.
+
+**Schema-retry metadata is layered on top of the filtered context, not
+subject to it.** `_request_with_schema_retry_context` adds a
+`schema_validation_error` key (attempt/max_retries/code/message) to the
+*already-filtered* base context on each retry attempt. That key is
+broker-synthesized from the child's own prior (already-seen-by-that-child)
+invalid output and the schema-mismatch taxonomy — it carries no parent-scoped
+information the quarantine is meant to protect — so it is deliberately exempt
+from the allowlist rather than requiring every runner to additionally declare
+`"schema_validation_error"` just to keep the existing retry mechanism working.
+
+**Journaled: dropped key *names*, never values.** When filtering actually
+narrows the script-supplied context, the `agent_started` journal event gains a
+`dropped_context_keys` field (a list of the dropped key names, sorted) —
+omitted entirely when nothing was dropped, matching the sparse-field
+convention `has_value`/`cache` already use on this event. Both store backends'
+`note_call` (§5.7, §5.7.4) explicitly whitelist which event keys are
+persisted; `dropped_context_keys` is in that whitelist on both, and
+`tests/test_script_store_sqlite.py::test_dropped_context_keys_journal_note_matches_the_file_backend`
+pins that the note round-trips identically on the SQLite backend. The note is
+metadata-only by construction — it is built from `dict.keys()`, so a dropped
+value can never leak into it even by accident.
+
+**Fingerprint stays pre-filter (design decision, not an oversight).** The
+`v2:` semantic fingerprint (`_prompt_agent_cache_identity`, §5.7) is always
+minted over the **pre-filter, script-supplied** `context` — every call site
+that computes it (`_maybe_prompt_cache_hit`, `_call_event`, `_persist_success`,
+and the fingerprint computed in `_handle_prompt_agent` itself, before the
+filtered request is built) constructs its `ChildAgentRequest` straight from
+the raw RPC params, never from the runner-narrowed copy. Two considerations
+drove this over fingerprinting "what the child actually saw":
+
+- **Cache/replay identity must not depend on which runner happens to be
+  configured.** `_maybe_prompt_cache_hit` can serve a fingerprint purely from
+  `self._replay`/`self._prompt_results` with no live runner at all (a fully
+  cached/replayed run never touches `self._child_runner`). A runner's declared
+  allowlist is a property of *that process's* wiring, not of the call's
+  semantic identity — post-filter fingerprinting would mean swapping in a
+  runner with a narrower (or wider) allowlist silently mints a different
+  fingerprint for an otherwise-identical `agent(prompt, opts)` call, breaking
+  resume/replay across a runner change that has nothing to do with what the
+  script asked for.
+- **It keeps every pre-#102 fingerprint byte-identical, unconditionally** —
+  not only for calls whose context happens to pass a given runner's allowlist
+  entirely. A post-filter fingerprint *would* have matched the pre-#102 value
+  for a fully-passing call (filtered context equals the original in that
+  case), satisfying the narrower version of this guarantee — but only for
+  that runner's particular allowlist, and only until an operator changes it.
+  Fingerprinting the pre-filter context sidesteps that fragility entirely: the
+  guarantee holds for every call, against every runner configuration, forever
+  — exactly like the `tools`-omitted case (§5.7.3) already guarantees for
+  issue #101.
+
+`tests/test_prompt_agent.py`'s
+`test_prompt_agent_context_quarantine_fingerprint_is_pre_filter_and_runner_independent`
+and `test_prompt_agent_context_quarantine_full_pass_through_fingerprint_matches_pre_102_baseline`
+pin both halves of this directly: two runners with disjoint declared
+allowlists dispatching the identical call mint the identical fingerprint, and
+a call whose context fully passes a runner's allowlist still mints exactly the
+fingerprint a pre-#102 build would have computed for it.
+
+**What did *not* need a fail-closed default: the bundled runner and existing
+test doubles.** `StubAgentRunner` implements `AgentRunner` (`agent(agent_id,
+input)`), not `ChildAgentRunner` — it never receives a `ChildAgentRequest` and
+so has no `child_visible_context_keys` to declare; the legacy `agent(agent_id,
+input)` path's `context` (when present) is ordinary `input` data passed
+through the unrelated capability/agent-id contract (§5.7.3's `tools`-echo
+note), not the quarantined `ChildAgentRequest.context`. The `ChildAgentRunner`
+test doubles across the suite that assert on `request.context` (in
+`tests/test_prompt_agent.py` and the loop-until-dry parity fixture,
+`tests/test_loop_until_dry_fixture.py`) were each given the minimal declared
+allowlist their existing assertions require — the fail-closed default applies
+uniformly; nothing is grandfathered in.
 
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
