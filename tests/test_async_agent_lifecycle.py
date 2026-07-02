@@ -12,7 +12,7 @@ later instead of holding an await open. Covered here:
   of ``test_vm_subprocess.py``'s broker unit tests;
 * unconditional replay-from-cache for a completed handle, even against a runner
   that would raise if actually dispatched -- the documented cut leaves durable
-  suspend of an *unresolved* handle at script end to a follow-up (DESIGN.md §5.14).
+  suspend of an *unresolved* handle at script end to a follow-up (DESIGN.md §5.15).
 
 Stdlib only; all effects route through the deterministic ``StubAsyncAgentRunner``
 except where a fake runner is needed to force a specific broker path.
