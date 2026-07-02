@@ -379,6 +379,10 @@ class CapabilityBroker:
         # script_store.py for why that is safe for a fully-replayed prefix and
         # what it costs for a call live-dispatched past that prefix.
         self._async_agents: dict[str, dict[str, Any]] = {}
+        # Handles whose replay-served terminal result already re-applied its
+        # recorded token spend (issue #112 / Copilot review PR #131) -- keeps
+        # the once-per-handle credit idempotent across multiple cached checks.
+        self._replay_async_credited: set[str] = set()
         # Interactive approval decisions (issue #111): when a ``decide_call``
         # "edit" decision governs a capability call, the operator-modified
         # arguments — not the script's original ones — must feed the replay
@@ -973,6 +977,26 @@ class CapabilityBroker:
                 usage = _non_negative_token_usage(entry.value)
                 if usage is not None:
                     self._tokens += usage
+            elif (
+                entry.ok
+                and method in ("agent_check", "agent_cancel")
+                and isinstance(entry.value, dict)
+                and entry.value.get("state") == "done"
+                and isinstance(entry.value.get("result"), dict)
+            ):
+                # Mirror _apply_async_status's once-per-handle token credit for a
+                # replay-served done result, so token_budget-gated control flow
+                # reproduces the recorded run instead of the async path silently
+                # bypassing the budget on replay. The live path credits exactly
+                # once (terminal states are sticky); the handle set gives the
+                # same idempotency across the several cached checks that may all
+                # carry the terminal state.
+                handle = params.get("handle") if isinstance(params, dict) else None
+                if isinstance(handle, str) and handle not in self._replay_async_credited:
+                    self._replay_async_credited.add(handle)
+                    usage = _non_negative_token_usage(entry.value["result"])
+                    if usage is not None:
+                        self._tokens += usage
             self._replayed_calls += 1
             budget = self._budget_info()
         if not entry.ok:

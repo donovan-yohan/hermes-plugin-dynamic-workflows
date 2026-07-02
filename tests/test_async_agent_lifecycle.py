@@ -21,7 +21,6 @@ except where a fake runner is needed to force a specific broker path.
 from __future__ import annotations
 
 import threading
-import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -711,3 +710,54 @@ def test_resume_with_a_live_agent_check_past_a_cached_agent_start_denies_unknown
         )
         assert resumed.ok is False
         assert resumed.error["code"] == "unknown_handle"
+
+
+def test_replay_served_done_result_reapplies_token_spend_once():
+    # Copilot review (PR #131): a replay-served done agent_check must advance
+    # the broker's token accounting exactly like the recorded run did --
+    # otherwise token_budget enforcement diverges on replay and the async path
+    # bypasses the budget -- and a handle is credited exactly once even when
+    # several cached checks carry the terminal state.
+    from hermes_workflows.agents import StubAgentRunner
+    from hermes_workflows.script_store import ReplayCache, ReplayEntry
+    from hermes_workflows.vm import replay_args_hash
+
+    handle = "async-h1"
+    start_params = {"target": "hermes.echo", "input": {"x": 1}}
+    check_params = {"handle": handle}
+    done_value = {"state": "done", "result": {"value": 1, "_tokens": 1000}}
+    entries = {
+        1: ReplayEntry(
+            call_id=1, method="agent_start",
+            args_hash=replay_args_hash("agent_start", start_params),
+            value={"handle": handle, "state": "pending"},
+        ),
+        2: ReplayEntry(
+            call_id=2, method="agent_check",
+            args_hash=replay_args_hash("agent_check", check_params),
+            value=done_value,
+        ),
+        3: ReplayEntry(
+            call_id=3, method="agent_check",
+            args_hash=replay_args_hash("agent_check", check_params),
+            value=done_value,
+        ),
+    }
+    broker = CapabilityBroker(
+        StubAgentRunner(), VMLimits(),
+        replay=ReplayCache(entries, source_run_id="src"),
+        async_child_runner=_ExplodingAsyncRunner(),
+        deterministic_runner=True,
+    )
+
+    started = broker.handle(_call("agent_start", start_params, call_id=1))
+    assert started["ok"] is True
+    assert broker._tokens == 0
+
+    first = broker.handle(_call("agent_check", check_params, call_id=2))
+    assert first["ok"] is True and first["value"]["state"] == "done"
+    assert broker._tokens == 1000
+
+    second = broker.handle(_call("agent_check", check_params, call_id=3))
+    assert second["ok"] is True and second["value"]["state"] == "done"
+    assert broker._tokens == 1000  # credited once per handle, not per cached check
