@@ -198,10 +198,13 @@ def child_visible_context_keys(runner: Any) -> frozenset[str]:
     ``ChildAgentRequest.context`` key reaches it. A declared value that is not
     an iterable of strings is treated the same as "undeclared" -- the parent
     never trusts the runner's own honesty about the *shape* of its
-    declaration, only what it can verify.
+    declaration, only what it can verify. A ``str``/``bytes`` declaration is a
+    common typo for a single-element collection (e.g. ``"pr"`` meant to be
+    ``{"pr"}``) -- iterating it yields individual characters rather than the
+    intended key, so it is rejected outright rather than silently degraded.
     """
     declared = getattr(runner, "child_visible_context_keys", None)
-    if declared is None:
+    if declared is None or isinstance(declared, (str, bytes)):
         return frozenset()
     try:
         return frozenset(key for key in declared if isinstance(key, str))

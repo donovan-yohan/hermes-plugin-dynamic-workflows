@@ -1390,9 +1390,13 @@ class CapabilityBroker:
             event["has_value"] = has_value
         # Metadata-only quarantine note (issue #102): dropped key *names*, never
         # their values, and only emitted when the runner's declared allowlist
-        # actually narrowed the script-supplied context.
+        # actually narrowed the script-supplied context. Key names are
+        # script-chosen strings, same as label/phase, so they go through the
+        # same credential-marker redaction before entering the journal.
         if dropped_context_keys:
-            event["dropped_context_keys"] = list(dropped_context_keys)
+            event["dropped_context_keys"] = [
+                safe_capability_metadata_value(key) for key in dropped_context_keys
+            ]
         self._emit(event)
 
     def _call_event(

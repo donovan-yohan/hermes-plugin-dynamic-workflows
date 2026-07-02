@@ -860,6 +860,34 @@ def test_prompt_agent_explicit_empty_allowlist_behaves_like_undeclared():
     assert runner.requests[0].context == {}
 
 
+def test_prompt_agent_str_declaration_behaves_like_undeclared_not_char_set():
+    # A bare string is the most plausible typo for a single-element allowlist
+    # (e.g. ``"pr"`` meant to be ``{"pr"}``). Python iterates a str character
+    # by character, so an unguarded ``frozenset(declared)`` would silently
+    # yield frozenset({"p", "r"}) -- dropping the intended key while letting
+    # any single-character context key pass through. Must fail closed instead.
+    runner = SpyChildRunner("pr")
+    script = META + (
+        'return await agent("summarize", {"context": {"pr": 70, "p": "leak"}})\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
+def test_prompt_agent_non_iterable_declaration_fails_closed_instead_of_crashing():
+    # A malformed declaration (e.g. an int) must not propagate a TypeError up
+    # through handle() as a runner_error -- it fails closed to an empty
+    # allowlist, per DESIGN.md Sec5.7.5.
+    runner = SpyChildRunner(42)
+    script = META + 'return await agent("summarize", {"context": {"pr": 70}})\n'
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
 def test_prompt_agent_context_quarantine_journals_dropped_key_names_not_values():
     runner = SpyChildRunner(frozenset({"pr"}))
     script = META + (
@@ -883,6 +911,33 @@ def test_prompt_agent_context_quarantine_journals_dropped_key_names_not_values()
         assert "leak-me-please" not in journal_text
         run_text = (Path(tmp) / "runs" / "quarantine_run" / "run.json").read_text(encoding="utf-8")
         assert "leak-me-please" not in run_text
+
+
+def test_prompt_agent_context_quarantine_redacts_credential_marker_in_dropped_key_name():
+    # Context *key names* are script-chosen strings, same class of input as
+    # label/phase; a dynamically built context whose key itself carries a
+    # credential marker must be redacted before it reaches the journal, not
+    # journaled verbatim.
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "context": {"pr": 70, "token=ghp_leaked_in_key_name": "x"},\n'
+        '})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script, store=store, run_id="quarantine_key_redact", child_agent_runner=runner
+        )
+        assert res.ok, res.error
+
+        journal = store.journal("quarantine_key_redact")
+        started = next(event for event in journal if event["type"] == "agent_started")
+        assert started["dropped_context_keys"] == [REDACTED]
+
+        journal_path = Path(tmp) / "runs" / "quarantine_key_redact" / "journal.jsonl"
+        journal_text = journal_path.read_text(encoding="utf-8")
+        assert "token=ghp_leaked_in_key_name" not in journal_text
 
 
 def test_prompt_agent_context_quarantine_no_journal_note_when_nothing_dropped():
