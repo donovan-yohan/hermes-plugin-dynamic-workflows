@@ -637,9 +637,15 @@ def decide_call(
     before a run has actually consumed the decision is a legitimate append-only
     audit trail, not a duplicate. :func:`latest_call_decision` resolves the
     *last* recorded decision for a given call id, which is the one an adapter
-    applies; once applied its outcome is durably journaled/cached by the
-    adapter, so a later correction here has no effect on an already-decided
-    call.
+    applies. A correction is inert only once its outcome lands in a run that
+    actually had a live ``CallRecorder`` — a *fresh* first run reaching the
+    call, which caches the applied decision's outcome. In the common
+    suspend -> decide -> resume flow, though, the resumed (``replay_from``)
+    run carries no recorder (a replay writes no cache of its own — see
+    ``run_workflow_script``), so nothing is cached there: the *last* decision
+    recorded here still governs every future replay of the root run, even one
+    that already appeared to succeed. A later correction is not inert in that
+    case — it retroactively rewrites what any subsequent replay observes.
     """
     if decision not in APPROVAL_DECISION_KINDS:
         raise ControlError(f"unknown approval decision: {decision!r}; expected one of {APPROVAL_DECISION_KINDS}")

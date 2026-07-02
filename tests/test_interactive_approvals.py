@@ -108,6 +108,7 @@ def _broker(
     policy=None,
     idempotency_root="run-1",
     active_run_id=None,
+    decision_run_ids=(),
     recorder=None,
     replay=None,
 ):
@@ -119,6 +120,7 @@ def _broker(
         control_store=control_store,
         idempotency_root=idempotency_root,
         active_run_id=active_run_id if active_run_id is not None else idempotency_root,
+        decision_run_ids=decision_run_ids,
         recorder=recorder,
         replay=replay,
     )
@@ -266,6 +268,79 @@ def test_decision_for_a_different_call_id_does_not_apply():
     ret = broker.handle(_cap_frame(1))
     assert ret["ok"] is False
     assert ret["error"]["code"] == "capability_approval_pending"
+
+
+def test_pending_call_decision_consults_every_replay_chain_generation():
+    # A chained resume: A suspends, resume B suspends again (still undecided),
+    # and the operator decides against B -- the run they actually watched
+    # suspend, not the logical root A. The next resume's broker is handed the
+    # whole chain (root-first) via ``decision_run_ids``.
+    calls: list[dict[str, Any]] = []
+    store = InMemoryControlStore()
+    decide_call(store, "B", "1", "approve")
+    broker = _broker(
+        _registry(calls),
+        control_store=store,
+        idempotency_root="A",
+        active_run_id="C",
+        decision_run_ids=("A", "B"),
+    )
+    ret = broker.handle(_cap_frame(1))
+    assert ret["ok"] is True, ret
+    assert calls == [{"path": "a.txt"}]
+
+
+def test_name_disallowed_capability_denies_instead_of_suspending():
+    # A capability the run policy's ``allowed_names`` forbids outright must
+    # never suspend awaiting an approval it could never be granted.
+    calls: list[dict[str, Any]] = []
+    store = InMemoryControlStore()
+    policy = _interactive_policy(allowed_names=("tools.other",))
+    broker = _broker(_registry(calls), control_store=store, policy=policy)
+    ret = broker.handle(_cap_frame(1))
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "capability_denied"
+    assert broker.should_suspend is False
+    assert calls == []
+
+
+def test_name_disallowed_capability_ignores_a_recorded_respond_decision():
+    # Even a pre-recorded ``respond`` decision must not smuggle a value back
+    # for a capability the host's allowlist forbids entirely -- the name
+    # check must run before any decision is consulted.
+    calls: list[dict[str, Any]] = []
+    store = InMemoryControlStore()
+    decide_call(store, "run-1", "1", "respond", value={"ok": True, "wrote": {"path": "smuggled"}})
+    policy = _interactive_policy(allowed_names=("tools.other",))
+    broker = _broker(_registry(calls), control_store=store, policy=policy)
+    ret = broker.handle(_cap_frame(1))
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "capability_denied"
+    assert calls == []
+
+
+def test_non_replayable_mutating_capability_denies_instead_of_suspending():
+    # A mutating capability that has not opted into replay safety would suspend
+    # into a dead end: every resume aborts at the pre-existing replay-unsafe
+    # guard before any decision is ever consulted (issue #5). Suspending
+    # forever would be worse than denying (DESIGN 5.14), so this must deny up
+    # front instead, exactly like the missing-control-store fast path.
+    calls: list[dict[str, Any]] = []
+    registry = CapabilityRegistry()
+    registry.register(
+        "tools.mutate",
+        lambda ctx: calls.append(dict(ctx["input"])) or {"ok": True},
+        side_effect_class="external_write",
+        replayable=False,
+        description="non-replayable mutating capability",
+    )
+    store = InMemoryControlStore()
+    broker = _broker(registry, control_store=store)
+    ret = broker.handle(_cap_frame(1, name="tools.mutate"))
+    assert ret["ok"] is False
+    assert ret["error"]["code"] == "capability_approval_required"
+    assert broker.should_suspend is False
+    assert calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +622,31 @@ def test_e2e_resume_suspends_again_while_still_undecided():
 
         decide_call(control_store, "A", "1", "approve")
         c = _run(store, control_store, calls, run_id="C", replay_from="A")
+        assert c.ok is True, c.error
+        assert calls == [{"path": "a.txt"}]
+
+
+def test_e2e_decision_against_the_resumed_generation_is_honored():
+    # workflow_control status reports each suspended generation's *own* run id
+    # (waits_from_suspended_run), so an operator naturally decides against the
+    # run they just watched suspend -- here B, a mid-chain generation, not the
+    # logical root A. That decision must still be found and applied on the
+    # next resume, not silently ignored forever.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        control_store = FileControlStore(Path(tmp) / "controls")
+        calls: list[dict[str, Any]] = []
+
+        a = _run(store, control_store, calls, run_id="A")
+        assert a.suspended is True
+
+        b = _run(store, control_store, calls, run_id="B", replay_from="A")
+        assert b.suspended is True
+        waits = waits_from_suspended_run(store.load_run("B"))
+        assert waits[0].run_id == "B"
+
+        decide_call(control_store, "B", "1", "approve")
+        c = _run(store, control_store, calls, run_id="C", replay_from="B")
         assert c.ok is True, c.error
         assert calls == [{"path": "a.txt"}]
 

@@ -265,6 +265,7 @@ class CapabilityBroker:
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
         active_run_id: Optional[str] = None,
+        decision_run_ids: tuple[str, ...] = (),
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
@@ -293,6 +294,13 @@ class CapabilityBroker:
         # intentionally keep the original run as idempotency_root for card/cache
         # convergence, but pause/stop/task_stop must read the fresh replay run id.
         self._active_run_id = active_run_id or idempotency_root
+        # Interactive approval decisions (issue #111) may be recorded against
+        # *any* generation of the replay chain — an operator decides against
+        # whichever run they observed suspended, not necessarily the root — so
+        # ``_pending_call_decision`` consults every id here. Defaults to just the
+        # logical root when the caller has not resolved a chain (a fresh run, or
+        # a single-generation resume where the root *is* the immediate source).
+        self._decision_run_ids = decision_run_ids if decision_run_ids else (idempotency_root,)
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
         self._control_store = control_store
@@ -1020,10 +1028,13 @@ class CapabilityBroker:
 
         Returns ``None`` whenever the caller should fall through to the existing
         :meth:`CapabilityRegistry.run` enforcement unchanged: the capability's
-        side effect class is not even allowed, is not approval-gated, is already
-        covered by a pre-provisioned ``approval_id`` (the non-interactive fast
-        path this policy has always supported), or the host has not opted into
-        ``CapabilityPolicy.interactive_approval`` with a ``control_store`` wired.
+        *name* is not on ``allowed_names``, its side effect class is not even
+        allowed, it is not approval-gated, it is already covered by a
+        pre-provisioned ``approval_id`` (the non-interactive fast path this
+        policy has always supported), it is a non-replayable capability with a
+        mutating side effect (see below), or the host has not opted into
+        ``CapabilityPolicy.interactive_approval`` with a ``control_store``
+        wired.
 
         When interactive approval *is* active and the call needs a decision,
         this returns the latest recorded ``decide_call`` row for ``call_id`` —
@@ -1034,10 +1045,26 @@ class CapabilityBroker:
         decision it applies deterministically.
         """
         policy = self._capability_policy
+        if policy.allowed_names is not None and capability.name not in policy.allowed_names:
+            # A name-disallowed capability must hit the existing deterministic
+            # ``capability_denied`` from ``_enforce_policy`` (mirrored here), not
+            # suspend awaiting an approval that could never be granted — and a
+            # ``respond`` decision must never smuggle a value back for a
+            # capability the host's allowlist forbids outright.
+            return None
         if capability.side_effect_class not in policy.allowed_side_effect_classes:
             return None  # not allowed at all; let the existing denial fire.
         if capability.side_effect_class not in policy.approval_required_classes:
             return None  # not approval-gated.
+        if capability.side_effect_class != "read_only" and not capability.replayable:
+            # A non-replayable mutating capability can suspend on a *fresh* run,
+            # but every resume aborts at the pre-existing replay-unsafe guard
+            # (``_handle_capability``, above) before a decision is ever consulted
+            # — even for reject/respond, which never re-dispatch. Suspending
+            # forever would be worse than denying (DESIGN 5.14), so treat it the
+            # same as the missing-control-store case: fall through to the
+            # existing fast-path ``capability_approval_required`` denial.
+            return None
         approval_id = params.get("approval_id")
         if isinstance(approval_id, str) and approval_id in policy.approved_approval_ids:
             return None  # pre-provisioned approval_id: the non-interactive fast path.
@@ -1054,19 +1081,28 @@ class CapabilityBroker:
         )
 
     def _pending_call_decision(self, call_id: Any) -> Optional[dict[str, Any]]:
-        """Look up a call's decision by the *logical* run id, not the per-generation one.
+        """Look up a call's decision across every generation of the replay chain.
 
         Unlike :meth:`_control_state` (pause/resume/stop/task_stop, which
-        deliberately read the fresh replay run id — see ``__init__``), an
-        operator decides against the run they observed suspended. A stable call
-        id reproduces at the same point on every replay of the same script/args,
-        so decisions must key on :attr:`_idempotency_root` (the ultimate,
-        replay-of-a-replay-resolved source run) exactly like the Kanban
-        idempotency key does, or a chained resume would never see the decision
-        an operator recorded against the original suspended run.
+        deliberately reads the fresh replay run id — see ``__init__``), an
+        operator decides against whichever generation they observed suspended —
+        :func:`~hermes_workflows.controls.waits_from_suspended_run` reports each
+        run's *own* run id, not the logical root, so a chained resume (A
+        suspends, resume B suspends again undecided, an operator decides
+        against B) must still find that decision. :attr:`_idempotency_root`
+        alone (the ultimate, replay-of-a-replay-resolved source run) is not
+        enough — it is always the *first* generation, A, never an intermediate
+        one like B. :attr:`_decision_run_ids` is the full chain (root first,
+        current generation's immediate source last; see
+        ``run_workflow_script``'s replay-root walk), so every generation an
+        operator could plausibly have decided against is consulted. A decision
+        recorded against a later generation in the chain (e.g. B) is honored
+        even though it is not the run the *next* resume degrades to.
         """
         assert self._control_store is not None
-        controls = self._control_store.list_for(self._idempotency_root)
+        controls: list[Any] = []
+        for run_id in self._decision_run_ids:
+            controls.extend(self._control_store.list_for(run_id))
         state = project_control_state(self._idempotency_root, controls)
         return latest_call_decision(state, str(call_id))
 
@@ -1818,6 +1854,7 @@ class WorkflowVM:
         kanban_backend: Optional[KanbanBackend] = None,
         idempotency_root: str = "",
         active_run_id: Optional[str] = None,
+        decision_run_ids: tuple[str, ...] = (),
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
@@ -1836,6 +1873,10 @@ class WorkflowVM:
         self._kanban_backend = kanban_backend
         self._idempotency_root = idempotency_root
         self._active_run_id = active_run_id or idempotency_root
+        # Every generation of the replay chain an interactive approval decision
+        # (issue #111) may have been recorded against; forwarded to the broker
+        # unchanged. See ``CapabilityBroker._decision_run_ids``.
+        self._decision_run_ids = decision_run_ids
         # Generic host-owned capability API wiring (issue #29): forwarded to the broker.
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy
@@ -1877,6 +1918,7 @@ class WorkflowVM:
             kanban_backend=self._kanban_backend,
             idempotency_root=self._idempotency_root,
             active_run_id=self._active_run_id,
+            decision_run_ids=self._decision_run_ids,
             capability_registry=self._capability_registry,
             capability_policy=self._capability_policy,
             control_store=self._control_store,
@@ -2465,6 +2507,11 @@ def run_script(
     replay_cache: Optional[ReplayCache] = None
     source_limits: Optional[dict[str, Any]] = None
     replay_idempotency_root: Optional[str] = None
+    # Every generation of the replay chain (root-first), so an interactive
+    # approval decision (issue #111) recorded against *any* suspended
+    # generation an operator actually observed — not only the logical root —
+    # is still found on the next resume. See ``_pending_call_decision``.
+    replay_chain_run_ids: tuple[str, ...] = ()
     if replay_from is not None:
         if store is None:
             raise ValueError("replay_from requires a store")
@@ -2488,6 +2535,7 @@ def run_script(
         # pre-pause deterministic call. Walk replay_of to the first non-replay
         # ancestor; degrade to the nearest resolvable run if the chain is broken.
         root_meta = source
+        chain = [source.run_id]  # source-to-root order; reversed below.
         visited = {source.run_id}
         while root_meta.replay_of is not None and root_meta.replay_of not in visited:
             visited.add(root_meta.replay_of)
@@ -2495,7 +2543,9 @@ def run_script(
                 root_meta = store.load_run(root_meta.replay_of)
             except ScriptRunStoreError:
                 break
+            chain.append(root_meta.run_id)
         replay_idempotency_root = root_meta.run_id
+        replay_chain_run_ids = tuple(reversed(chain))
         # Serve the cache from the root (the only run that actually executed and
         # recorded the deterministic calls). For a single-generation resume the
         # root *is* the source, so this is unchanged for the common case. Loaded up
@@ -2586,6 +2636,7 @@ def run_script(
         kanban_backend=kanban_backend,
         idempotency_root=idempotency_root,
         active_run_id=persist_run_id,
+        decision_run_ids=replay_chain_run_ids,
         capability_registry=capability_registry,
         capability_policy=capability_policy,
         control_store=control_store,
