@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from . import schema as _schema
 from . import sandbox as _sandbox
 from . import runtime as _runtime
-from .agents import AgentRunner, ChildAgentRunner, StubAgentRunner
+from .agent_type_registry import AgentTypeRegistry
+from .agents import AgentRunner, AsyncChildAgentRunner, ChildAgentRunner, StubAgentRunner
 from .background import BackgroundWorkflowRunManager
 from .capabilities import CapabilityPolicy, CapabilityRegistry
 from .catalog import FileWorkflowCatalog
@@ -58,6 +59,7 @@ def workflow(
     script_store: Optional[ScriptRunStore] = None,
     agent_runner: Optional[AgentRunner] = None,
     child_agent_runner: Optional[ChildAgentRunner] = None,
+    agent_type_registry: Optional[AgentTypeRegistry] = None,
     validate: bool = True,
     max_parallel: int = 8,
     include_steps: bool = True,
@@ -163,6 +165,7 @@ def workflow(
                 store=script_store,
                 agent_runner=agent_runner,
                 child_agent_runner=child_agent_runner,
+                agent_type_registry=agent_type_registry,
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
@@ -181,6 +184,7 @@ def workflow(
                 store=script_store,
                 agent_runner=agent_runner,
                 child_agent_runner=child_agent_runner,
+                agent_type_registry=agent_type_registry,
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
@@ -199,6 +203,7 @@ def workflow(
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
+            agent_type_registry=agent_type_registry,
             version=script_version,
             validate=validate,
             run_id=run_id,
@@ -245,6 +250,7 @@ def workflow(
                 script_version=script_version,
                 agent_runner=agent_runner,
                 child_agent_runner=child_agent_runner,
+                agent_type_registry=agent_type_registry,
                 validate=validate,
                 run_id=run_id,
                 replay_from=resume_from_run_id,
@@ -267,6 +273,7 @@ def workflow(
             store=script_store,
             agent_runner=agent_runner,
             child_agent_runner=child_agent_runner,
+            agent_type_registry=agent_type_registry,
             limits=VMLimits(max_parallel=max_parallel),
             version=script_version,
             validate=validate,
@@ -565,6 +572,8 @@ def workflow_run_script(
     store: Optional[ScriptRunStore] = None,
     agent_runner: Optional[AgentRunner] = None,
     child_agent_runner: Optional[ChildAgentRunner] = None,
+    async_child_runner: Optional[AsyncChildAgentRunner] = None,
+    agent_type_registry: Optional[AgentTypeRegistry] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -586,6 +595,8 @@ def workflow_run_script(
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
+        async_child_runner=async_child_runner,
+        agent_type_registry=agent_type_registry,
         limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,
@@ -617,6 +628,8 @@ def run_workflow_script(
     args: Any = None,
     agent_runner: Optional[AgentRunner] = None,
     child_agent_runner: Optional[ChildAgentRunner] = None,
+    async_child_runner: Optional[AsyncChildAgentRunner] = None,
+    agent_type_registry: Optional[AgentTypeRegistry] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -653,12 +666,27 @@ def run_workflow_script(
     run id and the stable call id, so a replay reattaches the same card instead of
     creating a duplicate. Without a backend, ``kanban_agent`` keeps its prior
     synchronous AgentRunner behaviour.
+
+    ``async_child_runner`` (issue #112) makes the script's ``agent_start`` /
+    ``agent_check`` / ``agent_cancel`` / ``agent_list`` globals available: the
+    non-blocking counterpart to ``agent()``, for starting background child-agent
+    runs the script polls later instead of awaiting inline. See
+    :func:`hermes_workflows.vm.run_script` for the replay contract and
+    DESIGN.md for the durable-suspend boundary this slice leaves as a follow-up.
+
+    ``agent_type_registry`` (issue #104) is the file-based registry the broker
+    resolves a script's ``agent(prompt, {"agentType": ...})`` calls (issue #92)
+    against -- explicit roots only, no implicit discovery. Omitted, the broker
+    still resolves the built-in ``general-purpose`` default for every bare
+    ``agent(prompt)`` call; any other ``agentType`` then denies as unknown.
     """
     return run_script(
         source,
         args=args,
         agent_runner=agent_runner,
         child_agent_runner=child_agent_runner,
+        async_child_runner=async_child_runner,
+        agent_type_registry=agent_type_registry,
         limits=_limits_with_max_parallel(limits, max_parallel),
         journal=journal,
         validate=validate,

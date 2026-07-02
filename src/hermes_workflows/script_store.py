@@ -51,7 +51,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from .errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
 from .registry import utc_now_iso
@@ -59,13 +59,19 @@ from .script_validator import normalize_meta_phases
 
 __all__ = [
     "SCRIPT_SCHEMA_VERSION",
+    "JournalDurability",
+    "JOURNAL_DURABILITY_MODES",
     "ScriptRunMeta",
     "ReplayEntry",
     "PromptReplayEntry",
     "ReplayCache",
+    "CallRecorderProtocol",
+    "TranscriptRecorderProtocol",
+    "ScriptRunStoreProtocol",
     "CallRecorder",
     "TranscriptRecorder",
     "ScriptRunStore",
+    "FileScriptRunStore",
     "canonical_hash",
     "script_sha256",
     "script_run_id",
@@ -95,6 +101,37 @@ _ALWAYS_REPLAYABLE = frozenset({"log", "phase"})
 # Methods that cross the AgentRunner boundary: replayable only when the runner
 # is declared deterministic for the run.
 _RUNNER_METHODS = frozenset({"agent", "kanban_agent"})
+# The async child-agent lifecycle globals (issue #112: ``agent_start`` /
+# ``agent_check`` / ``agent_cancel`` / ``agent_list``) are unconditionally
+# replayable -- like ``_ALWAYS_REPLAYABLE`` but for a different reason. Each
+# call's recorded value is a *snapshot at that call id* (the run's own current
+# handle/state at that exact point in its deterministic sequence), not a
+# fresh live read the way a plain ``agent``/``kanban_agent`` call is; serving
+# it from the cache is exactly what "resume without re-polling the async
+# runner" (and "cancel is replay-deterministic") mean. Unlike ``agent``/
+# ``kanban_agent`` this does **not** gate on ``deterministic_runner``: the
+# production case -- a real, non-deterministic host ``AsyncChildAgentRunner``
+# -- is precisely the one that most needs its completed handles to replay
+# from cache rather than re-dispatch against a runner with no memory of the
+# original token (see DESIGN.md's async-lifecycle section for the boundary
+# this leaves: a call made *after* the recorded prefix ends still re-dispatches
+# live and requires the handle to already be attached in this process).
+_ASYNC_LIFECYCLE_METHODS = frozenset({"agent_start", "agent_check", "agent_cancel", "agent_list"})
+
+# Run-journal (``journal.jsonl``) durability policy (issue #108). ``sync`` fsyncs
+# every event (today's behavior, and the default — zero change unless an
+# embedder opts in). ``async`` buffers events in memory and fsyncs them in one
+# batch every ``async_flush_every`` events (a deterministic *count* trigger —
+# never a wall-clock interval, per the module's no-wall-clock contract).
+# ``exit`` buffers every event and only reaches disk on the run's terminal
+# force-flush. Suspend/finish/abort always force-flush the buffer regardless of
+# mode (see :meth:`ScriptRunStore.finish`); only an actual process crash before
+# that point can lose buffered ``async``/``exit`` events. Never applies to
+# ``run.json`` (always fsynced) or the per-card kanban event log.
+JournalDurability = Literal["exit", "async", "sync"]
+JOURNAL_DURABILITY_MODES: frozenset[str] = frozenset({"exit", "async", "sync"})
+_DEFAULT_JOURNAL_DURABILITY: JournalDurability = "sync"
+_DEFAULT_ASYNC_FLUSH_EVERY = 8
 
 
 def canonical_hash(obj: Any) -> str:
@@ -144,11 +181,16 @@ def replay_args_hash(method: str, params: dict[str, Any]) -> str:
 def is_replayable(method: str, *, deterministic_runner: bool) -> bool:
     """Whether a call of ``method`` may be cached/served from the replay cache.
 
-    ``log`` / ``phase`` always (constant ``None`` result). ``agent`` /
-    ``kanban_agent`` only when ``deterministic_runner`` is true. ``workflow`` and
-    anything else are never replayable.
+    ``log`` / ``phase`` always (constant ``None`` result). The async lifecycle
+    globals (``agent_start`` / ``agent_check`` / ``agent_cancel`` /
+    ``agent_list``, issue #112) always too -- see
+    :data:`_ASYNC_LIFECYCLE_METHODS`. ``agent`` / ``kanban_agent`` only when
+    ``deterministic_runner`` is true. ``workflow`` and anything else are never
+    replayable.
     """
     if method in _ALWAYS_REPLAYABLE:
+        return True
+    if method in _ASYNC_LIFECYCLE_METHODS:
         return True
     if method in _RUNNER_METHODS:
         return deterministic_runner
@@ -172,11 +214,12 @@ def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
     Drops the free-text ``message`` (which a workflow script controls and could
     fill with input/output-derived data) and keeps the structural ``type`` /
-    ``code`` / ``line``, honoring the journal's metadata-only contract.
+    ``code`` / ``line`` / ``retryable`` (issue #103), honoring the journal's
+    metadata-only contract.
     """
     if not isinstance(error, dict):
         return error
-    return {k: error[k] for k in ("type", "code", "line") if k in error}
+    return {k: error[k] for k in ("type", "code", "line", "retryable") if k in error}
 
 
 def _fsync_dir(path: Path) -> None:
@@ -249,12 +292,26 @@ class ScriptRunMeta:
 
 @dataclass(frozen=True)
 class ReplayEntry:
-    """One cached deterministic call result, addressed by its stable call id."""
+    """One cached deterministic call outcome, addressed by its stable call id.
+
+    ``ok=True`` (the default, and the only shape written before issue #103) is a
+    successful result cached for replay. ``ok=False`` (issue #103) is a
+    *retryable* dispatch failure (``code="runner_error"``) that a script caught
+    and handled on the source run: recorded metadata-only (``code``/
+    ``retryable``, never a payload — ``value`` is unused) so replay reproduces
+    the identical :class:`~hermes_workflows.errors.CapabilityDenied` instead of
+    silently re-dispatching live against a runner that may now behave
+    differently, which would let the replayed run's outcome diverge from the
+    source run's for a failure the script had already observed and handled.
+    """
 
     call_id: int
     method: str
     args_hash: str
-    value: Any
+    value: Any = None
+    ok: bool = True
+    code: Optional[str] = None
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -322,6 +379,30 @@ class CallRecorder:
     def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
         line = json.dumps(
             {"call_id": call_id, "method": method, "args_hash": args_hash, "value": value},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def record_failure(self, call_id: Any, method: str, args_hash: str, code: str, retryable: bool) -> None:
+        """Append one cached *retryable* dispatch-failure outcome (issue #103).
+
+        Metadata-only — ``call_id``/``method``/``args_hash``/``code``/
+        ``retryable``, never a payload — so a caught-and-handled transient
+        runner failure replays to the identical classification instead of
+        silently re-dispatching live. Mirrors :meth:`record`'s durability
+        (append + fsync).
+        """
+        line = json.dumps(
+            {
+                "call_id": call_id, "method": method, "args_hash": args_hash,
+                "ok": False, "code": code, "retryable": retryable,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
             default=str,
@@ -572,6 +653,175 @@ class TranscriptRecorder:
         return self._dir / f"{agent_ref}.meta.json"
 
 
+@runtime_checkable
+class CallRecorderProtocol(Protocol):
+    """Contract for a run's append-only deterministic replay-cache writer.
+
+    :class:`CallRecorder` (file backend) and the SQLite adapter's recorder both
+    satisfy this structurally. Every method is durable the instant it returns
+    (cache writes are always immediately committed, independent of a store's
+    journal ``durability`` mode — see :class:`ScriptRunStoreProtocol`).
+    """
+
+    def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
+        """Persist one successful, replayable call outcome."""
+        ...
+
+    def record_failure(self, call_id: Any, method: str, args_hash: str, code: str, retryable: bool) -> None:
+        """Persist one cached *retryable* dispatch-failure outcome (issue #103)."""
+        ...
+
+    def record_prompt(self, fingerprint: str, method: str, args_hash: str, value: Any) -> None:
+        """Persist one completed prompt-agent result keyed by fingerprint."""
+        ...
+
+
+@runtime_checkable
+class TranscriptRecorderProtocol(Protocol):
+    """Contract for a run's per-subagent transcript artifact writer (issue #76)."""
+
+    def refs(self) -> dict[str, Any]:
+        """Return artifact refs/paths for every recorded subagent, without content."""
+        ...
+
+    def started(self, call_id: Any, method: str, params: dict[str, Any], *, started_at: str) -> str:
+        ...
+
+    def result(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        value: Any,
+        state: str = "succeeded",
+        event_name: str = "result",
+    ) -> str:
+        ...
+
+    def error(
+        self,
+        call_id: Any,
+        method: str,
+        params: dict[str, Any],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        error_code: Optional[str],
+    ) -> str:
+        ...
+
+    def cache_hit(self, call_id: Any, method: str, params: dict[str, Any], *, at: str, value: Any) -> str:
+        ...
+
+
+@runtime_checkable
+class ScriptRunStoreProtocol(Protocol):
+    """The durable persistence contract every ``ScriptRunStore`` backend implements.
+
+    Extracted (issue #110) from the file-backed implementation that used to be
+    the *only* backend, so a pluggable backend (e.g. the SQLite adapter in
+    :mod:`hermes_workflows.script_store_sqlite`) can be verified structurally
+    against the same surface the rest of the package (``vm.py``, ``kanban.py``,
+    ``background.py``, the resume/replay path) actually calls. Grouped by the
+    concern each method covers:
+
+    * **Run lifecycle** — ``next_run_id`` / ``begin`` / ``finish`` / ``load_run``.
+    * **Metadata-only journal** — ``note_call`` (append) / ``journal`` (iterate,
+      most-recent-``limit``) / ``journal_path`` (operator-facing pointer).
+    * **Deterministic replay cache** — ``recorder`` (returns a
+      :class:`CallRecorderProtocol`) / ``load_cache``.
+    * **Transcript artifacts** (issue #76) — ``transcript_recorder`` (returns a
+      :class:`TranscriptRecorderProtocol`) / ``transcript_refs``.
+    * **Suspended-run index** (issue #5) — ``suspended_runs``.
+    * **Durable Kanban card state + event log** (issue #5) —
+      ``record_kanban_card_state`` / ``load_kanban_card_state`` / ``kanban_waits``
+      / ``append_kanban_event`` / ``read_kanban_events`` / ``latest_kanban_resolution``.
+
+    A backend also exposes a ``root: Path`` attribute (the store's directory;
+    some backends, like SQLite, keep all relational state in one file under it)
+    and a constructor accepting ``root`` plus the issue #108 ``durability`` /
+    ``async_flush_every`` knobs. The constructor is not part of the structural
+    Protocol (``__init__`` isn't checked by ``isinstance``), but every backend
+    must accept the same keyword arguments so callers can swap backends by
+    changing only which class they construct.
+
+    Every load failure across every backend is a typed
+    :class:`~hermes_workflows.errors.ScriptRunStoreError` subclass
+    (:class:`~hermes_workflows.errors.ScriptRunNotFound` /
+    :class:`~hermes_workflows.errors.CorruptScriptRunError`) — never a bare
+    backend-specific exception (``OSError``, ``sqlite3.Error``, ...).
+    """
+
+    root: Path
+
+    def next_run_id(self, script: str, args: Any = None) -> str: ...
+
+    def begin(
+        self,
+        run_id: str,
+        *,
+        script: str,
+        args: Any,
+        limits: Optional[dict[str, Any]],
+        deterministic_runner: bool,
+        meta: Optional[dict[str, Any]] = None,
+        replay_of: Optional[str] = None,
+    ) -> "ScriptRunMeta": ...
+
+    def note_call(self, run_id: str, event: dict[str, Any]) -> None: ...
+
+    def recorder(self, run_id: str) -> CallRecorderProtocol: ...
+
+    def transcript_recorder(self, run_id: str) -> TranscriptRecorderProtocol: ...
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        meta: Optional[dict[str, Any]],
+        value: Any,
+        error: Optional[dict[str, Any]],
+    ) -> None: ...
+
+    def load_run(self, run_id: str) -> "ScriptRunMeta": ...
+
+    def load_cache(self, run_id: str) -> "ReplayCache": ...
+
+    def journal(self, run_id: str, *, limit: int = 200) -> list[dict[str, Any]]: ...
+
+    def journal_path(self, run_id: str) -> Path: ...
+
+    def transcript_refs(self, run_id: str) -> dict[str, Any]: ...
+
+    def suspended_runs(self) -> list["ScriptRunMeta"]: ...
+
+    def record_kanban_card_state(self, card_id: str, state: dict[str, Any]) -> None: ...
+
+    def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]: ...
+
+    def kanban_waits(self) -> list[dict[str, Any]]: ...
+
+    def append_kanban_event(
+        self,
+        card_id: str,
+        *,
+        status: str,
+        result: Optional[dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        profile: str = "",
+    ) -> dict[str, Any]: ...
+
+    def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]: ...
+
+    def latest_kanban_resolution(self, card_id: str) -> Optional[dict[str, Any]]: ...
+
+
 class ScriptRunStore:
     """Filesystem-backed durable store for subprocess workflow-script runs.
 
@@ -585,9 +835,38 @@ class ScriptRunStore:
     its subprocess) still has no filesystem authority. Concurrent writers within
     one process are serialised by a single lock. ``root`` defaults are chosen by
     the caller (e.g. ``$HERMES_HOME/dynamic-workflows/script-runs``).
+
+    ``durability`` (issue #108) governs only the ``journal.jsonl`` write policy
+    (never ``run.json``, which is always fsynced, and never the per-card kanban
+    event log): ``"sync"`` (default) fsyncs every event — today's behavior,
+    unchanged unless an embedder opts in. ``"async"`` buffers events in memory
+    and fsyncs them together every ``async_flush_every`` events (a deterministic
+    *count* trigger, never a wall-clock interval). ``"exit"`` buffers every
+    event and only reaches disk on the run's terminal force-flush. Regardless of
+    mode, :meth:`finish` (suspend, succeed, fail, stop, pause — every terminal
+    status) always force-flushes any buffered events before returning.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        durability: JournalDurability = _DEFAULT_JOURNAL_DURABILITY,
+        async_flush_every: int = _DEFAULT_ASYNC_FLUSH_EVERY,
+    ) -> None:
+        if durability not in JOURNAL_DURABILITY_MODES:
+            raise ValueError(
+                f"unsupported journal durability: {durability!r} (expected one of "
+                f"{sorted(JOURNAL_DURABILITY_MODES)})"
+            )
+        if not isinstance(async_flush_every, int) or isinstance(async_flush_every, bool) or async_flush_every < 1:
+            raise ValueError(f"async_flush_every must be a positive int, got {async_flush_every!r}")
+        self._durability: JournalDurability = durability
+        self._async_flush_every = async_flush_every
+        # Buffered, not-yet-fsynced journal lines per run id (``async``/``exit``
+        # modes only; always empty in ``sync`` mode). Only touched under
+        # ``self._lock``.
+        self._journal_buffer: dict[str, list[str]] = {}
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -665,7 +944,8 @@ class ScriptRunStore:
         for key in (
             "agent_id", "profile", "capability", "label", "phase", "phase_title", "parallel_index",
             "pipeline_item_index", "pipeline_stage_index",
-            "fingerprint", "error", "replayed", "cache", "has_value", "attempt", "max_retries",
+            "fingerprint", "error", "retryable", "replayed", "cache", "has_value", "attempt", "max_retries",
+            "dropped_context_keys",
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)
@@ -729,6 +1009,11 @@ class ScriptRunStore:
                 "done",
                 {"status": status, "has_value": value is not None, "error": _redact_error(error)},
             )
+            # Every terminal status (succeeded/failed/suspended/stopped/paused)
+            # force-flushes the journal regardless of durability mode (issue
+            # #108): a run that is about to go quiet must not leave events
+            # sitting unflushed in memory.
+            self._flush_journal_locked(run_id)
 
     # -- reads ------------------------------------------------------------
     def load_run(self, run_id: str) -> ScriptRunMeta:
@@ -796,11 +1081,37 @@ class ScriptRunStore:
                         raise CorruptScriptRunError(
                             run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
                         )
+                    # "ok" is absent on every line written before issue #103 (all of
+                    # which are successful results) and on every success line since,
+                    # so absence means True — a fail-closed reader would reject the
+                    # entire pre-existing on-disk format.
+                    ok = obj.get("ok", True)
+                    if not isinstance(ok, bool):
+                        raise CorruptScriptRunError(
+                            run_id, "corrupt_cache", f"cache.jsonl line {lineno}: ok must be a bool"
+                        )
+                    code: Optional[str] = None
+                    retryable = False
+                    if not ok:
+                        code = obj.get("code")
+                        retryable = obj.get("retryable", False)
+                        if not isinstance(code, str) or not code:
+                            raise CorruptScriptRunError(
+                                run_id, "corrupt_cache",
+                                f"cache.jsonl line {lineno}: failed entry requires a non-empty 'code'",
+                            )
+                        if not isinstance(retryable, bool):
+                            raise CorruptScriptRunError(
+                                run_id, "corrupt_cache", f"cache.jsonl line {lineno}: retryable must be a bool"
+                            )
                     entries[call_id] = ReplayEntry(
                         call_id=call_id,
                         method=method,
                         args_hash=args_hash,
                         value=obj.get("value"),
+                        ok=ok,
+                        code=code,
+                        retryable=retryable,
                     )
                     continue
                 fingerprint = obj.get("fingerprint")
@@ -1161,11 +1472,47 @@ class ScriptRunStore:
         _fsync_dir(run_dir)
 
     def _append_journal(self, run_id: str, event_type: str, data: dict[str, Any]) -> None:
+        """Append one journal event, applying the store's durability policy.
+
+        Called with ``self._lock`` already held by every caller (:meth:`begin`,
+        :meth:`note_call`, :meth:`finish`). ``sync`` (the default) is written and
+        fsynced immediately — byte-for-byte the store's original behavior.
+        ``async``/``exit`` instead buffer the serialized line in memory;
+        ``async`` additionally force-flushes every ``async_flush_every`` events
+        (a deterministic count trigger, never a wall-clock interval).
+        """
         event = {"ts": utc_now_iso(), "type": event_type, "run_id": run_id, **data}
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        if self._durability == "sync":
+            self._write_journal_lines(run_id, [line])
+            return
+        buffer = self._journal_buffer.setdefault(run_id, [])
+        buffer.append(line)
+        if self._durability == "async" and len(buffer) >= self._async_flush_every:
+            self._flush_journal_locked(run_id)
+
+    def _write_journal_lines(self, run_id: str, lines: list[str]) -> None:
+        """Append+fsync ``lines`` to ``run_id``'s journal in a single write."""
+        if not lines:
+            return
         with self._journal_path(run_id).open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            for line in lines:
+                f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+    def _flush_journal_locked(self, run_id: str) -> None:
+        """Force any buffered ``async``/``exit`` journal events to disk.
+
+        A no-op in ``sync`` mode (nothing is ever buffered) and a no-op if
+        nothing is pending. Requires ``self._lock`` already held. The buffer is
+        popped only after the write succeeds, so a transient disk failure during
+        a force-flush leaves the pending lines intact for a retried ``finish()``.
+        """
+        pending = self._journal_buffer.get(run_id)
+        if pending:
+            self._write_journal_lines(run_id, pending)
+            self._journal_buffer.pop(run_id, None)
 
     def _run_dir(self, run_id: str) -> Path:
         _require_safe_run_id(run_id)
@@ -1184,3 +1531,11 @@ class ScriptRunStore:
 # A journal sink the VM accepts is just ``Callable[[dict], None]``; the store's
 # ``note_call`` is adapted into one by :mod:`hermes_workflows.vm`.
 JournalSink = Callable[[dict[str, Any]], None]
+
+# ``ScriptRunStore`` is the file backend and remains the default/public name for
+# backward compatibility (every existing embedder constructs it directly). This
+# alias names it explicitly now that :mod:`hermes_workflows.script_store_sqlite`
+# adds a second backend satisfying the same :class:`ScriptRunStoreProtocol`
+# (issue #110) — pick the constructor for the backend you want; nothing selects
+# a backend implicitly, and the file backend's behavior is unchanged.
+FileScriptRunStore = ScriptRunStore

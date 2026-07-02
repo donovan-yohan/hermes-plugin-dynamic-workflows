@@ -14,7 +14,10 @@ no Hermes credentials. It:
    restricted ``__builtins__`` and only RPC-backed capability globals;
 5. routes every ``agent`` / ``kanban_agent`` / ``capability`` / ``log`` /
    ``phase`` / ``workflow`` call back to the parent broker and blocks for the
-   structured response;
+   structured response; ``agent_start`` / ``agent_check`` / ``agent_cancel`` /
+   ``agent_list`` (issue #112) are the non-blocking counterpart -- each still
+   round-trips to the parent, but ``agent_start`` returns immediately with a
+   handle instead of waiting for the background run to finish;
 6. reports the final return value (or the script's exception) in a ``done``
    frame and exits.
 
@@ -98,10 +101,20 @@ class CapabilityError(RuntimeError):
 
     Injected as a script global so a workflow may ``try/except CapabilityError``
     around brokered calls (e.g. to handle a budget/limit denial gracefully).
+
+    ``retryable`` (issue #103) mirrors the parent's classification of *this
+    specific call*: ``False`` for a contract violation (unknown agent id,
+    schema/budget/limit exhaustion, a replay drift) where re-issuing the same
+    call would fail identically, and ``True`` only when the parent's runner
+    itself raised while dispatching (``code="runner_error"``) — a transient
+    failure of one dispatch attempt a script may reasonably retry. Defaults to
+    ``False`` so every existing catch site remains correct without inspecting
+    the attribute.
     """
 
-    def __init__(self, message: str, code: Optional[str] = None) -> None:
+    def __init__(self, message: str, code: Optional[str] = None, retryable: bool = False) -> None:
         self.code = code
+        self.retryable = retryable
         super().__init__(message)
 
 
@@ -113,6 +126,7 @@ class PipelineStageError(RuntimeError):
         self.stage_index = stage_index
         self.cause_type = type(exc).__name__
         self.code = exc.code if isinstance(exc, CapabilityError) else None
+        self.retryable = exc.retryable if isinstance(exc, CapabilityError) else False
         super().__init__(
             f"pipeline item {item_index} stage {stage_index} failed: {type(exc).__name__}: {exc}"
         )
@@ -187,7 +201,11 @@ class _Connection:
         if frame.get("ok"):
             return frame.get("value")
         error = frame.get("error") or {}
-        raise CapabilityError(error.get("message", "capability denied"), code=error.get("code"))
+        raise CapabilityError(
+            error.get("message", "capability denied"),
+            code=error.get("code"),
+            retryable=bool(error.get("retryable", False)),
+        )
 
     async def acall(self, method: str, params: dict[str, Any]) -> Any:
         """Send one capability call without blocking sibling async tasks."""
@@ -229,7 +247,13 @@ class _Connection:
                 fut.set_result(frame.get("value"))
             else:
                 error = frame.get("error") or {}
-                fut.set_exception(CapabilityError(error.get("message", "capability denied"), code=error.get("code")))
+                fut.set_exception(
+                    CapabilityError(
+                        error.get("message", "capability denied"),
+                        code=error.get("code"),
+                        retryable=bool(error.get("retryable", False)),
+                    )
+                )
         self._reader_task = None
 
     def _fail_pending(self, exc: BaseException) -> None:
@@ -287,10 +311,12 @@ def _build_script_globals(
     async def agent(target: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                      phase: Optional[str] = None, schema: Optional[dict[str, Any]] = None,
                      model: Optional[str] = None, effort: Optional[str] = None,
-                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None) -> Any:
+                     isolation: Optional[str] = None, context: Optional[dict[str, Any]] = None,
+                     tools: Optional[Any] = None, agentType: Optional[str] = None) -> Any:
         explicit_opts = {
             "label": label, "phase": phase, "schema": schema, "model": model,
-            "effort": effort, "isolation": isolation, "context": context,
+            "effort": effort, "isolation": isolation, "context": context, "tools": tools,
+            "agentType": agentType,
         }
         legacy_agent_id = _looks_like_legacy_agent_id(target)
         opts_from_pos = input if isinstance(input, dict) and not legacy_agent_id else None
@@ -331,6 +357,33 @@ def _build_script_globals(
 
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
         return await conn.acall("workflow", _annotate_call({"name": name, "args": args}))
+
+    async def agent_start(target: str, input: Optional[dict[str, Any]] = None,
+                           opts: Optional[dict[str, Any]] = None) -> Any:
+        # Non-blocking counterpart to ``agent()`` (issue #112): the parent broker
+        # starts a background child-agent run through the injected
+        # AsyncChildAgentRunner and returns immediately with a deterministic
+        # handle -- it never waits for the run to finish. Poll it later with
+        # ``agent_check(handle)``.
+        params: dict[str, Any] = {"target": target, "input": input or {}, "opts": opts or {}}
+        return await conn.acall("agent_start", _annotate_call(params))
+
+    async def agent_check(handle: Any) -> Any:
+        # Non-blocking poll of a run started by ``agent_start``: returns
+        # {"state": "pending"} immediately, or the terminal shape once resolved.
+        # Polling a completed handle again (including after a durable replay)
+        # returns the same resolved state rather than re-dispatching.
+        return await conn.acall("agent_check", _annotate_call({"handle": handle}))
+
+    async def agent_cancel(handle: Any) -> Any:
+        # Request cancellation of a run started by ``agent_start``; returns the
+        # resulting (acknowledged) state. Idempotent once the handle is terminal.
+        return await conn.acall("agent_cancel", _annotate_call({"handle": handle}))
+
+    async def agent_list() -> Any:
+        # Every ``agent_start`` handle known to this run and its current state,
+        # in the deterministic order the handles were started.
+        return await conn.acall("agent_list", _annotate_call({}))
 
     async def capability(name: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                          approval_id: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
@@ -435,6 +488,10 @@ def _build_script_globals(
         "kanban_agent": kanban_agent,
         "capability": capability,
         "workflow": workflow,
+        "agent_start": agent_start,
+        "agent_check": agent_check,
+        "agent_cancel": agent_cancel,
+        "agent_list": agent_list,
         "log": log,
         "phase": phase,
         "parallel": parallel,
@@ -468,14 +525,17 @@ def _error_payload(exc: BaseException) -> dict[str, Any]:
     """Build a metadata-only error payload (no full traceback to the parent)."""
     line = _script_line(exc)
     payload: dict[str, Any] = {"type": type(exc).__name__, "message": str(exc)}
-    if isinstance(exc, CapabilityError) and exc.code:
-        payload["code"] = exc.code
+    if isinstance(exc, CapabilityError):
+        if exc.code:
+            payload["code"] = exc.code
+        payload["retryable"] = exc.retryable
     if isinstance(exc, PipelineStageError):
         payload["item_index"] = exc.item_index
         payload["stage_index"] = exc.stage_index
         payload["cause_type"] = exc.cause_type
         if exc.code:
             payload["code"] = exc.code
+        payload["retryable"] = exc.retryable
     if line is not None:
         payload["line"] = line
     return payload

@@ -16,6 +16,7 @@ from typing import Any
 
 from .models import Diagnostic
 from . import errors as err
+from . import schema_subset
 
 __all__ = [
     "SUPPORTED_VERSION",
@@ -286,8 +287,17 @@ def _validate_effect_input_contract(step: dict[str, Any], ptr: str, diags: list[
     if "input" in step and not isinstance(step["input"], (dict, str)):
         diags.append(_e(err.E_SCHEMA_STEP, "'input' must be an object or a $ref string", f"{ptr}/input"))
 
-    if "output_schema" in step and not isinstance(step["output_schema"], dict):
-        diags.append(_e(err.E_SCHEMA_STEP, "'output_schema' must be an object", f"{ptr}/output_schema"))
+    if "output_schema" in step:
+        output_schema = step["output_schema"]
+        if not isinstance(output_schema, dict):
+            diags.append(_e(err.E_SCHEMA_STEP, "'output_schema' must be an object", f"{ptr}/output_schema"))
+        else:
+            # Fail closed on an unsupported schema keyword/shape *here*, before
+            # the run ever starts (issue #107), rather than only discovering it
+            # when the runtime tries to validate a step's output against it.
+            schema_error = schema_subset.check_schema(output_schema)
+            if schema_error is not None:
+                diags.append(_e(err.E_SCHEMA_OUTPUT_SCHEMA, f"invalid 'output_schema': {schema_error}", f"{ptr}/output_schema"))
 
 
 def iter_agent_steps(steps: list[Any]):

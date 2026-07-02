@@ -447,13 +447,27 @@ shape explicit and durable.
 `waits_from_loop_status` turns a loop's `waiting_for_event` / `waiting_for_approval`
 state and its suspension event into a uniform `WaitSummary` (§1.5);
 `waits_from_kanban_states` does the same for a `ScriptRunStore`'s non-terminal
-Kanban card states (§5.8). Durable Kanban waiting markers created through the VM
-carry the logical run id from the `<logical_run_id>:<call_id>` idempotency key,
-and the store preserves that association across later state writes; for
-legacy/manual waits with no stored `run_id`, the plugin `status` path attaches
-them to the inspected run rather than silently dropping them. No new backend or
-store is introduced — the inspectors read plain dicts, so they compose with
-whatever a caller already has.
+Kanban card states (§5.8); `waits_from_suspended_run` (issue #111, §5.14) does
+the same for a run suspended on an undecided approval-gated capability call,
+reading the metadata-only pending-call detail off its terminal `error` field.
+Durable Kanban waiting markers created through the VM carry the logical run id
+from the `<logical_run_id>:<call_id>` idempotency key, and the store preserves
+that association across later state writes; for legacy/manual waits with no
+stored `run_id`, the plugin `status` path attaches them to the inspected run
+rather than silently dropping them. No new backend or store is introduced —
+the inspectors read plain dicts, so they compose with whatever a caller
+already has.
+
+**Interactive interrupt decisions (issue #111, §5.14).** `decide_call(store,
+run_id, call_id, decision, ...)` is a fourth targeted, `target_ref`-keyed
+control action alongside `task_stop`/`retry`: it records one of
+`approve`/`edit`/`reject`/`respond` against a pending approval-gated
+`capability()` call. `latest_call_decision(state, call_id)` resolves the *last*
+recorded decision for a call (an operator correction before it is consumed is
+legitimate, not a duplicate — the retry-lineage idempotency above does not
+apply here). §5.3's `CapabilityBroker` is the consumer; this module only
+records and projects the decision, exactly the "core decides intent, adapter
+enforces" split every other control verb here follows.
 
 **Compact projections, no JSON spelunking.** `inspect_run(...)` composes a single
 run's lifecycle status, control state, current phase, waits, child task refs,
@@ -777,6 +791,28 @@ Representative checks and codes:
 With `strict=True`, warnings are promoted to errors, so a strict caller rejects
 any definition that is not fully typed and policy-clean.
 
+**Known-agent resolution (`E_UNKNOWN_AGENT`).** `agent` steps are checked
+against `hermes_workflows.agents.is_known_agent`, which recognises exactly two
+sources: the fixed `KNOWN_AGENTS` roster (the ids the bundled examples/tests
+use, e.g. `hermes.greeter`, `hermes.github.pr_head`) and any id an embedding
+host has explicitly added via `register_known_agent(agent_id)`. There is no
+bare `hermes.*` wildcard fallback — a typo like `hermes.summarzier` fails
+`workflow_validate` with `E_UNKNOWN_AGENT` (error severity, not a warning) the
+same way any other unresolvable id does, instead of validating silently. This
+was previously a wildcard: any id starting with `hermes.` passed, which meant
+a typo'd agent id flowed all the way to the runner unnoticed — a quiet
+exception to the hard-rejection principle enforced everywhere else (unknown
+workflow capabilities, disallowed builtins, reserved `kanban.<profile>` runner
+ids). Error, not warning, was chosen for consistency with that existing
+behavior: every other "id the runtime cannot resolve" case in this table is
+already an error, so a demoted-to-warning `hermes.*` special case would just
+reintroduce a smaller version of the same silent-acceptance gap. Hosts that
+extend the roster at runtime call `register_known_agent` once per id at
+startup; registration is additive and process-lifetime (no unregister).
+`kanban.<profile>` ids remain excluded from ordinary `agent` steps regardless
+of registration — they are reserved for `kanban_agent` via `kanban_runner_id`
+and rejected up front by `is_kanban_runner_id`.
+
 ### 3.3 Allowed vs blocked
 
 **Allowed (skeleton):**
@@ -807,6 +843,13 @@ class AgentRunner(Protocol):
 In production this is the Hermes fan-out wiring. In the skeleton it defaults to
 `StubAgentRunner`, a deterministic stub. Because every effect funnels through this
 one injected callable, the trust boundary is small, auditable, and easy to mock.
+
+The prompt-shaped sibling boundary, `ChildAgentRunner` (`agent(prompt, opts)`,
+§5.7.3), carries the same isolation posture one step further: the injected
+runner may declare a `child_visible_context_keys` allowlist naming exactly
+which `ChildAgentRequest.context` keys it may see, enforced parent-side before
+dispatch and defaulting to empty (fail-closed) when undeclared — see §5.7.5
+for the full host-declared child-visible-context quarantine contract.
 
 ---
 
@@ -998,10 +1041,47 @@ A subprocess crash, a CPU-spin timeout (`VMLimits.max_runtime_s`), a protocol
 breach, or an exit-without-result is mapped to a failed `ScriptRunResult` —
 never an uncaught exception — so parent state is never corrupted. `VMLimits`
 (`max_rpc_calls` hard-abort backstop, soft per-`agent`/`kanban` caps,
-`token_budget`, `allow_nested_workflows`) is the first slice of the issue #11
-governance surface; launch-approval/session routing remain parent-owned future
-work. Journal events are metadata-only by default (method, call id, agent
-id/profile, ok) — raw inputs/outputs and prompts are redacted.
+`token_budget`, `allow_nested_workflows`, `max_result_bytes`) is the first
+slice of the issue #11 governance surface; launch-approval/session routing
+remain parent-owned future work. Journal events are metadata-only by default
+(method, call id, agent id/profile, ok) — raw inputs/outputs and prompts are
+redacted. `CapabilityPolicy.interactive_approval` (§5.14, issue #111) extends
+this seam with an *interactive* alternative to the pre-provisioned
+`approval_id` fast path: an approval-required call with no valid `approval_id`
+durably suspends the run and exposes the pending call to an operator via
+`workflow_control status`, who then approves/edits/rejects/responds to it —
+still governed by the same `CapabilityPolicy.allowed_side_effect_classes` /
+`approval_required_classes` gates above it.
+
+| `VMLimits` field | Default | Enforced against | Breach behavior |
+| --- | --- | --- | --- |
+| `max_rpc_calls` | `1000` | every brokered `call` frame | hard-abort: `should_abort=True`, `limit_rpc` |
+| `max_agent_calls` | `200` | `agent` (incl. prompt-agent) dispatch | soft denial: `limit_agent` |
+| `max_kanban_calls` | `100` | `kanban_agent` dispatch | soft denial: `limit_kanban` |
+| `max_capability_calls` | `100` | `capability` dispatch | soft denial: `limit_capability` |
+| `max_parallel` | `8` | guest-side `parallel()` fan-out | guest-enforced batching |
+| `max_runtime_s` | `30.0` | wall-clock run deadline | hard-abort: subprocess killed, timeout |
+| `token_budget` | `None` (unbounded) | cumulative agent/prompt token usage | soft denial: `limit_token` |
+| `max_schema_retries` | `2` | prompt-agent structured-output retries | typed `schema` denial after retries exhausted |
+| `kanban_suspend_after_s` | `None` (blocks to deadline) | unresolved `on_block="pause"` Kanban await | durable suspend (`status="suspended"`), not a failure |
+| `max_result_bytes` | `524288` (512 KiB) | `agent`/`kanban_agent` (incl. prompt-agent) result, JSON-serialized, checked before `_persist_success` | soft denial: `result_too_large` (metadata-only: observed size, limit, call id) |
+
+`max_result_bytes` (#106) mirrors `CapabilityPolicy.max_result_bytes` on the
+`agent`/`kanban_agent` side of the broker success path: `capability()` already
+clips well-known stream fields then fails closed if the result is still too
+large (`capability_result_too_large`), but a huge `agent`/`kanban_agent`
+result had no bound at all — the single worst context-exposure gap, the
+mirror image of a filesystem-as-artifact-channel design. The broker checks the
+JSON-serialized size of every `agent`/`kanban_agent` value (prompt-agent calls
+are `agent` calls with a `prompt` param, so they are covered by the same
+check) immediately after dispatch and *before* `_persist_success`, so an
+over-limit result never reaches the script, the replay cache, or the
+in-memory prompt-agent cache. This is a hard ceiling, not a truncation: unlike
+the capability path there is no field-level clipping, so the failure is
+deterministic and repeatable rather than a surprise partial payload — a script
+may catch `result_too_large` via `CapabilityError` like any other soft denial.
+A future spill tier (#93) can convert this error into an offload instead of
+guessing at what was cut.
 
 ### 5.5 What is intentionally deferred
 
@@ -1141,6 +1221,527 @@ data. The metadata `journal.jsonl` stays redacted by default (raw params and
 script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
+
+### 5.7.1 Journal durability modes (issue #108)
+
+`journal.jsonl` writes historically always fsynced per event (the safest, and
+still the default, policy). `ScriptRunStore(root, *, durability=..., async_flush_every=...)`
+exposes a LangGraph-inspired `"exit" | "async" | "sync"` knob so an embedder can
+trade write latency against crash-window size. The knob governs **only**
+`journal.jsonl`; `run.json` (the operator-facing snapshot) is always fsynced
+on every `finish()`, and the per-card durable kanban event log
+(`append_kanban_event`, `script_store.py:964-1063`) is untouched — it keeps its
+own always-fsync policy, since it is the cross-process producer/consumer seam
+worker durability depends on.
+
+| Mode | Per-event behavior | Crash window |
+| --- | --- | --- |
+| `sync` (default) | Every `boot`/`call`/`agent_*`/`done` event is written and fsynced before the call returns — unchanged from the store's original behavior. | None: a parent crash immediately after any journal-producing call still leaves that event durable. |
+| `async` | Events are buffered in memory and fsynced together once `async_flush_every` events have accumulated (default 8) — a **count** trigger, never a wall-clock timer (the module's no-wall-clock/no-randomness contract applies to journal writes too, so behavior stays deterministic and replay-safe). | Up to `async_flush_every - 1` of the most recent events (since the last count-triggered flush) are only in process memory and are lost on a parent crash/kill before the next flush or before the run's terminal `finish()`. |
+| `exit` | Events are buffered in memory and never proactively fsynced during the run. | Every event since `begin()` is only in process memory until the run's terminal `finish()`; a parent crash/kill at any point during the run loses the entire in-memory journal for that run (the `run.json` snapshot from any prior `finish()`-adjacent write is unaffected, since it is a different file with its own always-fsync policy). |
+
+Regardless of mode, **`finish()` always force-flushes** any buffered events
+before returning — this is the single funnel for every terminal status
+(`succeeded` / `failed` / `suspended` / `stopped` / `paused`), so suspend and
+abort get the same durability guarantee as a normal completion: once `finish()`
+returns, the full journal for that run is on disk. The only crash window that
+matters for `async`/`exit` is therefore *mid-run, before `finish()` runs* —
+exactly the trade an embedder opts into for lower per-call write latency.
+
+### 5.7.2 Pending-writes resume contract: completed `parallel()`/`pipeline()` siblings survive a mid-run crash (issue #109)
+
+LangGraph calls this "pending writes": siblings that already completed within a
+failed superstep are preserved on resume, not re-executed. §5.7's replay cache
+already gives us the mechanism — every *cacheable* RPC call's success is
+fsynced to `cache.jsonl` (or the prompt-fingerprint cache, below) the instant
+`CapabilityBroker.handle()` returns, **independent of whether the run as a
+whole later fails**. Which calls are cacheable is gated by `_is_cacheable` /
+`is_replayable` (§5.7): `log`/`phase` always, but `agent(agent_id, input)` and
+`kanban_agent` only when the run's `deterministic_runner` is true (the default
+is `isinstance(runner, StubAgentRunner) and child_agent_runner is None` — i.e.
+true for the built-in stub runner, false for any live/custom `AgentRunner`
+unless the caller opts in explicitly). This section states the resulting
+guarantee, and its precondition, explicitly, and pins it with a fixture
+(`tests/test_pending_writes_resume_contract.py`, which passes
+`deterministic_runner=True` for exactly this reason).
+
+**The guarantee.** When a `parallel()` (or `pipeline()`) fan-out is
+interrupted mid-flight — a runner crash, an operator kill, a process death —
+the *cacheable* branches that had already returned successfully are not lost
+and are not re-run on `replay_from`:
+
+- A **deterministic `agent(agent_id, input)`** branch that completed is served
+  by its stable call id from `cache.jsonl` (§5.7), exactly like any other
+  deterministic call — the resumed run never invokes the (possibly new/
+  different) injected runner for it. This half of the guarantee applies **only
+  when the source run recorded with `deterministic_runner=True`** (explicitly,
+  or implicitly via the `StubAgentRunner` default). A source run driven by a
+  live/custom `AgentRunner` with `deterministic_runner` left at its default
+  `False` caches no `agent(agent_id, ...)` results at all — every such branch,
+  completed or not, re-dispatches live on resume.
+- A **prompt-agent `agent(prompt, opts)`** branch that completed is served by
+  its semantic `v2:` fingerprint (`_prompt_agent_cache_identity`), independent
+  of `deterministic_runner` and independent of call id — it is recorded
+  unconditionally on every successful prompt-agent call, so it survives even a
+  run whose deterministic-agent cache is off (see README's "Fingerprint resume
+  cache"). This half of the guarantee holds regardless of runner configuration.
+- Branches that never completed before the crash (their RPC call never
+  returned, or returned with an error) have no cache entry — deterministic or
+  fingerprint — and re-dispatch live on resume, against whatever runner the
+  resumed process is given.
+
+Because each cacheable call's persistence is independent of the others and of
+the run's terminal outcome, an *N-of-M* mid-`parallel()` crash resumes with
+exactly the N completed **cacheable** siblings cache-served and the remaining
+ones re-executed — never more, never fewer *among calls the run's
+configuration made cacheable*; a live-runner deterministic-agent branch is
+outside that set regardless of whether it completed. The fixture drives this
+directly: a four-branch `parallel()` mixing one deterministic and one
+prompt-agent branch that complete with one of each that "crash" (a runner that
+raises, the same controlled-failure-injection pattern already used throughout
+`tests/test_vm_subprocess.py`), then asserts via **runner invocation
+counting** on *fresh* runner instances for the resumed run that the two
+completed branches never reach the new runners at all, and the two crashed
+branches do, exactly once each. (Only the `parallel()` half is pinned by a
+fixture; `pipeline()` shares the same per-call persistence mechanism — it is
+stage-agnostic, not `parallel()`-specific — but that sharing is not separately
+pinned.)
+
+**Drift-abort fail-closed still applies at the sibling level.** A completed
+sibling's cache entry is guarded by the same per-call integrity tag as any
+other replayed call (§5.7): if the recorded `method`/`args_hash` for a
+completed branch's call id no longer matches what the resumed script would
+send — in practice a tampered/corrupted `cache.jsonl` line, since
+`replay_from` already refuses a whole-run `script_sha256`/`args_hash` identity
+mismatch before any subprocess spawns — the resume aborts the subprocess
+(`replay_mismatch` / `WorkflowSubprocessError`) rather than silently serving
+or re-running a poisoned value. The same rule governs the prompt-agent
+fingerprint path (`"prompt replay drift at fingerprint ..."`). Pending-writes
+recovery is opt-in to a determinism guarantee, not a best-effort cache — a
+doubtful hit is refused, not guessed at.
+
+**Boundary: this is call-result dedup, not side-effect dedup.** The guarantee
+above is about *not re-running a call whose success the parent already
+durably observed*, and it only ever observes calls the run's configuration
+made cacheable in the first place. Two distinct ways a completed branch can
+still re-dispatch live on resume:
+
+- **Never cacheable, regardless of timing.** A live (non-deterministic)
+  `AgentRunner`'s `agent(agent_id, input)` results are not recorded to
+  `cache.jsonl` at all when `deterministic_runner` is (as it is by default for
+  any runner other than `StubAgentRunner`) `False` — not because of *when* the
+  process died, but because `_is_cacheable` never persists them in the first
+  place. Every such branch re-dispatches live on resume whether it completed
+  cleanly or crashed.
+- **Cacheable, but lost to a crash-window race.** For a call the run *does*
+  treat as cacheable, its underlying effect can still fire without being
+  durably recorded — e.g. the process died before the RPC response reached
+  `_persist_success`, or a `capability()` handler has an `external_write`
+  side-effect class that is not `replayable` (§5.3). Those re-dispatch live on
+  resume like any cache miss and may repeat the external effect.
+
+Closing that gap needs effect-level
+idempotency — already the honored contract for `kanban_agent` (§5.8) and for a
+*replayable* mutating capability handler (§5.3) — extended to *every*
+side-effecting call. That is the same "dedup of durable side effects" item the
+roadmap (§8, item 3) and the README's "the script VM can replay completed
+deterministic RPC calls, but general partial-run resume is still evolving"
+limitation already flag as open; this issue narrows and pins the *call-result*
+half of that story, it does not close the *side-effect* half.
+
+### 5.7.3 Prompt-agent (`agent(prompt, opts)`) option matrix (issue #101)
+
+`ChildAgentRequest` (`agents.py`) is the parent-normalized contract every
+`agent(prompt, opts)` call crosses the injected `ChildAgentRunner` boundary as.
+`CHILD_AGENT_OPTION_KEYS` is the exhaustive allowlist `_prompt_agent_request`
+validates `opts` against — any other key is a deterministic `bad_request`
+denial (§5.4) before the child runner is ever invoked.
+
+| Option | Shape | Broker validation | Feeds the `v2:` fingerprint (§5.7)? |
+| --- | --- | --- | --- |
+| `label` | string | must be a string | yes, always |
+| `phase` | string | must be a string | yes, always |
+| `schema` | object | must be an object; also independently checked by `schema_subset.normalize_schema` | yes, always |
+| `model` | string | must be a string | yes, always |
+| `effort` | string | must be a string | yes, always |
+| `isolation` | string | must be a string | yes, always |
+| `context` | object | must be an object | yes, always |
+| `tools` | list/tuple of non-empty strings | must be a list/tuple whose items are all non-empty strings; deduped preserving first-occurrence order and normalized to a tuple | only when not `None` |
+| `agentType` | non-empty string | must be a non-empty string; resolved against the agent-type registry (§5.7.6, issue #104) — an unresolvable name denies before dispatch | only when not `None` |
+
+`tools` and `agentType` are the two options whose fingerprint participation is
+conditional. A differently-scoped `tools` allowlist, or a different named
+`agentType`, for an otherwise-identical prompt/opts call must land in a
+distinct cache entry, so a provided value adds its key to the fingerprint
+payload. But a call that never sets the option (the overwhelming majority of
+calls, and every call recorded before the option existed) omits the key
+entirely rather than fingerprinting it as `null` — so every fingerprint
+minted before issue #101 (`tools`) or issue #92 (`agentType`) stays
+byte-identical, and the durable resume/replay cache (§5.7, §5.7.2) keeps
+serving those pre-existing entries without re-dispatching the child runner.
+This holds for `agentType` even though a bare `agent(prompt)` call *always*
+resolves the built-in `general-purpose` default (§5.7.6) — that resolution is
+not a script-supplied option, so it stays invisible to both the fingerprint
+and the `ChildAgentRequest.agent_type` field itself (`None`), only showing up
+in the *resolved* `system_prompt`/`model`/`effort` the broker dispatches.
+
+`StubAgentRunner`'s generic echo fallback for the legacy `agent(agent_id,
+input)` form already surfaces a `tools` key placed in `input` verbatim (it
+echoes the whole `input` dict) — the allowlist is only a first-class,
+broker-validated option on the `agent(prompt, opts)` path.
+
+An explicit `"tools": []` is a valid, distinct allowlist — the most
+restrictive one, "no tools at all" — not an alias for omitting `tools`
+entirely. It normalizes to `()`, is forwarded to the child runner as `()`,
+and (per the table above) still feeds the fingerprint since it is not
+`None`, so it lands in its own cache entry rather than reusing the
+tools-less one.
+
+### 5.7.4 Pluggable store backend: SQLite adapter (issue #110)
+
+§5.7's `ScriptRunStore` was local-file only, acknowledged as the multi-host
+gap (§8's roadmap item 4, and the trust-boundary note above). This slice extracts the
+store contract that class already implied into an explicit structural
+interface, `ScriptRunStoreProtocol` (`script_store.py`, `@runtime_checkable
+Protocol` — plus `CallRecorderProtocol` / `TranscriptRecorderProtocol` for the
+two writer objects a store hands out), and ships a second backend against it:
+`SqliteScriptRunStore` (`script_store_sqlite.py`), stdlib `sqlite3` only —
+zero-dependency posture unchanged.
+
+**What moved into the interface.** Every method the rest of the package
+(`vm.py`, `kanban.py`, `kanban_notify.py`, `background.py`, the resume/replay
+path in `primitives.py`) actually calls on a store: run lifecycle
+(`next_run_id` / `begin` / `finish` / `load_run`), the metadata-only journal
+(`note_call` / `journal` / `journal_path`), the deterministic replay cache
+(`recorder` / `load_cache`), transcript artifacts (`transcript_recorder` /
+`transcript_refs`, issue #76), the suspended-run index (`suspended_runs`,
+issue #5), and the durable Kanban card state + event log
+(`record_kanban_card_state` / `load_kanban_card_state` / `kanban_waits` /
+`append_kanban_event` / `read_kanban_events` / `latest_kanban_resolution`,
+issue #5). `ScriptRunStore` (the file backend) is unchanged behaviorally and
+remains the default; `FileScriptRunStore` is an alias naming it explicitly now
+that a second backend exists. **Nothing selects a backend implicitly** — an
+embedder constructs whichever store class it wants (both accept the same
+`root` / `durability` / `async_flush_every` constructor keywords), and passes
+it to `run_workflow_script(..., store=...)` like today.
+
+**Store layout: one database per store root.** Where the file backend persists
+one directory per run (`<root>/<run_id>/{run.json,journal.jsonl,cache.jsonl}`),
+the SQLite backend persists **one file**, `<root>/store.sqlite3`, opened in
+`PRAGMA journal_mode=WAL` with `synchronous=FULL`. Six tables carry the same
+information the file backend's three per-run files did: `runs` (one row per
+run — `run.json`'s fields), `journal` (`run_id, seq, data_json` — one row per
+`journal.jsonl` line, `data_json` holding the exact same event dict the file
+backend would have written, so `store.journal(run_id)` returns
+byte-identical-in-content event dicts across both backends — see the
+`test_journal_event_payloads_match_the_file_backend_byte_for_byte` fixture),
+`cache_calls` / `cache_prompts` (the two halves of `cache.jsonl`'s call-id and
+fingerprint entries), and `kanban_card_state` / `kanban_events` (the
+`_kanban/<card_id>.json` latest-state file and `.events.jsonl` durable log).
+**One piece deliberately stays on the filesystem even on this backend:**
+per-subagent transcript artifacts (issue #76, `transcript_recorder` /
+`transcript_refs`) are large-ish, append-mostly, non-relational blobs, so this
+adapter reuses the file backend's `TranscriptRecorder` unmodified, writing to
+`<root>/<run_id>/transcripts/` exactly as before. `journal_path(run_id)`
+therefore returns the shared database file (not a per-run file, since there
+isn't one) — an operator-facing pointer to *where the data lives*, honestly
+different in shape from the file backend's per-run pointer but present and
+real on disk either way.
+
+**Schema versioning and the migration story.** `PRAGMA user_version` stamps
+the database's schema generation (`SQLITE_STORE_SCHEMA_VERSION`, starting at
+1) — independent of `SCRIPT_SCHEMA_VERSION`, which still separately gates the
+shape of an individual `runs` row (checked per-load, exactly like the file
+backend checks per-`run.json`). A fresh (empty) database is initialized and
+stamped on first open. Opening a database stamped with a *different, non-zero*
+version fails closed at construction time with a typed
+`CorruptScriptRunError` (`reason="schema_version"`) — the store-wide analogue
+of `load_run`'s per-record check, just performed once instead of on every
+read, since SQLite's schema is a property of the whole database rather than
+of one row. There is no schema generation 2 yet; when one ships, the expected
+shape (documented here so it does not have to be rediscovered) is: bump
+`SQLITE_STORE_SCHEMA_VERSION`, add an `ALTER TABLE`/rebuild migration keyed off
+the *stored* `user_version` read at open time (never assume "0 or current" —
+a real migration path branches on every version between the stored one and
+current), and keep the migration forward-only and additive where possible so
+a downgrade never gets attempted implicitly. Until then, an incompatible
+`user_version` is refused rather than guessed at, matching this store's
+existing fail-closed posture toward every other form of stale/corrupt state.
+
+**Durability modes onto SQL transaction boundaries (issue #108).** The
+`"exit" | "async" | "sync"` knob (§5.7.1) governs the same thing on this
+backend — only the `journal` table's writes — via explicit transaction
+boundaries instead of buffered file lines:
+
+| Mode | SQL behavior |
+| --- | --- |
+| `sync` (default) | Each journal row is inserted inside its own `BEGIN`/`COMMIT` before the call returns — immediately visible to any other connection/query, matching `journal.jsonl`'s per-event fsync. |
+| `async` | Journal rows are buffered in memory (never written to the table) and committed together — one `BEGIN` + `executemany INSERT` + `COMMIT` — once `async_flush_every` rows have accumulated (the same deterministic *count* trigger as the file backend, never a wall-clock timer). |
+| `exit` | Journal rows are buffered in memory and only committed at the run's terminal `finish()`. |
+
+Exactly as in the file backend, `run.json`'s role (the `runs` table) and the
+replay cache (`cache_calls` / `cache_prompts`) and the Kanban card
+state/event log are **always** committed immediately, in every durability
+mode — those tables' writers never buffer. And exactly as in the file
+backend, `finish()` always force-commits any buffered journal rows before
+returning, so suspend/succeed/fail/stop/pause all get the same durability
+guarantee (`tests/test_script_store_sqlite.py`'s
+`test_finish_force_commits_every_terminal_status_in_exit_and_async_modes`
+pins this, the SQLite analogue of §5.7.1's file-backend fixture).
+
+**Test coverage.** `tests/test_script_store.py` and
+`tests/test_pending_writes_resume_contract.py` parametrize their
+API-surface-only tests (the ones that only call store methods, never reach
+past the store to read/tamper with its on-disk representation directly) over
+a `backend` fixture covering both `ScriptRunStore` and `SqliteScriptRunStore`.
+Tests that simulate corruption by editing a JSONL/JSON file's bytes directly
+stay file-backend-only — a SQLite database has no "edit one line" equivalent
+— and `tests/test_script_store_sqlite.py` supplies the SQLite-native
+counterparts (raw `UPDATE`s against the store's own tables) for the same
+failure classes, plus the schema/WAL/versioning/transaction-boundary tests
+above and end-to-end replay/pending-writes/suspend-resume fixtures re-run
+directly against the SQLite backend. This is a deliberate scope boundary
+(documented rather than silently narrowed): full parametrization of every
+store-touching test module across the codebase (the Kanban suspend/resume and
+durable-resume suites, in particular) was judged too invasive for one slice,
+since several of *those* fixtures also reach past the store's API for
+timing/tampering assertions; the SQLite backend's behavioral parity with the
+file backend on those paths is established by the shared
+`ScriptRunStoreProtocol` contract plus the dedicated end-to-end fixtures this
+slice adds, not by re-running those suites' internals verbatim.
+
+### 5.7.5 Host-declared child-visible-context quarantine (issue #102)
+
+`ChildAgentRequest.context` (§5.7.3) is a free-form dict the script fully
+controls — it is exactly the kind of parent-scoped payload the "single effect
+boundary" (§3.4) is supposed to constrain, but historically it crossed the
+`ChildAgentRunner` boundary unfiltered: whatever the script's `context=`
+option contained, the injected runner received verbatim. That is the one gap
+in an otherwise verified allowlist-only posture — "The subprocess guest never
+receives parent chat history or credentials" (`agents.py`'s
+`ChildAgentRequest` docstring) is a claim about the *subprocess*/parent RPC
+boundary, but said nothing about what a live runner (issue #97) is allowed to
+forward into a *further* child call once `context` reaches it.
+
+**The contract, inverted from deepagents.** deepagents' `private_state_keys`
+is a *denylist* — everything not explicitly hidden flows through by default.
+This project rejects that shape everywhere else (unknown agent ids, unknown
+`opts` keys, unresolved capabilities all fail closed), so the fix here is the
+inverse: a `ChildAgentRunner` may declare a
+`child_visible_context_keys: frozenset[str]` attribute naming exactly the
+`context` keys it is allowed to see. This is *not* a formal `ChildAgentRunner`
+Protocol member (adding one would force every existing runner, including
+every test double already in this codebase, to declare it just to keep
+matching the Protocol's shape) — it is resolved via `getattr` with a
+fail-closed default, `agents.child_visible_context_keys(runner)`:
+
+```python
+def child_visible_context_keys(runner: Any) -> frozenset[str]:
+    declared = getattr(runner, "child_visible_context_keys", None)
+    if declared is None or isinstance(declared, (str, bytes)):
+        # A bare string declaration would iterate char-wise into a set of
+        # single-character "keys" -- fail closed like undeclared instead.
+        return frozenset()
+    try:
+        return frozenset(key for key in declared if isinstance(key, str))
+    except TypeError:
+        return frozenset()
+```
+
+Undeclared → empty allowlist → **no** `context` key reaches that runner. A
+declared value that is not an iterable of strings is treated identically to
+"undeclared" rather than raising — the parent never trusts the runner's
+*shape* any more than its intent, so a malformed declaration fails closed
+instead of crashing the run.
+
+**Enforcement is parent-side, in `vm.py`, and never trusts the runner.**
+`agents.filter_child_visible_context(runner, context)` — called from
+`CapabilityBroker._handle_prompt_agent`, immediately after the child runner is
+confirmed configured and before the request is dispatched — returns the
+filtered `dict` plus the sorted tuple of *dropped key names*. The broker
+rebuilds the `ChildAgentRequest` handed to
+`_invoke_prompt_agent_with_schema_retry` with the filtered `context`
+(`dataclasses.replace(request, context=filtered_context)`), so every
+subsequent dispatch on that call — including every schema-retry attempt
+(§5.7.3) — carries only the allowed keys. A runner cannot widen its own
+visibility by lying about what it received; the filtering happens before the
+runner is ever invoked, and the runner's return value is never consulted to
+decide what it "should" have seen.
+
+**Schema-retry metadata is layered on top of the filtered context, not
+subject to it.** `_request_with_schema_retry_context` adds a
+`schema_validation_error` key (attempt/max_retries/code/message) to the
+*already-filtered* base context on each retry attempt. That key is
+broker-synthesized from the child's own prior (already-seen-by-that-child)
+invalid output and the schema-mismatch taxonomy — it carries no parent-scoped
+information the quarantine is meant to protect — so it is deliberately exempt
+from the allowlist rather than requiring every runner to additionally declare
+`"schema_validation_error"` just to keep the existing retry mechanism working.
+
+**Journaled: dropped key *names*, never values.** When filtering actually
+narrows the script-supplied context, the `agent_started` journal event gains a
+`dropped_context_keys` field (a list of the dropped key names, sorted) —
+omitted entirely when nothing was dropped, matching the sparse-field
+convention `has_value`/`cache` already use on this event. Both store backends'
+`note_call` (§5.7, §5.7.4) explicitly whitelist which event keys are
+persisted; `dropped_context_keys` is in that whitelist on both, and
+`tests/test_script_store_sqlite.py::test_dropped_context_keys_journal_note_matches_the_file_backend`
+pins that the note round-trips identically on the SQLite backend. The note is
+metadata-only by construction — it is built from `dict.keys()`, so a dropped
+value can never leak into it even by accident.
+
+**Fingerprint stays pre-filter (design decision, not an oversight).** The
+`v2:` semantic fingerprint (`_prompt_agent_cache_identity`, §5.7) is always
+minted over the **pre-filter, script-supplied** `context` — every call site
+that computes it (`_maybe_prompt_cache_hit`, `_call_event`, `_persist_success`,
+and the fingerprint computed in `_handle_prompt_agent` itself, before the
+filtered request is built) constructs its `ChildAgentRequest` straight from
+the raw RPC params, never from the runner-narrowed copy. Two considerations
+drove this over fingerprinting "what the child actually saw":
+
+- **Cache/replay identity must not depend on which runner happens to be
+  configured.** `_maybe_prompt_cache_hit` can serve a fingerprint purely from
+  `self._replay`/`self._prompt_results` with no live runner at all (a fully
+  cached/replayed run never touches `self._child_runner`). A runner's declared
+  allowlist is a property of *that process's* wiring, not of the call's
+  semantic identity — post-filter fingerprinting would mean swapping in a
+  runner with a narrower (or wider) allowlist silently mints a different
+  fingerprint for an otherwise-identical `agent(prompt, opts)` call, breaking
+  resume/replay across a runner change that has nothing to do with what the
+  script asked for.
+- **It keeps every pre-#102 fingerprint byte-identical, unconditionally** —
+  not only for calls whose context happens to pass a given runner's allowlist
+  entirely. A post-filter fingerprint *would* have matched the pre-#102 value
+  for a fully-passing call (filtered context equals the original in that
+  case), satisfying the narrower version of this guarantee — but only for
+  that runner's particular allowlist, and only until an operator changes it.
+  Fingerprinting the pre-filter context sidesteps that fragility entirely: the
+  guarantee holds for every call, against every runner configuration, forever
+  — exactly like the `tools`-omitted case (§5.7.3) already guarantees for
+  issue #101.
+
+`tests/test_prompt_agent.py`'s
+`test_prompt_agent_context_quarantine_fingerprint_is_pre_filter_and_runner_independent`
+and `test_prompt_agent_context_quarantine_full_pass_through_fingerprint_matches_pre_102_baseline`
+pin both halves of this directly: two runners with disjoint declared
+allowlists dispatching the identical call mint the identical fingerprint, and
+a call whose context fully passes a runner's allowlist still mints exactly the
+fingerprint a pre-#102 build would have computed for it.
+
+**What did *not* need a fail-closed default: the bundled runner and existing
+test doubles.** `StubAgentRunner` implements `AgentRunner` (`agent(agent_id,
+input)`), not `ChildAgentRunner` — it never receives a `ChildAgentRequest` and
+so has no `child_visible_context_keys` to declare; the legacy `agent(agent_id,
+input)` path's `context` (when present) is ordinary `input` data passed
+through the unrelated capability/agent-id contract (§5.7.3's `tools`-echo
+note), not the quarantined `ChildAgentRequest.context`. The `ChildAgentRunner`
+test doubles across the suite that assert on `request.context` (in
+`tests/test_prompt_agent.py` and the loop-until-dry parity fixture,
+`tests/test_loop_until_dry_fixture.py`) were each given the minimal declared
+allowlist their existing assertions require — the fail-closed default applies
+uniformly; nothing is grandfathered in.
+
+### 5.7.6 File-based agent-type registry (issue #104)
+
+Issue #92 added the `agentType` opt to `agent(prompt, opts)` (§5.7.3); this
+section is what it resolves against — `agent_type_registry.py`'s
+`AgentTypeRegistry`. deepagents' CLI resolves `agentType` against
+project-then-user `agents/{name}/AGENTS.md` files; this is the equivalent for
+the script VM, kept deliberately boring and file-backed like the saved-script
+catalog (§5.6) it reuses path hygiene from.
+
+**Layout.** One definition file per agent type, `<root>/<agent-type-name>.md`:
+a `---`-delimited frontmatter block of flat `key: value` lines (`name`
+required; `description` / `model` / `effort` all optional) followed by the
+system-prompt body:
+
+```
+---
+name: reviewer
+description: Reviews code changes for correctness.
+model: opus
+effort: high
+---
+You are a meticulous code reviewer. Flag correctness bugs only.
+```
+
+**Resolution: ordered roots, first match wins.** `AgentTypeRegistry(roots=
+[...])` checks roots in the order given; the first root with a matching
+`<name>.md` wins. The registry itself has no notion of "project" vs "user" —
+that precedence is just "pass the project root before the user root" at
+construction time, exactly like `FileWorkflowScriptCatalog`'s root ordering
+(§5.6). Path hygiene is shared, not reimplemented: `safe_agent_type_name`
+delegates straight to `script_catalog.safe_script_name` (an agent-type id is,
+like a saved script name, one safe path segment), and root-escape checking
+uses the same `script_catalog.ensure_within_root` guard the script catalog
+itself uses (factored out to a module-level function for this reuse). A
+traversal attempt (`agentType="../../etc/passwd"`) or any other unsafe name
+fails the same way an unsafe script name would. A trailing `.md` or
+`.workflow.py` suffix is rejected outright rather than stripped — `agentType`
+is a name, not a filename, and stripping it would let `"reviewer"`,
+`"reviewer.md"`, and `"reviewer.workflow.py"` all resolve the same on-disk
+definition while still minting distinct fingerprints/cache entries (the
+`ChildAgentRequest` stores the raw spelling).
+
+**Explicit roots only — no implicit discovery.** Unlike
+`default_script_catalog_roots()` (§5.6, which layers an `HERMES_HOME`/cwd
+default), an `AgentTypeRegistry` never guesses at roots: the embedding host
+constructs one with explicit paths and injects it at `WorkflowVM`/
+`CapabilityBroker` construction (`run_workflow_script(...,
+agent_type_registry=...)`, threaded the same way `capability_registry`
+already is through `primitives.py`'s facade and `background.py`'s launcher).
+Omitted, the broker defaults to a registry with zero roots — the built-in
+`general-purpose` type (below) is still resolvable; any other name is a
+deterministic `unknown_agent_type` denial.
+
+**The `general-purpose` built-in default.** A bare `agent(prompt)` call (no
+`agentType`) always resolves `GENERAL_PURPOSE_AGENT_TYPE = "general-purpose"`
+— defined semantics for every pre-#92 call site, documented here so it does
+not have to be rediscovered: *bare prompt == `general-purpose`*. This is a
+Python-level fallback inside `AgentTypeRegistry.resolve`, tried only after
+every configured root has been checked for an on-disk `general-purpose.md` —
+so a project may still shadow the built-in default with its own definition,
+exactly like any other agent type name.
+
+**Broker-side resolution and defaulting (not the fingerprint).** The broker
+resolves the agent type *after* building the request from raw params but
+*before* computing the `v2:` fingerprint (§5.7.3) — the fingerprint is always
+computed from the unresolved request so every other call site that
+recomputes it from the same raw params (cache-hit lookup, success
+persistence) stays consistent. A **second**, resolved copy of the
+`ChildAgentRequest` — `system_prompt` stamped unconditionally (there is no opt
+to override it) and `model`/`effort` filled from the definition only when the
+script did not already supply them, i.e. **an explicit per-call opt always
+wins over the registry default** — is what actually crosses the
+`ChildAgentRunner` boundary. `StubAgentRunner`-style fakes used in tests
+(`FakeChildRunner`) receive this resolved request and can assert on
+`request.agent_type` (the raw opt, `None` when omitted) and
+`request.system_prompt` (always populated) directly.
+
+**Failure taxonomy (issue #103).** Both failure shapes are plain
+`CapabilityDenied` — `retryable=False` by construction (§5.4's default; only
+`runner_error` sets `True`) — surfaced as metadata-only diagnostics (agent-type
+name and, for a malformed on-disk definition, a 1-based line number and
+structural reason — never the line's text, file contents, or a raw filesystem
+path):
+
+| Failure | `code` |
+| --- | --- |
+| Name absent from every configured root and not `general-purpose` | `unknown_agent_type` |
+| Unsafe name (path traversal, disallowed characters, or a suffixed spelling like `"reviewer.md"`) | `agent_type_invalid` |
+| On-disk definition missing `---` frontmatter, an unparsable frontmatter line, missing the required `name` field, or an empty/whitespace-only system-prompt body | `agent_type_invalid` |
+
+**Replay determinism despite mutable registry state.** Unlike every other
+`CapabilityDenied` code the broker raises — a pure function of the call's own
+arguments and the run's own in-memory state, so re-evaluating it live on
+replay reproduces the identical denial — `unknown_agent_type` and
+`agent_type_invalid` also depend on the on-disk `AgentTypeRegistry`, which is
+mutable host configuration that can drift between a source run and a later
+replay (a definition file added, removed, or fixed). So the broker buffers
+these two codes into the replay cache exactly like a caught `runner_error`
+(issue #103's `_persist_failure`/`flush_pending_failures`, `vm.py`): a replay
+serves the recorded denial without re-touching the registry at all,
+regardless of what is on disk at replay time.
 
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
@@ -1415,6 +2016,297 @@ Known, accepted limitations (not security escapes):
   is the current backstop. A `resource.setrlimit` guard in the guest is future
   hardening.
 
+### 5.14 Interactive interrupt decisions on approval-gated capability calls (issue #111)
+
+§5.3's `CapabilityPolicy` has always had exactly one approval mechanism: a
+script must carry a pre-provisioned `approval_id` that already appears in
+`approved_approval_ids`, minted by whoever launched the run. That is a good
+*non-interactive* fast path (a CI job, a pre-authorized automation) but gives
+an operator watching a live run no way to inspect a pending mutating call and
+decide on it — deepagents' `interrupt_on` supports approve/**edit**/reject/
+respond; Dynamic Workflows only had the coarse pause/stop of §1.5.3. This
+slice adds that surface without touching the fast path at all.
+
+**Opt-in, not a new default.** `CapabilityPolicy.interactive_approval` (default
+`False`) gates the whole feature. With it `False` — every existing caller,
+including every `approval_required_classes` test predating this slice — an
+approval-required call with no valid `approval_id` still gets the original
+immediate, catchable `capability_approval_required` denial. Turning it `True`
+*and* wiring a `control_store` on `run_workflow_script`/`run_script` is what
+activates the interactive path; `interactive_approval=True` with no
+`control_store` degrades to the same fast-path denial (there is nowhere to
+record a decision, so suspending forever would be worse than denying).
+
+**Suspend reuses §5.10's mechanism, not a new one.** When interactive approval
+is active and a call has no recorded decision yet, `CapabilityBroker`
+(`_resolve_approval_decision` in `vm.py`) sets `should_suspend` +
+`suspend_info = {"type": "ApprovalPending", "call_id", "method": "capability",
+"name", "side_effect_class", "params_summary"}` and raises a deterministic,
+**non-retryable** `capability_approval_pending` denial — the identical
+teardown-and-report-suspended path the Kanban pause-suspend (§5.10) already
+built, just keyed on a different `suspend_info["type"]`. `params_summary` is a
+redacted (`safe_capability_metadata_value`), size-bounded (2 KiB) view of the
+call's `input` — never the raw arguments, mirroring the journal's
+metadata-only convention. There is no polling/backend to await: the pending
+call simply has no `decide_call` control recorded yet, and resuming
+re-dispatches it live, which re-checks the (durable) control store.
+
+**Four decisions, one control action.** `controls.py` adds `decide_call(store,
+run_id, call_id, decision, ...)` — one new `ControlAction`
+(`"decide_call"`) carrying a closed `decision` kind
+(`APPROVAL_DECISION_KINDS = ("approve", "edit", "reject", "respond")`),
+mirroring how `task_stop`/`retry` are already targeted, `target_ref`-keyed
+controls. Unlike `retry`, it is **not** idempotent-by-target: an operator
+correcting themselves (reject, then reconsider and approve) before a run
+consumes the decision is a legitimate append-only audit trail, not a
+duplicate — `latest_call_decision(state, call_id)` resolves the *last*
+recorded row, the same "last one wins" convention `evaluate_control_state`
+already uses for `stopped_tasks`/`retries`. `waits_from_suspended_run(meta)`
+turns a suspended run's `error` field into the same uniform `WaitSummary`
+`waits_from_loop_status`/`waits_from_kanban_states` produce, so
+`workflow_control status`'s `waits` list carries the pending call (`kind:
+"approval"`) without any caller hand-decoding `run.json`. The plugin
+(`__init__.py`) wires a `decide_call` action (`target_ref` doubles as the
+call id, `input`/`value` carry the edit/respond payload) and folds
+`waits_from_suspended_run` into both `status` and `overview`.
+
+**Applying a decision reuses the existing enforcement, not a bypass.**
+`_handle_capability` resolves a decision (if any) *before* calling
+`CapabilityRegistry.run`:
+
+- `reject` raises `CapabilityDenied(..., code="capability_rejected",
+  retryable=False)` directly — the call never dispatches, and a script `try/
+  except CapabilityError` sees exactly the #103 taxonomy (catchable, not
+  retryable: an operator's recorded rejection will not resolve differently on
+  a later attempt).
+- `respond` never touches `CapabilityRegistry.run`/the handler either. Its
+  value is normalized/redacted/bounded through the *identical* pipeline a live
+  capability result goes through — `capabilities.finalize_capability_result`
+  is `CapabilityRegistry.run`'s tail, factored out so both paths share it — so
+  an operator-supplied result is bounded like any other capability result
+  (`CapabilityPolicy.max_result_bytes`), the #106 analogy the acceptance
+  criteria calls for on the `capability()` side of the broker.
+- `approve`/`edit` mint a synthetic `approval_id` (`f"decision:{control_id}"`)
+  and pass a *widened* `CapabilityPolicy` (`dataclasses.replace`,
+  `approved_approval_ids` plus that one id) into the same
+  `CapabilityRegistry.run` call every other capability dispatch goes through —
+  so credential scanning, redaction, stream clipping, and the result-size
+  bound are all unchanged, reused code, not a parallel path. `edit` additionally
+  stages the operator's arguments (without the synthetic id) as the *effective
+  params* for persistence: `CapabilityBroker.handle` swaps them in for the
+  script's original params right after dispatch, before the recorder/journal
+  ever see them — so the replay cache's `args_hash` and the journal's
+  `rpc_call`/`capability` fields both reflect what the operator actually
+  authorized, exactly the acceptance criterion ("edited params, not original,
+  feed the replay fingerprint/journal").
+
+**Decisions key on the logical run, not the per-generation one.** Unlike
+pause/stop/task_stop (which deliberately read the *fresh* replay run id — see
+`CapabilityBroker.__init__`), `_pending_call_decision` looks the decision up
+against `idempotency_root`: the same "walk `replay_of` to the first non-replay
+ancestor" root the Kanban idempotency key already resolves to. A stable call
+id reproduces at the same point on every replay of the same script/args, so an
+operator who decided against the run they saw suspended (`A`) has that
+decision picked up by every subsequent resume (`B` replaying `A`, `C`
+replaying `A` again, ...) without re-recording it.
+
+**Cross-process resume boundary (the cut this slice takes).** This lands the
+*in-process decision surface + durable journaling + deterministic resume*,
+not a live scheduler:
+
+- Suspension is a teardown, exactly like §5.10: the subprocess's local state is
+  discarded, and resuming is the ordinary `run_workflow_script(...,
+  replay_from=<suspended_run_id>)` path. Nothing holds the suspension open in
+  the parent process; a fresh invocation (an operator, a cron, a webhook
+  handler) drives the resume, same as every other suspend/resume boundary in
+  this design.
+- A mutating (non-`read_only`) capability reached through the interactive path
+  must be registered `WorkflowCapability(replayable=True)` to ever be
+  *resumable* at all — this is not a new restriction #111 introduces, it is
+  §5.3's pre-existing "replay cannot safely re-dispatch a non-replayable
+  side-effecting capability" guard (`capability_replay_unsafe`), which fires
+  unconditionally on any `replay_from` run reaching that call point,
+  independent of whether a decision exists. A host wanting interactive
+  approval on a mutating capability accepts the same idempotency-key
+  discipline §5.3 already asks of any resumable capability.
+- **A resumed run writes no cache of its own** (§5.10, unchanged): the edited
+  args-hash entry only lands in the *root* run's `cache.jsonl` when that root
+  run itself has a live `CallRecorder` attached at the moment the decision is
+  applied. In the common suspend → decide → `replay_from` flow, the resumed
+  generation carries no recorder (a replay serves the *root's* cache and never
+  writes a new one — the same reason a resumed Kanban await is never cached),
+  so a decided capability call re-dispatches live on every subsequent
+  `replay_from` of the source run, relying on the capability's own idempotency
+  key for safety rather than a cached result. This mirrors `kanban_agent`'s
+  existing "a live durable effect is never cached" behavior exactly.
+- Because a *cached* `edit` entry's `args_hash` is computed from the operator's
+  arguments rather than the script's own (by design — see above), a full
+  from-scratch replay of an already-successfully-decided run (one further
+  `replay_from` generation past the one that actually applied the decision,
+  where the call *is* cached) will detect drift at that call (the script always
+  sends its original arguments; the cache holds the edited ones) and abort
+  rather than silently reproducing the operator's edit. Only resuming the
+  still-*undecided* suspended run is guaranteed to reproduce the decision
+  deterministically in this slice; teaching a further replay generation to
+  recognize "this call was legitimately decided, not drifted" is future work.
+- There is no cross-host transport and no notification that a run is
+  suspended-on-approval beyond `workflow_control status`/`overview` (an
+  operator or a poller must ask); producing an active wakeup (à la §5.12's
+  webhook broker) when a run enters this state is out of scope here.
+
+### 5.15 Async child-agent lifecycle: `agent_start`/`agent_check`/`agent_cancel`/`agent_list` (issue #112)
+
+§5.8's `kanban_agent` is a *blocking* durable awaitable: one call, one (possibly
+long, possibly suspending) wait, one result. Some background work does not fit
+that shape — a script wants to start several long-running child agents, keep
+orchestrating other work (or return control to the caller entirely), and only
+later ask "is it done yet?". This slice generalizes the RPC/broker/replay
+machinery `kanban_agent` established into four non-blocking script globals,
+modeled on deepagents' `AsyncSubAgentMiddleware`:
+
+- `agent_start(target, input, opts) -> {"handle": <str>, "state": "pending"}`
+  fires the request through a new, separate `AsyncChildAgentRunner` seam
+  (`agents.py`: `start(request) -> token` / `poll(token) -> status` /
+  `cancel(token) -> status`) and returns immediately — it never waits for the
+  run to finish.
+- `agent_check(handle) -> {"state": ..., "result"?: {...}, "error"?: {...}}`
+  polls once, non-blocking. `state` is one of `pending` / `done` / `cancelled`
+  / `failed`.
+- `agent_cancel(handle) -> {"state": ...}` requests cancellation and returns
+  the acknowledged resulting state; idempotent once terminal.
+- `agent_list() -> {"handles": [{"handle", "target", "state"}, ...]}` lists
+  every handle this run has started, in the deterministic order they were
+  started (sorted by the originating `agent_start` call id, never dict
+  insertion order — concurrent `agent_start`s issued via `parallel()` can
+  *finish* dispatching in a different order than they were issued, since they
+  run on the parent's thread pool, but their call ids are assigned by the
+  guest before the frame is even sent and so are race-free).
+
+**Handles are deterministic, not random.** `CapabilityBroker._async_agent_handle`
+derives the handle the same way `kanban.kanban_card_id` derives a card id: a
+content-addressed hash of `<idempotency_root>:agent_start:<call_id>`. No
+`uuid`/wall-clock is ever involved, so the same script+args always mints the
+same handle for the same logical `agent_start` call.
+
+**Replay is unconditional, unlike `agent`/`kanban_agent`.** §5.7's
+`is_replayable` gates `agent`/`kanban_agent` caching on `deterministic_runner`
+— a live, non-deterministic Hermes runner's result is deliberately *not*
+cached, so a replay re-dispatches it fresh rather than serving a possibly-stale
+value. The four async lifecycle globals are the opposite: they are *always*
+cacheable (`script_store._ASYNC_LIFECYCLE_METHODS`), regardless of
+`deterministic_runner`. This is deliberate, not an oversight: a recorded call
+here is a snapshot of this run's own handle/state at one exact point in its
+deterministic sequence, not a fresh external read, and the production case —
+a real, non-deterministic `AsyncChildAgentRunner` — is precisely the one that
+most needs a completed handle to replay from cache instead of re-dispatching
+against a runner with no memory of the original token. This satisfies "start N
+background children, `parallel()` other work, then collect via `agent_check`"
+surviving an ordinary replay/resume of a *fully-recorded* run untouched by the
+boundary below.
+
+**Boundary this slice leaves for a follow-up (tracked as issue #129): no
+durable suspend on an unresolved handle.** §5.10 made an unresolved *paused
+Kanban await* suspend the run durably (`ScriptRunResult(suspended=True)`,
+`store.suspended_runs()`, resumable via `replay_from`) by reusing the existing
+card/event-log plumbing — the await already knew how to block-then-give-up.
+The async lifecycle globals never block at all (`agent_check` is a single
+non-blocking poll), so there is no analogous "give up and suspend" moment to
+hook into, and unlike a Kanban card there is no durable, host-external store
+of the async run's identity this slice can reattach to from a fresh process.
+Landing that properly needs its own durable async-run store (a `token`/
+`handle` -> host-run-id index a fresh process can query).
+
+This is a real reduction from issue #112's own proposal, which said
+unresolved handles "participate in durable suspend exactly like Kanban
+awaits" (AC #2: "Process death with unresolved handles suspends durably;
+resume re-attaches idempotently") — not something #112's text pre-authorized
+cutting. The cut is ratified on #112 itself (see the issue comment on this
+PR) and the closing work is filed as its own issue, #129, rather than left as
+an undocumented gap. Concretely, today:
+
+- A script that ends with an unresolved (`pending`) handle just ends unresolved
+  — the run is **not** suspended; it reports its ordinary terminal status.
+  Nothing observes or acts on the pending handle after the script returns.
+- A `replay_from` reproduces every call already in the source run's cache
+  (§ above) untouched. A call *live-dispatched past that cached prefix* --
+  e.g. a resumed run's `agent_check` for a handle whose `agent_start` was
+  itself served from the cache -- finds `self._async_agents` unpopulated (that
+  dict is only ever written by a *live* dispatch of `agent_start`, never by a
+  cache hit) and fails closed with a typed, deterministic `unknown_handle`
+  denial rather than crashing or guessing. A script that depends on checking a
+  handle across a resume boundary is not yet supported; only "the whole
+  relevant prefix stayed within the replay cache" is. This exact boundary --
+  a cached `agent_start` followed by a live-dispatched `agent_check` past it
+  -- is pinned by
+  `test_resume_with_a_live_agent_check_past_a_cached_agent_start_denies_unknown_handle`
+  in `tests/test_async_agent_lifecycle.py`, which forces the source run to
+  die with the `agent_check` call itself unrecorded (an uncaught runner
+  failure mid-poll, mirroring the #109 pending-writes crash pattern) so the
+  resumed run's `agent_check` is a genuine live dispatch past the cached
+  prefix, not merely a second cache hit.
+
+Issue #129 closes this the same way §5.10 closed the Kanban gap: add a
+durable async-run index alongside `ScriptRunStore`, make an unresolved handle
+at script end request the same `should_suspend`/`suspend_info` teardown the
+broker already exposes for Kanban (`CapabilityBroker._begin_suspend` and
+`WorkflowVM._drive`'s handling of it), and have a resumed run's live
+`agent_check`/`agent_cancel` reattach through that index instead of requiring
+`self._async_agents` to already hold the token.
+
+**Adversarial review of this slice, before #129.** A follow-up review of the
+landed slice (still ahead of the durable-suspend work above) found and fixed
+four issues, each now regression-tested in `tests/test_async_agent_lifecycle.py`:
+
+- **Terminal states were not sticky.** `_handle_agent_check`/
+  `_handle_agent_cancel` read `record["state"]`, released the lock, called the
+  runner, and only then wrote the result back — a poll racing a cancel on the
+  same handle could resurrect a just-cancelled handle to `"done"` (or clobber
+  a completed result back to `"cancelled"` with a null result), whichever
+  runner round-trip happened to finish last. `_apply_async_status` now
+  discards an update once the record is already terminal, and
+  `_require_async_record` returns a lock-consistent snapshot instead of the
+  live dict, so a caller can no longer observe a torn read across `state`/
+  `result`/`error`.
+- **`agent_start` bypassed governance limits.** It launched a real background
+  child-agent run through the host runner without incrementing any counter —
+  `agent()`/`kanban_agent()`/`capability()` all count against
+  `max_agent_calls`/`max_kanban_calls`/`max_capability_calls`, but
+  `agent_start` only hit the shared `max_rpc_calls` ceiling (1000 by default,
+  versus `max_agent_calls`'s 200). It now counts against `max_agent_calls`
+  like `agent()`, with matching cache-hit accounting in `_maybe_replay` so a
+  partially-replayed run trips the cap at the same point. A `"done"` async
+  result's `_tokens` now also feeds `token_budget` (previously silently
+  dropped), closing a second bypass of the same governance surface.
+- **No idempotency identity crossed the runner seam.** `AsyncChildAgentRequest`
+  now carries the broker-derived deterministic handle as `idempotency_key`
+  (mirroring `kanban_agent`'s `kanban_idempotency_key`), so a host runner can
+  dedupe/reattach a re-dispatch of the same logical `agent_start` — e.g. one
+  recorded inside a crashed `parallel()` branch under the #109 pending-writes
+  contract and re-dispatched fresh on resume — instead of starting a second
+  background run with no way to tell it apart from a first.
+- **`StubAsyncAgentRunner` collided identical requests onto one token.**
+  Two independent `agent_start` calls with byte-identical `(target, input,
+  opts)` shared a token (a pure content digest), so cancelling one silently
+  cancelled the other. `start()` now appends a per-digest sequence number to
+  the token, keeping each call's lifecycle independent while the required
+  poll count (derived from the request content alone) stays reproducible.
+
+A guest-supplied `handle` on `agent_check`/`agent_cancel` is also now routed
+through `safe_capability_metadata_value` before it is journaled (it was
+previously written verbatim, including on the `bad_request`/`unknown_handle`
+denial paths where it has not gone through the broker's own content-addressed
+derivation), matching the `phase_title`/`label` precedent.
+
+**Runner seam and deterministic test stub.** `agents.AsyncChildAgentRunner` is
+the `Protocol` a host implements (`start`/`poll`/`cancel`); `run_workflow_script`
+wires it in as `async_child_runner=`, mirroring `child_agent_runner=`'s existing
+pattern — omit it and `agent_start`/`agent_check`/`agent_cancel` deny with
+`async_child_agent_unavailable`. `agents.StubAsyncAgentRunner` is the
+deterministic, network-free default for tests: it completes a given request
+after a fixed number of `poll()` calls derived only from a stable hash of the
+request (never wall-clock/randomness), so the same call always takes the same
+number of polls to resolve and every test is reproducible.
+
 ## 6. GitHub issue lifecycle hygiene template
 
 `examples/github_issue_lifecycle_hygiene.workflow.json` is the first saved template
@@ -1557,7 +2449,6 @@ Near-term and future work, roughly in priority order:
    - nested `workflow(name | {scriptPath}, args)` inline execution — the in-VM
      `workflow()` RPC currently always denies (`nested_denied`/`nested_unsupported`)
      rather than running a child workflow one level deep ([#91]);
-   - the `agentType` `agent()` option (custom subagent type selector) ([#92]);
    - a truncate-and-spill result tier (capped completion notification +
      on-demand spill) so the result is not delivered inline ([#93]);
    - a `parallel()`/`pipeline()` per-call element cap and `effort` enum

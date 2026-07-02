@@ -25,15 +25,24 @@ __all__ = [
     "ChildAgentRequest",
     "ChildAgentRunner",
     "CHILD_AGENT_OPTION_KEYS",
+    "child_visible_context_keys",
+    "filter_child_visible_context",
     "StubAgentRunner",
+    "AsyncChildAgentRequest",
+    "AsyncChildAgentRunner",
+    "AsyncAgentState",
+    "ASYNC_AGENT_STATES",
+    "StubAsyncAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
+    "register_known_agent",
+    "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
 ]
 
 CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
-    {"label", "phase", "schema", "model", "effort", "isolation", "context"}
+    {"label", "phase", "schema", "model", "effort", "isolation", "context", "tools", "agentType"}
 )
 
 
@@ -41,6 +50,13 @@ CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
 # deployment would resolve these against a Hermes service registry; for the
 # skeleton it is a deterministic allow-list used by ``workflow_validate`` to
 # emit ``E_UNKNOWN_AGENT`` and by :class:`StubAgentRunner` to shape stub output.
+#
+# This roster intentionally covers every ``hermes.*`` id used by the bundled
+# examples and tests (surveyed for #105). There is no bare ``hermes.*``
+# wildcard fallback: an unregistered id -- including a typo of one of these,
+# e.g. ``hermes.summarzier`` -- is rejected the same way any other unknown
+# agent id is, matching the hard-rejection behaviour the rest of the runtime
+# already enforces (unknown workflow capabilities, disallowed builtins, ...).
 KNOWN_AGENTS: frozenset[str] = frozenset(
     {
         "hermes.greeter",
@@ -49,20 +65,58 @@ KNOWN_AGENTS: frozenset[str] = frozenset(
         "hermes.summarizer",
         "hermes.classifier",
         "hermes.noop",
+        "hermes.bughunter",
+        "hermes.github.pr_head",
+        "hermes.github.release_exact_head",
+        "hermes.github.pr_event_context",
+        "hermes.github.pr_validation_summary",
+        "hermes.github.issue_inventory",
     }
 )
+
+# Ids an embedding host has registered at runtime via :func:`register_known_agent`,
+# in addition to the fixed :data:`KNOWN_AGENTS` roster above. Kept process-local
+# and additive: a real Hermes deployment resolves its own extended agent roster
+# once at startup, so there is no corresponding "unregister".
+_REGISTERED_AGENTS: set[str] = set()
+
+
+def register_known_agent(agent_id: str) -> None:
+    """Register ``agent_id`` as known, extending the fixed :data:`KNOWN_AGENTS` roster.
+
+    This is the explicit opt-in hook an embedding host uses to teach
+    ``workflow_validate`` and the runtime VM about agent ids beyond the bundled
+    skeleton roster -- there is no ``hermes.*`` wildcard fallback, so ids that
+    are not in :data:`KNOWN_AGENTS` must be registered here before scripts that
+    reference them will validate or run. Registration is idempotent and
+    additive for the lifetime of the process. ``kanban.<profile>`` ids are
+    reserved for :func:`kanban_runner_id` and may not be registered here.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("agent_id must be a non-empty string")
+    if is_kanban_runner_id(agent_id):
+        raise ValueError(f"{agent_id!r} is a reserved kanban runner id and cannot be registered as an agent")
+    _REGISTERED_AGENTS.add(agent_id)
+
+
+def registered_agent_ids() -> frozenset[str]:
+    """Return the effective known-agent roster: :data:`KNOWN_AGENTS` plus host-registered ids."""
+    return KNOWN_AGENTS | frozenset(_REGISTERED_AGENTS)
 
 
 def is_known_agent(agent_id: str) -> bool:
     """Return ``True`` if ``agent_id`` is a recognised Hermes agent id.
 
-    Recognises the fixed :data:`KNOWN_AGENTS` roster plus any id under the
-    reserved ``hermes.`` namespace, so example/stub workflows validate without
-    hard-coding every possible agent. ``kanban.<profile>`` ids are intentionally
-    excluded from ordinary agent steps; they are only produced by
-    ``kanban_agent`` through :func:`kanban_runner_id`.
+    Recognises exactly the fixed :data:`KNOWN_AGENTS` roster plus any id an
+    embedding host has explicitly added via :func:`register_known_agent`.
+    There is no bare ``hermes.*`` wildcard fallback: an unrecognised id --
+    including a typo under the ``hermes.`` namespace -- fails validation with
+    ``E_UNKNOWN_AGENT`` (error severity) instead of validating silently.
+    ``kanban.<profile>`` ids are intentionally excluded from ordinary agent
+    steps; they are only produced by ``kanban_agent`` through
+    :func:`kanban_runner_id`.
     """
-    return agent_id in KNOWN_AGENTS or agent_id.startswith("hermes.")
+    return agent_id in KNOWN_AGENTS or agent_id in _REGISTERED_AGENTS
 
 
 def kanban_runner_id(profile: str) -> str:
@@ -102,6 +156,22 @@ class ChildAgentRequest:
     effort: Optional[str] = None
     isolation: Optional[str] = None
     context: dict[str, Any] = field(default_factory=dict)
+    tools: Optional[tuple[str, ...]] = None
+    # Named subagent type selector (issue #92), resolved against a file-based
+    # registry by the broker (issue #104) -- see
+    # :mod:`hermes_workflows.agent_type_registry`. ``None`` means the script
+    # never set ``agentType`` explicitly; the broker still resolves a system
+    # prompt/defaults for the dispatch (the built-in ``general-purpose``
+    # type), it just does not stamp this field or the replay fingerprint.
+    agent_type: Optional[str] = None
+    # Broker-resolved system prompt for the request's effective agent type
+    # (explicit ``agentType`` or the built-in ``general-purpose`` default).
+    # Never script-settable directly -- there is no matching opts key -- and
+    # never part of the replay fingerprint (see ``_prompt_agent_fingerprint_payload``
+    # in :mod:`hermes_workflows.vm`): the agent-type *name* already
+    # identifies the call; the resolved prompt text is a deterministic
+    # function of it for a given registry.
+    system_prompt: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the runner contract as a plain JSON-friendly dict."""
@@ -114,16 +184,84 @@ class ChildAgentRequest:
             "effort": self.effort,
             "isolation": self.isolation,
             "context": copy.deepcopy(self.context),
+            "tools": list(self.tools) if self.tools is not None else None,
+            "agent_type": self.agent_type,
+            "system_prompt": self.system_prompt,
         }
 
 
 @runtime_checkable
 class ChildAgentRunner(Protocol):
-    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``."""
+    """Protocol for host-owned prompt subagents used by script ``agent(prompt, opts)``.
+
+    A runner may additionally declare a ``child_visible_context_keys:
+    frozenset[str]`` attribute naming the ``ChildAgentRequest.context`` keys it
+    is allowed to receive (issue #102). This is not a formal Protocol member --
+    it is optional and resolved via ``getattr`` with a fail-closed default (see
+    :func:`child_visible_context_keys`) -- so existing runners that predate the
+    contract keep working unchanged; they simply see no context until they opt
+    in. The allowlist is enforced parent-side, in ``vm.py``, immediately before
+    a ``ChildAgentRequest`` crosses this boundary; the runner is never trusted
+    to police itself. This is the inverse of deepagents' ``private_state_keys``
+    denylist: an explicit, host-declared *allowlist* of what a child may see,
+    not a list of what to hide from it.
+    """
 
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         """Run one isolated child agent and return its final structured result."""
         ...
+
+
+def child_visible_context_keys(runner: Any) -> frozenset[str]:
+    """Resolve ``runner``'s declared child-visible-context allowlist (issue #102).
+
+    Fail-closed default: a runner that does not expose a
+    ``child_visible_context_keys`` attribute gets an empty allowlist, so no
+    ``ChildAgentRequest.context`` key reaches it. A declared value that is not
+    an iterable of strings is treated the same as "undeclared" -- the parent
+    never trusts the runner's own honesty about the *shape* of its
+    declaration, only what it can verify. A ``str``/``bytes`` declaration is a
+    common typo for a single-element collection (e.g. ``"pr"`` meant to be
+    ``{"pr"}``) -- iterating it yields individual characters rather than the
+    intended key, so it is rejected outright rather than silently degraded.
+    """
+    declared = getattr(runner, "child_visible_context_keys", None)
+    if declared is None or isinstance(declared, (str, bytes)):
+        return frozenset()
+    try:
+        return frozenset(key for key in declared if isinstance(key, str))
+    except TypeError:
+        return frozenset()
+
+
+def filter_child_visible_context(
+    runner: Any, context: dict[str, Any]
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Filter ``context`` down to ``runner``'s declared allowlist (issue #102).
+
+    Returns ``(filtered_context, dropped_keys)``: the dict actually safe to
+    hand to ``runner``, and the sorted tuple of dropped key *names* -- never
+    their values -- suitable for a metadata-only journal note. Called
+    parent-side (``vm.py``), immediately before a ``ChildAgentRequest`` crosses
+    the runner boundary; it never trusts the runner to self-filter.
+    """
+    allowed = child_visible_context_keys(runner)
+    filtered = {
+        key: value
+        for key, value in context.items()
+        if isinstance(key, str) and key in allowed
+    }
+    # Non-string keys can never match the str allowlist, so they are always
+    # dropped -- and they must not crash the sort (mixed-type ``sorted()``
+    # raises ``TypeError``): non-string names are journaled via ``repr``.
+    dropped = tuple(
+        sorted(
+            key if isinstance(key, str) else repr(key)
+            for key in context
+            if not (isinstance(key, str) and key in allowed)
+        )
+    )
+    return filtered, dropped
 
 
 class StubAgentRunner:
@@ -220,3 +358,166 @@ class StubAgentRunner:
             default=str,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# -- async child-agent lifecycle (issue #112) --------------------------------
+#
+# ``agent()``/``kanban_agent()`` above are both *blocking*: one call crosses the
+# runner boundary and the script waits for a single structured result (kanban's
+# durable await, #5, hides a long wait behind that same one-call shape). This
+# section adds the complementary *non-blocking* lifecycle a script uses to fan
+# out long-running background work without holding an await open: start once,
+# keep orchestrating, poll many times. See ``vm.py``'s ``agent_start`` /
+# ``agent_check`` / ``agent_cancel`` / ``agent_list`` broker handlers and
+# ``vm_guest.py``'s globals of the same names for the RPC surface this seam
+# feeds; DESIGN.md documents the durable-suspend boundary this slice leaves for
+# a follow-up (the #5 Kanban await machinery this generalizes suspends the run
+# on an *unresolved* handle at script end -- this seam does not, yet).
+
+ASYNC_AGENT_STATES: frozenset[str] = frozenset({"pending", "done", "cancelled", "failed"})
+AsyncAgentState = str  # one of ASYNC_AGENT_STATES; kept as a plain str for JSON-safety.
+
+
+@dataclass(frozen=True)
+class AsyncChildAgentRequest:
+    """Host-facing request describing one background async child-agent run.
+
+    Mirrors :class:`ChildAgentRequest`'s role for the blocking ``agent()``
+    global, but for the async lifecycle: ``target`` names the agent/prompt to
+    run (its interpretation -- a known agent id vs. free-text prompt -- is
+    host-defined, exactly like ``agent()``'s own ``target``), ``input`` is the
+    structured payload, and ``opts`` is an open, host-defined options bag
+    (forwarded verbatim; unlike ``ChildAgentRequest`` this slice does not
+    validate it against a fixed key allowlist -- see DESIGN.md).
+    """
+
+    target: str
+    input: dict[str, Any] = field(default_factory=dict)
+    opts: dict[str, Any] = field(default_factory=dict)
+    # The broker-derived, deterministic ``agent_start`` handle (see
+    # ``CapabilityBroker._async_agent_handle``), passed through so a host
+    # runner can dedupe/reattach a duplicate dispatch of the *same logical*
+    # agent_start rather than starting a second background run. This matters
+    # under the #109 pending-writes contract: an agent_start recorded inside a
+    # crashed parallel() branch is discarded and re-dispatched fresh on
+    # resume, minting the identical handle both times -- without an
+    # idempotency identity crossing the runner seam, the host has no way to
+    # tell the resumed dispatch apart from a brand-new one. Mirrors
+    # ``kanban_agent``'s ``kanban_idempotency_key`` for the same reason.
+    idempotency_key: Optional[str] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the runner contract as a plain JSON-friendly dict."""
+        return {
+            "target": self.target,
+            "input": copy.deepcopy(self.input),
+            "opts": copy.deepcopy(self.opts),
+            "idempotency_key": self.idempotency_key,
+        }
+
+
+@runtime_checkable
+class AsyncChildAgentRunner(Protocol):
+    """Protocol for a host-owned background child-agent lifecycle (issue #112).
+
+    Unlike :class:`ChildAgentRunner` (blocking: one call, one result) this
+    models a remote run the parent broker starts once and polls many times:
+
+    * ``start(request)`` begins the run and returns an opaque, JSON-safe
+      ``token`` the broker persists alongside the script-visible handle. Must
+      not block on completion.
+    * ``poll(token)`` returns the run's current status without blocking:
+      ``{"state": "pending"}``, ``{"state": "done", "result": {...}}``, or
+      ``{"state": "failed", "error": {...}}``. ``result``/``error`` follow the
+      same metadata-only error contract as every other brokered call.
+    * ``cancel(token)`` requests cancellation and returns the resulting status
+      in the same shape as ``poll`` (typically ``{"state": "cancelled"}``);
+      idempotent when the token is already terminal.
+    """
+
+    def start(self, request: AsyncChildAgentRequest) -> Any:
+        """Begin one background run for ``request``; return an opaque token."""
+        ...
+
+    def poll(self, token: Any) -> dict[str, Any]:
+        """Return ``token``'s current status without blocking."""
+        ...
+
+    def cancel(self, token: Any) -> dict[str, Any]:
+        """Request cancellation of ``token``; return its resulting status."""
+        ...
+
+
+class StubAsyncAgentRunner:
+    """Deterministic, network-free default :class:`AsyncChildAgentRunner`.
+
+    Completes after a fixed number of ``poll()`` calls derived only from a
+    stable hash of the request (never wall-clock/randomness), so a given
+    ``(target, input, opts)`` always takes the same number of polls to
+    resolve and every test using it is reproducible. ``cancel()`` is terminal
+    and idempotent; a cancelled token stays cancelled even if polled again.
+
+    Each ``start()`` call gets its own independent lifecycle, even for two
+    calls with byte-identical requests: the token is the request's content
+    digest plus a per-digest monotonic sequence number (``f"{digest}:{n}"``),
+    still fully deterministic but no longer shared -- without the sequence
+    number, two independent ``agent_start`` calls with identical arguments
+    would collide on one token, so cancelling one would silently cancel the
+    other too.
+    """
+
+    def __init__(self) -> None:
+        self._requests: dict[str, AsyncChildAgentRequest] = {}
+        self._poll_counts: dict[str, int] = {}
+        self._cancelled: set[str] = set()
+        self._start_counts: dict[str, int] = {}
+
+    def start(self, request: AsyncChildAgentRequest) -> Any:
+        digest = self._digest(request)
+        n = self._start_counts.get(digest, 0)
+        self._start_counts[digest] = n + 1
+        token = f"{digest}:{n}"
+        self._requests[token] = request
+        self._poll_counts.setdefault(token, 0)
+        return token
+
+    def poll(self, token: Any) -> dict[str, Any]:
+        key = str(token)
+        if key in self._cancelled:
+            return {"state": "cancelled"}
+        request = self._requests.get(key)
+        if request is None:
+            return {
+                "state": "failed",
+                "error": {"type": "UnknownAsyncToken", "message": f"unknown async token {key!r}"},
+            }
+        self._poll_counts[key] = self._poll_counts.get(key, 0) + 1
+        if self._poll_counts[key] < self._required_polls(request):
+            return {"state": "pending"}
+        return {
+            "state": "done",
+            "result": {"echo": dict(request.input), "target": request.target, "digest": key},
+        }
+
+    def cancel(self, token: Any) -> dict[str, Any]:
+        key = str(token)
+        self._cancelled.add(key)
+        return {"state": "cancelled"}
+
+    @staticmethod
+    def _required_polls(request: AsyncChildAgentRequest) -> int:
+        """Deterministic 1..4 poll count derived from the request's own hash."""
+        digest = StubAsyncAgentRunner._digest(request)
+        return 1 + (int(digest[:8], 16) % 4)
+
+    @staticmethod
+    def _digest(request: AsyncChildAgentRequest) -> str:
+        import json
+
+        payload = json.dumps(
+            {"target": request.target, "input": request.input, "opts": request.opts},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

@@ -30,6 +30,7 @@ from .errors import ControlDispatchDenied, SandboxPolicyError
 from .models import StepStatus
 from .registry import RunStore, utc_now_iso
 from .sandbox import parse_ref
+from . import schema_subset
 
 __all__ = ["GovernancePolicy", "RunContext", "execute"]
 
@@ -609,46 +610,18 @@ def _resolve(value: Any, ctx: RunContext) -> Any:
     return value
 
 
-# Minimal type-hint-string -> python type table for output_schema checks.
-_TYPE_MAP: dict[str, tuple[type, ...]] = {
-    "string": (str,),
-    "str": (str,),
-    "number": (int, float),
-    "int": (int,),
-    "integer": (int,),
-    "float": (float,),
-    "bool": (bool,),
-    "boolean": (bool,),
-    "object": (dict,),
-    "dict": (dict,),
-    "list": (list,),
-    "array": (list,),
-    "any": (object,),
-}
-
-
 def _validate_output(output: dict[str, Any], output_schema: Optional[dict[str, Any]]) -> None:
     """Validate ``output`` against a declared ``output_schema`` (best-effort).
 
-    ``output_schema`` maps field -> type-hint string. Missing fields or type
-    mismatches raise :class:`SandboxPolicyError` so the step is recorded failed.
-    A ``None`` schema (no declaration) accepts any dict output.
+    Delegates to :mod:`hermes_workflows.schema_subset` (issue #107), the same
+    module the script VM uses, so both engines produce identical verdicts for
+    identical (schema, payload) pairs. ``output_schema`` may be the legacy flat
+    ``{field: type}`` shape or the JSON-Schema subset; either way, a missing
+    field, a type mismatch, or a malformed schema raises
+    :class:`SandboxPolicyError` so the step is recorded failed. A ``None``/empty
+    schema (no declaration) accepts any dict output.
     """
-    if not output_schema:
-        return
-    for field_name, hint in output_schema.items():
-        if field_name not in output:
-            raise SandboxPolicyError(f"output missing declared field {field_name!r}")
-        expected = _TYPE_MAP.get(str(hint).lower())
-        if expected is None:
-            continue  # unknown hint: skip rather than reject.
-        value = output[field_name]
-        # bool is a subclass of int; guard so "number"/"int" don't accept bools.
-        if expected != (bool,) and isinstance(value, bool):
-            raise SandboxPolicyError(
-                f"output field {field_name!r} expected {hint}, got bool"
-            )
-        if not isinstance(value, expected):
-            raise SandboxPolicyError(
-                f"output field {field_name!r} expected {hint}, got {type(value).__name__}"
-            )
+    try:
+        schema_subset.validate(output, output_schema)
+    except schema_subset.SchemaError as exc:
+        raise SandboxPolicyError(str(exc)) from exc

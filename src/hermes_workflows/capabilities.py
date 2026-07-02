@@ -26,6 +26,7 @@ __all__ = [
     "CapabilityRegistry",
     "UnknownWorkflowCapability",
     "find_capability_request_credential",
+    "finalize_capability_result",
     "normalize_capability_name",
     "safe_capability_metadata_value",
 ]
@@ -79,6 +80,13 @@ class CapabilityPolicy:
     allowed_side_effect_classes: tuple[str, ...] = ("read_only",)
     approval_required_classes: tuple[str, ...] = ("session_launch", "session_control", "external_write")
     approved_approval_ids: tuple[str, ...] = ()
+    # Interactive interrupt decisions (issue #111): when True and the run has an
+    # operator ControlStore wired, an approval-required call with no pre-approved
+    # approval_id suspends the run for an operator approve/edit/reject/respond
+    # decision instead of the default fast-path denial below. Default False keeps
+    # the pre-provisioned approval_id path (this policy's long-standing default)
+    # unchanged for every existing caller.
+    interactive_approval: bool = False
     max_result_bytes: int = 16_384
     max_stream_bytes: int = 4_096
 
@@ -172,14 +180,35 @@ class CapabilityRegistry:
             raw = capability.handler(context)
         except CapabilityDenied:
             raise
-        except Exception as exc:  # noqa: BLE001 - host handlers are contained at the capability boundary.
+        except KeyboardInterrupt:
+            raise  # let a genuine operator interrupt propagate.
+        except BaseException as exc:  # noqa: BLE001 - host handlers are contained at the capability
+            # boundary, including a deliberate SystemExit/GeneratorExit: a handler fault is a
+            # contract violation of *this* handler's own behavior, not a transient dispatch
+            # attempt against a live runner, so it stays retryable=False (issue #103) — unlike
+            # the broker's runner-exception containment in vm.py, which classifies
+            # retryable=True. Catching BaseException (not just Exception) keeps that
+            # distinction: without it, a handler-raised SystemExit would escape this boundary
+            # and fall into the broker's containment instead, misclassified as retryable=True.
             raise CapabilityDenied(
                 f"capability handler raised {type(exc).__name__}", code="capability_handler_error"
             ) from exc
-        normalized = _normalize_result(raw)
-        normalized.setdefault("side_effect_class", capability.side_effect_class)
-        normalized = redact_credentials(normalized)
-        return _bound_result(normalized, policy)
+        return finalize_capability_result(raw, side_effect_class=capability.side_effect_class, policy=policy)
+
+
+def finalize_capability_result(raw: Any, *, side_effect_class: str, policy: CapabilityPolicy) -> dict[str, Any]:
+    """Normalize, redact, and bound a capability result exactly like :meth:`CapabilityRegistry.run`.
+
+    Factored out so a caller that supplies a result *without* invoking a
+    registered handler — the interactive ``respond`` decision (issue #111),
+    which lets an operator hand back a value for a pending approval-gated call
+    instead of running it — gets the identical shape/credential/size contract a
+    live capability dispatch would have produced.
+    """
+    normalized = _normalize_result(raw)
+    normalized.setdefault("side_effect_class", side_effect_class)
+    normalized = redact_credentials(normalized)
+    return _bound_result(normalized, policy)
 
 
 def normalize_capability_name(name: str) -> str:
