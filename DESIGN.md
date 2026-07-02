@@ -776,6 +776,28 @@ Representative checks and codes:
 With `strict=True`, warnings are promoted to errors, so a strict caller rejects
 any definition that is not fully typed and policy-clean.
 
+**Known-agent resolution (`E_UNKNOWN_AGENT`).** `agent` steps are checked
+against `hermes_workflows.agents.is_known_agent`, which recognises exactly two
+sources: the fixed `KNOWN_AGENTS` roster (the ids the bundled examples/tests
+use, e.g. `hermes.greeter`, `hermes.github.pr_head`) and any id an embedding
+host has explicitly added via `register_known_agent(agent_id)`. There is no
+bare `hermes.*` wildcard fallback — a typo like `hermes.summarzier` fails
+`workflow_validate` with `E_UNKNOWN_AGENT` (error severity, not a warning) the
+same way any other unresolvable id does, instead of validating silently. This
+was previously a wildcard: any id starting with `hermes.` passed, which meant
+a typo'd agent id flowed all the way to the runner unnoticed — a quiet
+exception to the hard-rejection principle enforced everywhere else (unknown
+workflow capabilities, disallowed builtins, reserved `kanban.<profile>` runner
+ids). Error, not warning, was chosen for consistency with that existing
+behavior: every other "id the runtime cannot resolve" case in this table is
+already an error, so a demoted-to-warning `hermes.*` special case would just
+reintroduce a smaller version of the same silent-acceptance gap. Hosts that
+extend the roster at runtime call `register_known_agent` once per id at
+startup; registration is additive and process-lifetime (no unregister).
+`kanban.<profile>` ids remain excluded from ordinary `agent` steps regardless
+of registration — they are reserved for `kanban_agent` via `kanban_runner_id`
+and rejected up front by `is_kanban_runner_id`.
+
 ### 3.3 Allowed vs blocked
 
 **Allowed (skeleton):**
@@ -990,10 +1012,41 @@ A subprocess crash, a CPU-spin timeout (`VMLimits.max_runtime_s`), a protocol
 breach, or an exit-without-result is mapped to a failed `ScriptRunResult` —
 never an uncaught exception — so parent state is never corrupted. `VMLimits`
 (`max_rpc_calls` hard-abort backstop, soft per-`agent`/`kanban` caps,
-`token_budget`, `allow_nested_workflows`) is the first slice of the issue #11
-governance surface; launch-approval/session routing remain parent-owned future
-work. Journal events are metadata-only by default (method, call id, agent
-id/profile, ok) — raw inputs/outputs and prompts are redacted.
+`token_budget`, `allow_nested_workflows`, `max_result_bytes`) is the first
+slice of the issue #11 governance surface; launch-approval/session routing
+remain parent-owned future work. Journal events are metadata-only by default
+(method, call id, agent id/profile, ok) — raw inputs/outputs and prompts are
+redacted.
+
+| `VMLimits` field | Default | Enforced against | Breach behavior |
+| --- | --- | --- | --- |
+| `max_rpc_calls` | `1000` | every brokered `call` frame | hard-abort: `should_abort=True`, `limit_rpc` |
+| `max_agent_calls` | `200` | `agent` (incl. prompt-agent) dispatch | soft denial: `limit_agent` |
+| `max_kanban_calls` | `100` | `kanban_agent` dispatch | soft denial: `limit_kanban` |
+| `max_capability_calls` | `100` | `capability` dispatch | soft denial: `limit_capability` |
+| `max_parallel` | `8` | guest-side `parallel()` fan-out | guest-enforced batching |
+| `max_runtime_s` | `30.0` | wall-clock run deadline | hard-abort: subprocess killed, timeout |
+| `token_budget` | `None` (unbounded) | cumulative agent/prompt token usage | soft denial: `limit_token` |
+| `max_schema_retries` | `2` | prompt-agent structured-output retries | typed `schema` denial after retries exhausted |
+| `kanban_suspend_after_s` | `None` (blocks to deadline) | unresolved `on_block="pause"` Kanban await | durable suspend (`status="suspended"`), not a failure |
+| `max_result_bytes` | `524288` (512 KiB) | `agent`/`kanban_agent` (incl. prompt-agent) result, JSON-serialized, checked before `_persist_success` | soft denial: `result_too_large` (metadata-only: observed size, limit, call id) |
+
+`max_result_bytes` (#106) mirrors `CapabilityPolicy.max_result_bytes` on the
+`agent`/`kanban_agent` side of the broker success path: `capability()` already
+clips well-known stream fields then fails closed if the result is still too
+large (`capability_result_too_large`), but a huge `agent`/`kanban_agent`
+result had no bound at all — the single worst context-exposure gap, the
+mirror image of a filesystem-as-artifact-channel design. The broker checks the
+JSON-serialized size of every `agent`/`kanban_agent` value (prompt-agent calls
+are `agent` calls with a `prompt` param, so they are covered by the same
+check) immediately after dispatch and *before* `_persist_success`, so an
+over-limit result never reaches the script, the replay cache, or the
+in-memory prompt-agent cache. This is a hard ceiling, not a truncation: unlike
+the capability path there is no field-level clipping, so the failure is
+deterministic and repeatable rather than a surprise partial payload — a script
+may catch `result_too_large` via `CapabilityError` like any other soft denial.
+A future spill tier (#93) can convert this error into an offload instead of
+guessing at what was cut.
 
 ### 5.5 What is intentionally deferred
 
@@ -1134,7 +1187,33 @@ script-authored error messages are never written). Budget enforcement is
 best-effort on replay (recorded token spend is re-applied for determinism but the
 hard cap is not re-checked on a faithful replay).
 
-### 5.7.1 Pending-writes resume contract: completed `parallel()`/`pipeline()` siblings survive a mid-run crash (issue #109)
+### 5.7.1 Journal durability modes (issue #108)
+
+`journal.jsonl` writes historically always fsynced per event (the safest, and
+still the default, policy). `ScriptRunStore(root, *, durability=..., async_flush_every=...)`
+exposes a LangGraph-inspired `"exit" | "async" | "sync"` knob so an embedder can
+trade write latency against crash-window size. The knob governs **only**
+`journal.jsonl`; `run.json` (the operator-facing snapshot) is always fsynced
+on every `finish()`, and the per-card durable kanban event log
+(`append_kanban_event`, `script_store.py:964-1063`) is untouched — it keeps its
+own always-fsync policy, since it is the cross-process producer/consumer seam
+worker durability depends on.
+
+| Mode | Per-event behavior | Crash window |
+| --- | --- | --- |
+| `sync` (default) | Every `boot`/`call`/`agent_*`/`done` event is written and fsynced before the call returns — unchanged from the store's original behavior. | None: a parent crash immediately after any journal-producing call still leaves that event durable. |
+| `async` | Events are buffered in memory and fsynced together once `async_flush_every` events have accumulated (default 8) — a **count** trigger, never a wall-clock timer (the module's no-wall-clock/no-randomness contract applies to journal writes too, so behavior stays deterministic and replay-safe). | Up to `async_flush_every - 1` of the most recent events (since the last count-triggered flush) are only in process memory and are lost on a parent crash/kill before the next flush or before the run's terminal `finish()`. |
+| `exit` | Events are buffered in memory and never proactively fsynced during the run. | Every event since `begin()` is only in process memory until the run's terminal `finish()`; a parent crash/kill at any point during the run loses the entire in-memory journal for that run (the `run.json` snapshot from any prior `finish()`-adjacent write is unaffected, since it is a different file with its own always-fsync policy). |
+
+Regardless of mode, **`finish()` always force-flushes** any buffered events
+before returning — this is the single funnel for every terminal status
+(`succeeded` / `failed` / `suspended` / `stopped` / `paused`), so suspend and
+abort get the same durability guarantee as a normal completion: once `finish()`
+returns, the full journal for that run is on disk. The only crash window that
+matters for `async`/`exit` is therefore *mid-run, before `finish()` runs* —
+exactly the trade an embedder opts into for lower per-call write latency.
+
+### 5.7.2 Pending-writes resume contract: completed `parallel()`/`pipeline()` siblings survive a mid-run crash (issue #109)
 
 LangGraph calls this "pending writes": siblings that already completed within a
 failed superstep are preserved on resume, not re-executed. §5.7's replay cache
