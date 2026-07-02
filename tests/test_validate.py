@@ -176,6 +176,21 @@ def test_unknown_agent_reference_is_error():
     assert all(e.pointer.startswith("/") for e in offending)
 
 
+def test_typo_d_hermes_namespace_agent_reference_is_error():
+    """A typo'd id under the ``hermes.`` namespace is not silently accepted.
+
+    ``is_known_agent`` recognises exactly the fixed ``KNOWN_AGENTS`` roster
+    plus host-registered ids -- there is no bare ``hermes.*`` wildcard
+    fallback -- so a near-miss like ``hermes.summarzier`` still fails with
+    ``E_UNKNOWN_AGENT`` instead of validating cleanly (#105).
+    """
+    d = valid_definition()
+    d["steps"][0]["agent"] = "hermes.summarzier"
+    result = workflow_validate(d)
+    assert result.ok is False
+    assert "E_UNKNOWN_AGENT" in _codes(result.errors)
+
+
 def test_cyclic_depends_on_is_error():
     """A cycle in the depends_on / pipeline graph -> E_CYCLE."""
     d = valid_definition()

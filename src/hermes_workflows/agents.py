@@ -28,6 +28,8 @@ __all__ = [
     "StubAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
+    "register_known_agent",
+    "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
 ]
@@ -41,6 +43,13 @@ CHILD_AGENT_OPTION_KEYS: frozenset[str] = frozenset(
 # deployment would resolve these against a Hermes service registry; for the
 # skeleton it is a deterministic allow-list used by ``workflow_validate`` to
 # emit ``E_UNKNOWN_AGENT`` and by :class:`StubAgentRunner` to shape stub output.
+#
+# This roster intentionally covers every ``hermes.*`` id used by the bundled
+# examples and tests (surveyed for #105). There is no bare ``hermes.*``
+# wildcard fallback: an unregistered id -- including a typo of one of these,
+# e.g. ``hermes.summarzier`` -- is rejected the same way any other unknown
+# agent id is, matching the hard-rejection behaviour the rest of the runtime
+# already enforces (unknown workflow capabilities, disallowed builtins, ...).
 KNOWN_AGENTS: frozenset[str] = frozenset(
     {
         "hermes.greeter",
@@ -49,20 +58,58 @@ KNOWN_AGENTS: frozenset[str] = frozenset(
         "hermes.summarizer",
         "hermes.classifier",
         "hermes.noop",
+        "hermes.bughunter",
+        "hermes.github.pr_head",
+        "hermes.github.release_exact_head",
+        "hermes.github.pr_event_context",
+        "hermes.github.pr_validation_summary",
+        "hermes.github.issue_inventory",
     }
 )
+
+# Ids an embedding host has registered at runtime via :func:`register_known_agent`,
+# in addition to the fixed :data:`KNOWN_AGENTS` roster above. Kept process-local
+# and additive: a real Hermes deployment resolves its own extended agent roster
+# once at startup, so there is no corresponding "unregister".
+_REGISTERED_AGENTS: set[str] = set()
+
+
+def register_known_agent(agent_id: str) -> None:
+    """Register ``agent_id`` as known, extending the fixed :data:`KNOWN_AGENTS` roster.
+
+    This is the explicit opt-in hook an embedding host uses to teach
+    ``workflow_validate`` and the runtime VM about agent ids beyond the bundled
+    skeleton roster -- there is no ``hermes.*`` wildcard fallback, so ids that
+    are not in :data:`KNOWN_AGENTS` must be registered here before scripts that
+    reference them will validate or run. Registration is idempotent and
+    additive for the lifetime of the process. ``kanban.<profile>`` ids are
+    reserved for :func:`kanban_runner_id` and may not be registered here.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("agent_id must be a non-empty string")
+    if is_kanban_runner_id(agent_id):
+        raise ValueError(f"{agent_id!r} is a reserved kanban runner id and cannot be registered as an agent")
+    _REGISTERED_AGENTS.add(agent_id)
+
+
+def registered_agent_ids() -> frozenset[str]:
+    """Return the effective known-agent roster: :data:`KNOWN_AGENTS` plus host-registered ids."""
+    return KNOWN_AGENTS | frozenset(_REGISTERED_AGENTS)
 
 
 def is_known_agent(agent_id: str) -> bool:
     """Return ``True`` if ``agent_id`` is a recognised Hermes agent id.
 
-    Recognises the fixed :data:`KNOWN_AGENTS` roster plus any id under the
-    reserved ``hermes.`` namespace, so example/stub workflows validate without
-    hard-coding every possible agent. ``kanban.<profile>`` ids are intentionally
-    excluded from ordinary agent steps; they are only produced by
-    ``kanban_agent`` through :func:`kanban_runner_id`.
+    Recognises exactly the fixed :data:`KNOWN_AGENTS` roster plus any id an
+    embedding host has explicitly added via :func:`register_known_agent`.
+    There is no bare ``hermes.*`` wildcard fallback: an unrecognised id --
+    including a typo under the ``hermes.`` namespace -- fails validation with
+    ``E_UNKNOWN_AGENT`` (error severity) instead of validating silently.
+    ``kanban.<profile>`` ids are intentionally excluded from ordinary agent
+    steps; they are only produced by ``kanban_agent`` through
+    :func:`kanban_runner_id`.
     """
-    return agent_id in KNOWN_AGENTS or agent_id.startswith("hermes.")
+    return agent_id in KNOWN_AGENTS or agent_id in _REGISTERED_AGENTS
 
 
 def kanban_runner_id(profile: str) -> str:
