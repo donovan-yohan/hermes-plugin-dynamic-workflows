@@ -1348,6 +1348,13 @@ input)` form already surfaces a `tools` key placed in `input` verbatim (it
 echoes the whole `input` dict) — the allowlist is only a first-class,
 broker-validated option on the `agent(prompt, opts)` path.
 
+An explicit `"tools": []` is a valid, distinct allowlist — the most
+restrictive one, "no tools at all" — not an alias for omitting `tools`
+entirely. It normalizes to `()`, is forwarded to the child runner as `()`,
+and (per the table above) still feeds the fingerprint since it is not
+`None`, so it lands in its own cache entry rather than reusing the
+tools-less one.
+
 ### 5.8 `kanban_agent` as a durable awaitable (issue #5)
 
 `kanban.py` upgrades `kanban_agent` from a synchronous stub call into a

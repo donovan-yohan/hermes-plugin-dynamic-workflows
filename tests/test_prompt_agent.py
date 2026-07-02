@@ -273,6 +273,30 @@ def test_prompt_agent_schema_retry_journal_redacts_label_and_phase_metadata():
         assert "token=phase-secret" not in repr(journal_retry)
 
 
+def test_prompt_agent_schema_retry_preserves_tools_allowlist_on_reconstructed_request():
+    # Regression pin (issue #101 review): the retry-context reconstruction in
+    # _request_with_schema_retry_context must carry the caller's `tools`
+    # allowlist forward on every attempt -- dropping it would silently widen
+    # (unscope) the child dispatched on retry.
+    runner = SequenceChildRunner([
+        {"answer": 7},
+        {"answer": "ok"},
+    ])
+    script = META + (
+        'result = await agent("summarize", {\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "tools": ["read_file"],\n'
+        '})\n'
+        'return result\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert len(runner.requests) == 2
+    assert runner.requests[0].tools == ("read_file",)
+    assert runner.requests[1].tools == runner.requests[0].tools == ("read_file",)
+
+
 def test_prompt_agent_schema_retry_exhaustion_returns_typed_schema_failure():
     runner = SequenceChildRunner([{"answer": 7}, {}])
     res = run_workflow_script(
@@ -617,6 +641,47 @@ def test_prompt_agent_without_tools_leaves_request_tools_none():
     assert runner.requests[0].tools is None
 
 
+def test_prompt_agent_empty_tools_list_is_most_restrictive_allowlist():
+    # Pin (issue #101 review): an explicit empty `tools` list is a distinct,
+    # deliberate "no tools at all" allowlist -- not equivalent to omitting
+    # `tools`. It normalizes to `()`, reaches the child runner as such, and
+    # mints a fingerprint distinct from the tools-less call (see DESIGN.md
+    # §5.7.3). See also test_prompt_agent_malformed_tools_rejected_* for the
+    # `[""]` case, which is rejected (an empty-*string* item), unlike `[]`.
+    runner = FakeChildRunner({"answer": "ok"})
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "tools": [],\n'
+        '})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(script, store=store, run_id="empty_tools_fp", child_agent_runner=runner)
+        assert res.ok, res.error
+        assert runner.requests[0].tools == ()
+
+        empty_tools_fingerprint = next(
+            e["fingerprint"] for e in store.journal("empty_tools_fp") if e["type"] == "agent_started"
+        )
+
+    runner_no_tools = FakeChildRunner({"answer": "ok"})
+    script_no_tools = META + 'return await agent("summarize", {"schema": {"answer": "string"}})\n'
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script_no_tools, store=store, run_id="no_tools_fp", child_agent_runner=runner_no_tools
+        )
+        assert res.ok, res.error
+        assert runner_no_tools.requests[0].tools is None
+
+        no_tools_fingerprint = next(
+            e["fingerprint"] for e in store.journal("no_tools_fp") if e["type"] == "agent_started"
+        )
+
+    assert empty_tools_fingerprint != no_tools_fingerprint
+
+
 def test_prompt_agent_tools_change_fingerprint():
     runner = FakeChildRunner({"answer": "ok"})
     script = META + (
@@ -647,7 +712,7 @@ def test_prompt_agent_fingerprint_without_tools_matches_pre_tools_baseline():
     request = ChildAgentRequest(
         prompt="summarize", label="x", schema={"answer": "string"}, model="sonnet"
     )
-    fingerprint, _args_hash = _prompt_agent_cache_identity(request)
+    fingerprint, args_hash = _prompt_agent_cache_identity(request)
 
     pre_tools_payload = {
         "prompt": "summarize",
@@ -661,6 +726,15 @@ def test_prompt_agent_fingerprint_without_tools_matches_pre_tools_baseline():
     }
     expected = "v2:" + canonical_hash({"kind": "agent(prompt,opts)", "version": 2, "request": pre_tools_payload})
     assert fingerprint == expected
+
+    # _maybe_prompt_cache_hit hard-aborts (replay_mismatch) on any args_hash
+    # divergence, so pin the pre-#101 args_hash derivation too -- not just the
+    # fingerprint -- otherwise a regression there would brick durable resume
+    # for every pre-#101 recorded prompt-agent call without a failing test.
+    expected_args_hash = canonical_hash(
+        {"method": "agent", "fingerprint": expected, "request": pre_tools_payload}
+    )
+    assert args_hash == expected_args_hash
 
 
 def test_prompt_agent_malformed_tools_rejected_deterministically_not_retryable():
