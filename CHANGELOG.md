@@ -28,6 +28,49 @@ First public alpha release line for `hermes-plugin-dynamic-workflows`.
 - Per-subagent transcript artifacts — per-call journal plus redacted metadata refs (including replay/cache-hit refs), surfaced in background run links.
 - Archive-backed loop-until-dry parity fixture exercising parallel fan-out plus prompt/options replay.
 
+#### deepagents stack-up wave (2026-07)
+
+Grounded in the adversarially-verified architecture comparison at
+`docs/analysis/deepagents-stackup-2026-07.md` (epics #99/#100; every slice
+adversarially reviewed pre-merge, Copilot-reviewed on the PR where available).
+Verified end-to-end in a live Hermes session (profile plugin checkout at this
+wave's head: `workflow` tool validate + run of a stub-backed script succeeded).
+
+- Explicit known-agent roster registration (`register_known_agent`) — the bare
+  `hermes.*` wildcard no longer validates typo'd agent ids silently (#105).
+- Fail-closed size bound on `agent`/`kanban_agent` results (`max_result_bytes`,
+  `result_too_large`) measured with the persistence-path encoder, so oversized
+  payloads never reach script memory or the replay cache (#106).
+- Retryable/catchable dispatch-error taxonomy: `CapabilityDenied.retryable`,
+  catchable `runner_error` with deterministic failure replay (buffered records
+  flushed only for handled failures, preserving the pending-writes contract) (#103).
+- Shared JSON-Schema-subset output validator (nested objects/arrays/enums)
+  across the script VM and JSON engine, fail-closed on unknown keywords, with
+  legacy flat schemas normalized compatibly; `kanban_agent` stays legacy-flat,
+  statically enforced (#107).
+- Journal durability modes on `ScriptRunStore` (`sync`/`async`/`exit`) with
+  force-flush on every terminal status (#108).
+- Pending-writes resume contract stated in DESIGN.md §5.7.2 and pinned by a
+  crash-mid-`parallel()` fixture (#109).
+- `tools` allowlist on `ChildAgentRequest`/`agent()` opts, feeding the replay
+  fingerprint only when set (pre-existing fingerprints stay byte-identical) (#101).
+- Pluggable store contract (`ScriptRunStoreProtocol`) plus a SQLite backend
+  (WAL, versioned schema, typed error boundary, cross-process-safe kanban
+  event sequencing) (#110).
+- Host-declared child-visible-context quarantine on the `ChildAgentRunner`
+  seam — allowlist-only, fail-closed, dropped key names journaled redacted (#102).
+- Interactive interrupt decisions on suspended approval-gated calls:
+  approve/edit/reject/respond via `workflow_control`, journaled and
+  replay-deterministic, with edited params becoming replay-authoritative (#111).
+- `agentType` opt (#92) resolved against a file-based agent-type registry
+  (project-over-user scope, frontmatter + system-prompt body, fail-closed
+  hygiene, built-in `general-purpose` default) (#104).
+- Async child-agent lifecycle globals — `agent_start`/`agent_check`/
+  `agent_cancel`/`agent_list` over a new `AsyncChildAgentRunner` seam with
+  deterministic handles, sticky terminal states, governance caps, and token
+  accounting on live and replayed paths (#112; durable suspend follow-up #129).
+- Deflaked wall-clock-sensitive background launch/stop timing tests (#119, #125).
+
 ### Fixed
 
 - Replay/cache-hit accounting no longer deadlocks when a journal callback re-enters the broker: shared-state mutations are taken under the broker lock in a short scope and journal/transcript writes happen after the lock is released.
