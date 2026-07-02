@@ -18,6 +18,12 @@ RESPONSES_PATH = FIXTURE_DIR / "fake_child_responses.json"
 class FixtureChildRunner:
     """Deterministic child-agent runner backed by sanitized fixture rows."""
 
+    # Issue #102: declares the child-visible-context allowlist this fixture's
+    # scripted phases actually rely on ("round"/"area" for finder phases,
+    # "bug"/"verifier" for verifier phases). Without this, the parent broker's
+    # fail-closed default would drop all four keys before dispatch.
+    child_visible_context_keys = frozenset({"round", "area", "bug", "verifier"})
+
     def __init__(self, responses: dict[str, Any]) -> None:
         self.responses = responses
         self.requests: list[ChildAgentRequest] = []

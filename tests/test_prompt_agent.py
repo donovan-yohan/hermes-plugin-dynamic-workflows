@@ -23,9 +23,19 @@ META = 'meta = {"name": "prompt-agent", "description": "d"}\n'
 
 
 class FakeChildRunner:
-    def __init__(self, output: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        output: dict[str, Any] | None = None,
+        *,
+        child_visible_context_keys: frozenset[str] = frozenset(),
+    ) -> None:
         self.output = output or {"answer": "ok", "_tokens": 3}
         self.requests: list[ChildAgentRequest] = []
+        # Issue #102: declared allowlist for the child-visible-context quarantine.
+        # Defaults empty (fail-closed), matching an undeclared runner; individual
+        # tests opt a runner into specific keys to keep pre-existing context-echo
+        # assertions meaningful.
+        self.child_visible_context_keys = child_visible_context_keys
 
     def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
         self.requests.append(request)
@@ -43,9 +53,15 @@ class PromptOutputRunner:
 
 
 class SequenceChildRunner:
-    def __init__(self, outputs: list[Any]) -> None:
+    def __init__(
+        self,
+        outputs: list[Any],
+        *,
+        child_visible_context_keys: frozenset[str] = frozenset(),
+    ) -> None:
         self.outputs = list(outputs)
         self.requests: list[ChildAgentRequest] = []
+        self.child_visible_context_keys = child_visible_context_keys
 
     def __call__(self, request: ChildAgentRequest) -> Any:
         self.requests.append(request)
@@ -79,7 +95,10 @@ def test_child_agent_request_as_dict_serializes_tools_and_defaults_to_none():
 
 def test_prompt_agent_routes_to_injected_child_runner_and_persists_redacted_outputs():
     secret = "ghp_should_not_persist_secret"
-    runner = FakeChildRunner({"answer": "ok", "token": secret, "nested": {"detail": secret}, "_tokens": 3})
+    runner = FakeChildRunner(
+        {"answer": "ok", "token": secret, "nested": {"detail": secret}, "_tokens": 3},
+        child_visible_context_keys=frozenset({"pr"}),
+    )
     script = META + (
         'result = await agent("summarize the latest PR", {\n'
         '    "label": "summary",\n'
@@ -187,10 +206,13 @@ def test_prompt_agent_child_output_is_json_safe_before_returning_to_script():
 
 
 def test_prompt_agent_schema_invalid_output_retries_with_validation_context_and_journal():
-    runner = SequenceChildRunner([
-        {"answer": 7},
-        {"answer": "ok", "_tokens": 5},
-    ])
+    runner = SequenceChildRunner(
+        [
+            {"answer": 7},
+            {"answer": "ok", "_tokens": 5},
+        ],
+        child_visible_context_keys=frozenset({"topic"}),
+    )
     script = META + (
         'result = await agent("summarize", {\n'
         '    "label": "summary",\n'
@@ -1050,3 +1072,251 @@ def test_prompt_agent_agent_type_without_registry_configured_still_resolves_gene
     res = run_workflow_script(META + 'return await agent("write a plan")\n', child_agent_runner=runner)
     assert res.ok, res.error
     assert runner.requests[0].system_prompt
+
+# --------------------------------------------------------------------------- #
+# Host-declared child-visible-context quarantine (issue #102).
+# --------------------------------------------------------------------------- #
+#
+# The runner seam receives a free-form ``context`` dict; the inverse of
+# deepagents' ``private_state_keys`` denylist is an explicit, host-declared
+# *allowlist* -- ``child_visible_context_keys: frozenset[str]`` -- that the
+# parent broker (vm.py) enforces before a ``ChildAgentRequest`` crosses the
+# runner boundary. Undeclared defaults to the empty allowlist (fail-closed).
+
+
+class SpyChildRunner:
+    """A :class:`ChildAgentRunner` test double that records exactly what it received."""
+
+    def __init__(self, child_visible_context_keys: frozenset[str] | None = None) -> None:
+        self.requests: list[ChildAgentRequest] = []
+        # Deliberately omit the attribute entirely when None, to prove the
+        # broker's fail-closed default for an *undeclared* spec (not merely an
+        # empty declared one -- both must behave identically).
+        if child_visible_context_keys is not None:
+            self.child_visible_context_keys = child_visible_context_keys
+
+    def __call__(self, request: ChildAgentRequest) -> dict[str, Any]:
+        self.requests.append(request)
+        return {"answer": "ok"}
+
+
+def test_prompt_agent_context_filtered_to_runner_declared_allowlist():
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "context": {"pr": 70, "secret_token": "leak-me", "chat_history": ["hi"]},\n'
+        '})\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert len(runner.requests) == 1
+    assert runner.requests[0].context == {"pr": 70}
+
+
+def test_prompt_agent_undeclared_runner_gets_no_context_at_all():
+    # No child_visible_context_keys attribute at all -- the fail-closed default.
+    runner = SpyChildRunner(None)
+    assert not hasattr(runner, "child_visible_context_keys")
+    script = META + (
+        'return await agent("summarize", {"context": {"pr": 70}})\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
+def test_prompt_agent_explicit_empty_allowlist_behaves_like_undeclared():
+    runner = SpyChildRunner(frozenset())
+    script = META + 'return await agent("summarize", {"context": {"pr": 70}})\n'
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
+def test_prompt_agent_str_declaration_behaves_like_undeclared_not_char_set():
+    # A bare string is the most plausible typo for a single-element allowlist
+    # (e.g. ``"pr"`` meant to be ``{"pr"}``). Python iterates a str character
+    # by character, so an unguarded ``frozenset(declared)`` would silently
+    # yield frozenset({"p", "r"}) -- dropping the intended key while letting
+    # any single-character context key pass through. Must fail closed instead.
+    runner = SpyChildRunner("pr")
+    script = META + (
+        'return await agent("summarize", {"context": {"pr": 70, "p": "leak"}})\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
+def test_prompt_agent_non_iterable_declaration_fails_closed_instead_of_crashing():
+    # A malformed declaration (e.g. an int) must not propagate a TypeError up
+    # through handle() as a runner_error -- it fails closed to an empty
+    # allowlist, per DESIGN.md Sec5.7.5.
+    runner = SpyChildRunner(42)
+    script = META + 'return await agent("summarize", {"context": {"pr": 70}})\n'
+    res = run_workflow_script(script, child_agent_runner=runner)
+
+    assert res.ok, res.error
+    assert runner.requests[0].context == {}
+
+
+def test_filter_child_visible_context_tolerates_non_string_context_keys():
+    # ``_prompt_agent_request`` only validates that ``context`` is a dict, so a
+    # mixed-key dict can reach the filter. Non-string keys can never match the
+    # str allowlist -- they must be dropped (journaled via repr) without the
+    # mixed-type ``sorted()`` TypeError crashing the run.
+    from hermes_workflows.agents import filter_child_visible_context
+
+    runner = SpyChildRunner(frozenset({"pr"}))
+    filtered, dropped = filter_child_visible_context(
+        runner, {1: "x", "pr": 70, "secret": "y"}
+    )
+
+    assert filtered == {"pr": 70}
+    assert dropped == ("1", "secret")
+
+
+def test_prompt_agent_context_quarantine_journals_dropped_key_names_not_values():
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "context": {"pr": 70, "secret_token": "leak-me-please"},\n'
+        '})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script, store=store, run_id="quarantine_run", child_agent_runner=runner
+        )
+        assert res.ok, res.error
+
+        journal = store.journal("quarantine_run")
+        started = next(event for event in journal if event["type"] == "agent_started")
+        assert started["dropped_context_keys"] == ["secret_token"]
+
+        journal_path = Path(tmp) / "runs" / "quarantine_run" / "journal.jsonl"
+        journal_text = journal_path.read_text(encoding="utf-8")
+        assert "leak-me-please" not in journal_text
+        run_text = (Path(tmp) / "runs" / "quarantine_run" / "run.json").read_text(encoding="utf-8")
+        assert "leak-me-please" not in run_text
+
+
+def test_prompt_agent_context_quarantine_redacts_credential_marker_in_dropped_key_name():
+    # Context *key names* are script-chosen strings, same class of input as
+    # label/phase; a dynamically built context whose key itself carries a
+    # credential marker must be redacted before it reaches the journal, not
+    # journaled verbatim.
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "context": {"pr": 70, "token=ghp_leaked_in_key_name": "x"},\n'
+        '})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script, store=store, run_id="quarantine_key_redact", child_agent_runner=runner
+        )
+        assert res.ok, res.error
+
+        journal = store.journal("quarantine_key_redact")
+        started = next(event for event in journal if event["type"] == "agent_started")
+        assert started["dropped_context_keys"] == [REDACTED]
+
+        journal_path = Path(tmp) / "runs" / "quarantine_key_redact" / "journal.jsonl"
+        journal_text = journal_path.read_text(encoding="utf-8")
+        assert "token=ghp_leaked_in_key_name" not in journal_text
+
+
+def test_prompt_agent_context_quarantine_no_journal_note_when_nothing_dropped():
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + 'return await agent("summarize", {"context": {"pr": 70}})\n'
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            script, store=store, run_id="no_drop_run", child_agent_runner=runner
+        )
+        assert res.ok, res.error
+        started = next(
+            event for event in store.journal("no_drop_run") if event["type"] == "agent_started"
+        )
+        assert "dropped_context_keys" not in started
+
+
+def test_prompt_agent_context_quarantine_fingerprint_is_pre_filter_and_runner_independent():
+    # Design decision (issue #102, DESIGN.md §5.7.5): the v2: fingerprint is
+    # minted over the pre-filter, script-supplied context so cache/replay
+    # identity never depends on which runner happens to be configured, or on
+    # what allowlist it declares. Two runners with wildly different declared
+    # allowlists dispatching the *same* prompt/opts call must mint the same
+    # fingerprint.
+    script = META + (
+        'return await agent("summarize", {\n'
+        '    "schema": {"answer": "string"},\n'
+        '    "context": {"pr": 70, "secret_token": "leak-me"},\n'
+        '})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        wide_runner = SpyChildRunner(frozenset({"pr", "secret_token"}))
+        res_wide = run_workflow_script(
+            script, store=store, run_id="wide", child_agent_runner=wide_runner
+        )
+        assert res_wide.ok, res_wide.error
+        assert wide_runner.requests[0].context == {"pr": 70, "secret_token": "leak-me"}
+
+        narrow_runner = SpyChildRunner(frozenset())
+        res_narrow = run_workflow_script(
+            script, store=store, run_id="narrow", child_agent_runner=narrow_runner
+        )
+        assert res_narrow.ok, res_narrow.error
+        assert narrow_runner.requests[0].context == {}
+
+        wide_fp = next(
+            e["fingerprint"] for e in store.journal("wide") if e["type"] == "agent_started"
+        )
+        narrow_fp = next(
+            e["fingerprint"] for e in store.journal("narrow") if e["type"] == "agent_started"
+        )
+        assert wide_fp == narrow_fp
+
+
+def test_prompt_agent_context_quarantine_full_pass_through_fingerprint_matches_pre_102_baseline():
+    # A runner whose allowlist happens to cover every key the script provided
+    # sees the context unchanged, and mints the exact same fingerprint a
+    # pre-#102 build would have for the identical call -- the filter never
+    # rewrites the fingerprint payload, only what crosses the runner boundary.
+    from hermes_workflows.script_store import canonical_hash
+    from hermes_workflows.vm import _prompt_agent_cache_identity
+
+    request = ChildAgentRequest(prompt="summarize", schema={"answer": "string"}, context={"pr": 70})
+    pre_filter_fingerprint, _ = _prompt_agent_cache_identity(request)
+
+    runner = SpyChildRunner(frozenset({"pr"}))
+    script = META + (
+        'return await agent("summarize", {"schema": {"answer": "string"}, "context": {"pr": 70}})\n'
+    )
+    with TemporaryDirectory() as tmp:
+        store = ScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(script, store=store, run_id="full_pass", child_agent_runner=runner)
+        assert res.ok, res.error
+        assert runner.requests[0].context == {"pr": 70}
+        started_fp = next(
+            e["fingerprint"] for e in store.journal("full_pass") if e["type"] == "agent_started"
+        )
+        assert started_fp == pre_filter_fingerprint
+        assert canonical_hash({"kind": "agent(prompt,opts)", "version": 2, "request": {
+            "prompt": "summarize",
+            "label": None,
+            "phase": None,
+            "schema": {"answer": "string"},
+            "model": None,
+            "effort": None,
+            "isolation": None,
+            "context": {"pr": 70},
+        }}) == pre_filter_fingerprint.removeprefix("v2:")
