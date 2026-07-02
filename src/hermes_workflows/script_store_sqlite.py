@@ -61,6 +61,7 @@ This module is pure Python 3.11 stdlib (``sqlite3``).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -80,6 +81,7 @@ from .script_store import (
     TranscriptRecorder,
     _KANBAN_NON_WAIT_STATUSES,
     _KANBAN_TERMINAL_STATUSES,
+    _redact_error,
     _require_safe_card_id,
     _require_safe_run_id,
     canonical_hash,
@@ -102,68 +104,82 @@ SQLITE_STORE_SCHEMA_VERSION = 1
 _DEFAULT_JOURNAL_DURABILITY: JournalDurability = "sync"
 _DEFAULT_ASYNC_FLUSH_EVERY = 8
 
-_SCHEMA_DDL = """
-CREATE TABLE runs (
-    run_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL,
-    script_sha256 TEXT NOT NULL,
-    args_hash TEXT NOT NULL,
-    status TEXT NOT NULL,
-    meta_json TEXT,
-    limits_json TEXT,
-    value_json TEXT,
-    error_json TEXT,
-    deterministic_runner INTEGER NOT NULL,
-    replay_of TEXT,
-    transcripts_json TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE journal (
-    run_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    data_json TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq)
-);
-
-CREATE TABLE cache_calls (
-    run_id TEXT NOT NULL,
-    call_id INTEGER NOT NULL,
-    method TEXT NOT NULL,
-    args_hash TEXT NOT NULL,
-    value_json TEXT,
-    ok INTEGER NOT NULL,
-    code TEXT,
-    retryable INTEGER NOT NULL,
-    PRIMARY KEY (run_id, call_id)
-);
-
-CREATE TABLE cache_prompts (
-    run_id TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    method TEXT NOT NULL,
-    args_hash TEXT NOT NULL,
-    value_json TEXT,
-    PRIMARY KEY (run_id, fingerprint)
-);
-
-CREATE TABLE kanban_card_state (
-    card_id TEXT PRIMARY KEY,
-    state_json TEXT NOT NULL
-);
-
-CREATE TABLE kanban_events (
-    card_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    ts TEXT NOT NULL,
-    status TEXT NOT NULL,
-    workflow_result_json TEXT NOT NULL,
-    reason TEXT,
-    profile TEXT NOT NULL,
-    PRIMARY KEY (card_id, seq)
-);
-"""
+# Every statement uses ``IF NOT EXISTS`` so a partially-applied prior init
+# (tables present but ``user_version`` never got stamped — see
+# ``_open_schema``) self-heals instead of dying with "table already exists".
+# Split into individual statements (rather than one ``executescript`` blob)
+# so ``_open_schema`` can run them inside its own explicit ``BEGIN
+# IMMEDIATE``/``COMMIT`` transaction: ``executescript`` always commits any
+# pending transaction first, which would defeat that atomicity.
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        script_sha256 TEXT NOT NULL,
+        args_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        meta_json TEXT,
+        limits_json TEXT,
+        value_json TEXT,
+        error_json TEXT,
+        deterministic_runner INTEGER NOT NULL,
+        replay_of TEXT,
+        transcripts_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS journal (
+        run_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        data_json TEXT NOT NULL,
+        PRIMARY KEY (run_id, seq)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cache_calls (
+        run_id TEXT NOT NULL,
+        call_id INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        args_hash TEXT NOT NULL,
+        value_json TEXT,
+        ok INTEGER NOT NULL,
+        code TEXT,
+        retryable INTEGER NOT NULL,
+        PRIMARY KEY (run_id, call_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cache_prompts (
+        run_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        method TEXT NOT NULL,
+        args_hash TEXT NOT NULL,
+        value_json TEXT,
+        PRIMARY KEY (run_id, fingerprint)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS kanban_card_state (
+        card_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS kanban_events (
+        card_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        ts TEXT NOT NULL,
+        status TEXT NOT NULL,
+        workflow_result_json TEXT NOT NULL,
+        reason TEXT,
+        profile TEXT NOT NULL,
+        PRIMARY KEY (card_id, seq)
+    )
+    """,
+)
 
 
 def _dumps(value: Any) -> str:
@@ -179,16 +195,39 @@ def _loads_or_corrupt(run_id: str, raw: Optional[str], *, where: str, reason: st
         raise CorruptScriptRunError(run_id, reason, f"{where}: {exc.msg}") from exc
 
 
-def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """Keep only metadata-safe error fields for the durable journal.
+@contextlib.contextmanager
+def _sqlite_error_boundary(identifier: str, *, corrupt_reason: str = "corrupt_run"):
+    """Translate raw ``sqlite3`` exceptions into the typed store-error contract.
 
-    Mirrors :func:`hermes_workflows.script_store._redact_error` exactly
-    (duplicated rather than imported since that helper is private module
-    plumbing, not part of the shared contract).
+    :class:`~hermes_workflows.script_store.ScriptRunStoreProtocol`'s docstring
+    promises every load failure is a typed :class:`ScriptRunStoreError`
+    subclass, never a raw ``sqlite3.Error`` — the same fail-closed contract
+    the file backend gives by mapping unreadable ``run.json`` bytes to
+    :class:`CorruptScriptRunError`. This is the SQLite analogue, applied at
+    every connection-open and query boundary:
+
+    * ``sqlite3.OperationalError``/``sqlite3.IntegrityError`` (lock
+      contention, constraint violations, ...) become a generic
+      :class:`ScriptRunStoreError` — these are not corruption, just a
+      transient or logical failure the caller can retry/handle.
+    * any other ``sqlite3.DatabaseError`` (``"file is not a database"``,
+      ``"database disk image is malformed"``, ...) becomes
+      :class:`CorruptScriptRunError` with ``reason=corrupt_reason`` — the
+      direct analogue of the file backend's byte-tamper handling.
+    * every remaining ``sqlite3.Error`` becomes a generic
+      :class:`ScriptRunStoreError`.
+
+    Must be checked *before* :exc:`sqlite3.DatabaseError` since both
+    ``OperationalError`` and ``IntegrityError`` are subclasses of it.
     """
-    if not isinstance(error, dict):
-        return error
-    return {k: error[k] for k in ("type", "code", "line", "retryable") if k in error}
+    try:
+        yield
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+        raise ScriptRunStoreError(str(exc)) from exc
+    except sqlite3.DatabaseError as exc:
+        raise CorruptScriptRunError(identifier, corrupt_reason, str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise ScriptRunStoreError(str(exc)) from exc
 
 
 class SqliteCallRecorder:
@@ -207,27 +246,32 @@ class SqliteCallRecorder:
         self._run_id = run_id
 
     def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
-        with self._lock:
+        # Plain INSERT (not OR REPLACE): a duplicate call_id is a bug/tamper
+        # canary, not a legitimate overwrite — it must surface as a typed
+        # failure immediately, the write-time analogue of the file backend's
+        # "duplicate cached call id" read-time check, rather than silently
+        # last-write-winning over the original entry.
+        with self._lock, _sqlite_error_boundary(self._run_id, corrupt_reason="corrupt_cache"):
             self._conn.execute(
-                "INSERT OR REPLACE INTO cache_calls"
+                "INSERT INTO cache_calls"
                 "(run_id, call_id, method, args_hash, value_json, ok, code, retryable) "
                 "VALUES (?, ?, ?, ?, ?, 1, NULL, 0)",
                 (self._run_id, call_id, method, args_hash, _dumps(value)),
             )
 
     def record_failure(self, call_id: Any, method: str, args_hash: str, code: str, retryable: bool) -> None:
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(self._run_id, corrupt_reason="corrupt_cache"):
             self._conn.execute(
-                "INSERT OR REPLACE INTO cache_calls"
+                "INSERT INTO cache_calls"
                 "(run_id, call_id, method, args_hash, value_json, ok, code, retryable) "
                 "VALUES (?, ?, ?, ?, NULL, 0, ?, ?)",
                 (self._run_id, call_id, method, args_hash, code, int(bool(retryable))),
             )
 
     def record_prompt(self, fingerprint: str, method: str, args_hash: str, value: Any) -> None:
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(self._run_id, corrupt_reason="corrupt_cache"):
             self._conn.execute(
-                "INSERT OR REPLACE INTO cache_prompts(run_id, fingerprint, method, args_hash, value_json) "
+                "INSERT INTO cache_prompts(run_id, fingerprint, method, args_hash, value_json) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (self._run_id, fingerprint, method, args_hash, _dumps(value)),
             )
@@ -285,26 +329,54 @@ class SqliteScriptRunStore:
         # this module implements the buffered journal durability modes.
         # ``check_same_thread=False`` is safe because every access is already
         # serialised by ``self._lock``.
-        self._conn = sqlite3.connect(str(self._db_path), isolation_level=None, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._open_schema()
+        with _sqlite_error_boundary(str(self._db_path), corrupt_reason="corrupt_store"):
+            self._conn = sqlite3.connect(str(self._db_path), isolation_level=None, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._open_schema()
 
     def _open_schema(self) -> None:
-        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            self._conn.executescript(_SCHEMA_DDL)
-            self._conn.execute(f"PRAGMA user_version = {SQLITE_STORE_SCHEMA_VERSION}")
-            return
-        if version != SQLITE_STORE_SCHEMA_VERSION:
-            self._conn.close()
-            raise CorruptScriptRunError(
-                str(self._db_path),
-                "schema_version",
-                f"sqlite store {self._db_path}: schema_version {version} != {SQLITE_STORE_SCHEMA_VERSION}",
-            )
+        """Create (or self-heal) the schema and stamp ``user_version``, atomically.
+
+        The version read, the DDL, and the version stamp all run inside one
+        ``BEGIN IMMEDIATE``/``COMMIT`` transaction: a crash between "tables
+        created" and "version stamped" now simply rolls back to nothing
+        (version stays 0, no tables), rather than leaving the database
+        permanently unopenable (tables present, version 0, so every future
+        open re-runs ``CREATE TABLE`` and dies on "table already exists").
+        ``BEGIN IMMEDIATE`` also serialises concurrent construction: two
+        processes/threads racing to initialize a fresh root queue on the
+        write lock instead of both attempting the DDL at once. Every DDL
+        statement additionally uses ``CREATE TABLE IF NOT EXISTS`` so a
+        database that already has the tables (from a version stamped only
+        after commit, or an old partial-init on disk from before this fix)
+        self-heals instead of erroring.
+        """
+        with _sqlite_error_boundary(str(self._db_path), corrupt_reason="corrupt_store"):
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0:
+                    for statement in _SCHEMA_STATEMENTS:
+                        self._conn.execute(statement)
+                    self._conn.execute(f"PRAGMA user_version = {SQLITE_STORE_SCHEMA_VERSION}")
+                elif version != SQLITE_STORE_SCHEMA_VERSION:
+                    raise CorruptScriptRunError(
+                        str(self._db_path),
+                        "schema_version",
+                        f"sqlite store {self._db_path}: schema_version {version} != {SQLITE_STORE_SCHEMA_VERSION}",
+                    )
+            except CorruptScriptRunError:
+                self._conn.execute("ROLLBACK")
+                self._conn.close()
+                raise
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
 
     # -- id minting -------------------------------------------------------
     def next_run_id(self, script: str, args: Any = None) -> str:
@@ -337,7 +409,7 @@ class SqliteScriptRunStore:
             meta=meta,
             replay_of=replay_of,
         )
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(run_id):
             try:
                 self._insert_meta_locked(record)
             except sqlite3.IntegrityError as exc:
@@ -384,7 +456,7 @@ class SqliteScriptRunStore:
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(run_id):
             if event_type in ("agent_started", "agent_result", "agent_cache_hit"):
                 self._append_journal_locked(run_id, event_type, data)
             else:
@@ -423,7 +495,14 @@ class SqliteScriptRunStore:
         _require_safe_run_id(run_id)
         with self._lock:
             try:
-                record = self._load_meta_unlocked(run_id, missing_ok=True)
+                # Narrow boundary: a raw sqlite3.Error reading the existing row
+                # must be translated to a typed ScriptRunStoreError *before* it
+                # reaches this except clause, so an unreadable row is tolerated
+                # here exactly like a missing one (mirrors the file backend's
+                # finish(), which never lets a corrupt existing record block
+                # writing a fresh terminal one).
+                with _sqlite_error_boundary(run_id):
+                    record = self._load_meta_unlocked(run_id, missing_ok=True)
             except ScriptRunStoreError:
                 record = None
             if record is None:
@@ -435,22 +514,23 @@ class SqliteScriptRunStore:
             refs = self.transcript_refs(run_id)
             record.transcripts = refs if refs.get("agents") else None
             record.updated_at = utc_now_iso()
-            self._upsert_meta_locked(record)
-            self._append_journal_locked(
-                run_id,
-                "done",
-                {"status": status, "has_value": value is not None, "error": _redact_error(error)},
-            )
-            # Every terminal status force-flushes the journal regardless of
-            # durability mode (issue #108) — see the module docstring.
-            self._flush_journal_locked(run_id)
+            with _sqlite_error_boundary(run_id):
+                self._upsert_meta_locked(record)
+                self._append_journal_locked(
+                    run_id,
+                    "done",
+                    {"status": status, "has_value": value is not None, "error": _redact_error(error)},
+                )
+                # Every terminal status force-flushes the journal regardless of
+                # durability mode (issue #108) — see the module docstring.
+                self._flush_journal_locked(run_id)
 
     # -- reads --------------------------------------------------------------
     def load_run(self, run_id: str) -> ScriptRunMeta:
         """Load a run's metadata. Raises :class:`ScriptRunNotFound` if absent and
         :class:`CorruptScriptRunError` on a malformed or stale-schema record."""
         _require_safe_run_id(run_id)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(run_id):
             record = self._load_meta_unlocked(run_id, missing_ok=False)
         assert record is not None
         return record
@@ -463,7 +543,7 @@ class SqliteScriptRunStore:
         malformed stored value. An empty cache is not an error.
         """
         _require_safe_run_id(run_id)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(run_id, corrupt_reason="corrupt_cache"):
             exists = self._conn.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if exists is None:
                 raise ScriptRunNotFound(run_id)
@@ -478,26 +558,69 @@ class SqliteScriptRunStore:
             ).fetchall()
         entries: dict[int, ReplayEntry] = {}
         for row in call_rows:
+            # Mirror the file backend's ``cache.jsonl`` line validation exactly
+            # (script_store.py's ``load_cache``): SQLite's dynamic typing lets a
+            # raw ``UPDATE`` tamper store a non-TEXT value into a TEXT column, so
+            # this can't rely on the schema's declared column types alone.
+            call_id = row["call_id"]
+            method = row["method"]
+            args_hash = row["args_hash"]
+            if not isinstance(method, str) or not isinstance(args_hash, str):
+                raise CorruptScriptRunError(
+                    run_id, "corrupt_cache", f"cache_calls call_id={call_id}: method/args_hash must be strings"
+                )
+            ok_raw = row["ok"]
+            if not isinstance(ok_raw, int) or isinstance(ok_raw, bool):
+                raise CorruptScriptRunError(
+                    run_id, "corrupt_cache", f"cache_calls call_id={call_id}: ok must be an int flag"
+                )
+            ok = bool(ok_raw)
+            code: Optional[str] = None
+            retryable = False
+            if not ok:
+                code = row["code"]
+                if not isinstance(code, str) or not code:
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache",
+                        f"cache_calls call_id={call_id}: failed entry requires a non-empty 'code'",
+                    )
+                retryable_raw = row["retryable"]
+                if not isinstance(retryable_raw, int) or isinstance(retryable_raw, bool):
+                    raise CorruptScriptRunError(
+                        run_id, "corrupt_cache", f"cache_calls call_id={call_id}: retryable must be an int flag"
+                    )
+                retryable = bool(retryable_raw)
             value = _loads_or_corrupt(
-                run_id, row["value_json"], where=f"cache_calls call_id={row['call_id']}", reason="corrupt_cache"
+                run_id, row["value_json"], where=f"cache_calls call_id={call_id}", reason="corrupt_cache"
             )
-            entries[row["call_id"]] = ReplayEntry(
-                call_id=row["call_id"],
-                method=row["method"],
-                args_hash=row["args_hash"],
-                value=value,
-                ok=bool(row["ok"]),
-                code=row["code"],
-                retryable=bool(row["retryable"]),
+            entries[call_id] = ReplayEntry(
+                call_id=call_id, method=method, args_hash=args_hash, value=value,
+                ok=ok, code=code, retryable=retryable,
             )
         prompt_entries: dict[str, PromptReplayEntry] = {}
         for row in prompt_rows:
+            fingerprint = row["fingerprint"]
+            method = row["method"]
+            args_hash = row["args_hash"]
+            # The file backend's fingerprint backward-compat guard
+            # (script_store.py's ``load_cache``): every fingerprint this store
+            # ever writes is a ``v2:...`` prompt-cache key, so anything else is
+            # either a stale format or a tampered row, either way unsafe to
+            # silently accept.
+            if not isinstance(fingerprint, str) or not fingerprint.startswith("v2:"):
+                raise CorruptScriptRunError(
+                    run_id, "corrupt_cache", f"cache_prompts fingerprint={fingerprint!r}: bad fingerprint format"
+                )
+            if not isinstance(method, str) or not isinstance(args_hash, str):
+                raise CorruptScriptRunError(
+                    run_id, "corrupt_cache", f"cache_prompts fingerprint={fingerprint}: method/args_hash must be strings"
+                )
             value = _loads_or_corrupt(
-                run_id, row["value_json"], where=f"cache_prompts fingerprint={row['fingerprint']}",
+                run_id, row["value_json"], where=f"cache_prompts fingerprint={fingerprint}",
                 reason="corrupt_cache",
             )
-            prompt_entries[row["fingerprint"]] = PromptReplayEntry(
-                fingerprint=row["fingerprint"], method=row["method"], args_hash=row["args_hash"], value=value
+            prompt_entries[fingerprint] = PromptReplayEntry(
+                fingerprint=fingerprint, method=method, args_hash=args_hash, value=value
             )
         return ReplayCache(entries, source_run_id=run_id, prompt_entries=prompt_entries)
 
@@ -510,7 +633,7 @@ class SqliteScriptRunStore:
         committed (by the count trigger or the terminal ``finish()``).
         """
         _require_safe_run_id(run_id)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(run_id):
             rows = self._conn.execute(
                 "SELECT data_json FROM journal WHERE run_id=? ORDER BY seq DESC LIMIT ?",
                 (run_id, max(1, limit)),
@@ -543,13 +666,16 @@ class SqliteScriptRunStore:
 
     def suspended_runs(self) -> list[ScriptRunMeta]:
         """Return runs durably suspended on an unresolved paused Kanban await (issue #5)."""
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(str(self._db_path), corrupt_reason="corrupt_store"):
             rows = self._conn.execute(
                 "SELECT run_id FROM runs WHERE status='suspended' ORDER BY run_id"
             ).fetchall()
         out: list[ScriptRunMeta] = []
         for row in rows:
             try:
+                # ``load_run`` itself now translates any raw sqlite3.Error into a
+                # typed ScriptRunStoreError, so one bad row here is skipped —
+                # never a raw crash of the whole operator resume scan.
                 out.append(self.load_run(row["run_id"]))
             except (ScriptRunStoreError, ValueError):
                 continue
@@ -566,7 +692,7 @@ class SqliteScriptRunStore:
         if not isinstance(state, dict):
             raise ValueError("kanban card state must be a dict")
         record = {**state, "card_id": card_id}
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(card_id):
             existing = self._load_kanban_card_state_unlocked(card_id)
             if "run_id" not in record and isinstance(existing, dict) and existing.get("run_id"):
                 record["run_id"] = existing["run_id"]
@@ -585,12 +711,12 @@ class SqliteScriptRunStore:
     def load_kanban_card_state(self, card_id: str) -> Optional[dict[str, Any]]:
         """Return the latest persisted state of ``card_id``, or ``None`` if absent."""
         _require_safe_card_id(card_id)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(card_id):
             return self._load_kanban_card_state_unlocked(card_id)
 
     def kanban_waits(self) -> list[dict[str, Any]]:
         """Return persisted card states that are not yet terminal (in-flight waits)."""
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(str(self._db_path), corrupt_reason="corrupt_store"):
             rows = self._conn.execute(
                 "SELECT card_id, state_json FROM kanban_card_state ORDER BY card_id"
             ).fetchall()
@@ -630,6 +756,16 @@ class SqliteScriptRunStore:
         (computed from the table, so it survives a store reopened against the
         same database) — the same semantics as the file backend's physical
         line position.
+
+        The seq-assignment SELECT and the INSERT run inside one ``BEGIN
+        IMMEDIATE``/``COMMIT`` transaction so the two are atomic *across
+        connections/processes*, not just within this one instance's
+        ``self._lock``: two ``SqliteScriptRunStore`` instances (e.g. a worker
+        process and its parent, or two hosts sharing the store root)
+        appending to the same card concurrently must never compute the same
+        ``seq`` and silently lose one event to a duplicate-key failure — the
+        exact cross-process durability guarantee the file backend gets for
+        free from ``O_APPEND``.
         """
         _require_safe_card_id(card_id)
         record = {
@@ -640,21 +776,28 @@ class SqliteScriptRunStore:
             "reason": reason,
             "profile": profile,
         }
-        with self._lock:
-            seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM kanban_events WHERE card_id=?", (card_id,)
-            ).fetchone()[0]
-            self._conn.execute(
-                "INSERT INTO kanban_events(card_id, seq, ts, status, workflow_result_json, reason, profile) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (card_id, seq, record["ts"], status, _dumps(record["workflow_result"]), reason, profile),
-            )
+        with self._lock, _sqlite_error_boundary(card_id):
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                seq = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM kanban_events WHERE card_id=?", (card_id,)
+                ).fetchone()[0]
+                self._conn.execute(
+                    "INSERT INTO kanban_events(card_id, seq, ts, status, workflow_result_json, reason, profile) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (card_id, seq, record["ts"], status, _dumps(record["workflow_result"]), reason, profile),
+                )
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
         return {"seq": seq, **record}
 
     def read_kanban_events(self, card_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
         """Return durable card events with position ``> after_seq``."""
         _require_safe_card_id(card_id)
-        with self._lock:
+        with self._lock, _sqlite_error_boundary(card_id):
             rows = self._conn.execute(
                 "SELECT seq, ts, status, workflow_result_json, reason, profile "
                 "FROM kanban_events WHERE card_id=? AND seq>? ORDER BY seq",

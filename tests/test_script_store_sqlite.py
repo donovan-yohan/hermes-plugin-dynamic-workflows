@@ -26,17 +26,27 @@ backend-specific:
   ``tests/test_kanban_suspend_resume.py`` / ``tests/test_pending_writes_
   resume_contract.py`` re-run here against the SQLite backend directly, per
   the issue's "resume/replay/suspend fixtures green on SQLite" criterion.
+* **Cross-process seq-assignment atomicity** — two independent
+  ``SqliteScriptRunStore`` connections (the worker/gateway + parent process
+  shape) appending to the same Kanban card concurrently must never collide on
+  ``seq``, mirroring the file backend's ``O_APPEND`` cross-process guarantee.
+* **Untyped-exception fail-closed contract** — a corrupt database *file*
+  (not just a corrupt row) and a partially-initialized database (tables
+  present, schema version never stamped — the crash-mid-init shape) must both
+  be handled through the same typed-error/self-heal contract as the rest of
+  this module, never a raw ``sqlite3.Error``.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from hermes_workflows import VMLimits, run_workflow_script
-from hermes_workflows.errors import CorruptScriptRunError, ScriptRunNotFound
+from hermes_workflows.errors import CorruptScriptRunError, ScriptRunNotFound, ScriptRunStoreError
 from hermes_workflows.kanban import kanban_card_id
 from hermes_workflows.kanban_notify import EventLogKanbanBackend, ThreadEventNotifier, publish_kanban_event
 from hermes_workflows.script_store import SCRIPT_SCHEMA_VERSION, ScriptRunStore
@@ -115,9 +125,61 @@ def test_incompatible_stamped_schema_version_fails_closed_at_construction():
             raise AssertionError("expected CorruptScriptRunError for an incompatible database schema_version")
 
 
+def test_partial_init_without_stamped_version_self_heals():
+    """Regression: a crash between "tables created" and "user_version stamped".
+
+    ``_open_schema`` used to ``executescript`` the DDL and stamp
+    ``user_version`` as two separate, non-atomic autocommit steps: a crash in
+    between left tables present with ``user_version=0`` forever, and every
+    future open re-ran ``CREATE TABLE`` and died on "table already exists".
+    Simulating exactly that on-disk shape (tables present, version reset to
+    0) must now self-heal on reopen, with no data loss.
+    """
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "runs"
+        store = SqliteScriptRunStore(root)
+        store.begin("r1", script="x", args=None, limits=None, deterministic_runner=False)
+        store.finish("r1", status="succeeded", meta=None, value={"v": 1}, error=None)
+        store._conn.close()
+
+        conn = sqlite3.connect(str(root / "store.sqlite3"))
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+        conn.close()
+
+        reopened = SqliteScriptRunStore(root)  # must not raise "table already exists".
+        loaded = reopened.load_run("r1")
+        assert loaded.status == "succeeded"
+        assert loaded.value == {"v": 1}
+        assert (
+            sqlite3.connect(str(root / "store.sqlite3")).execute("PRAGMA user_version").fetchone()[0]
+            == SQLITE_STORE_SCHEMA_VERSION
+        )
+
+
 # --------------------------------------------------------------------------- #
 # SQLite-native corruption (counterparts to the file backend's file-tamper tests)
 # --------------------------------------------------------------------------- #
+
+def test_corrupt_database_file_raises_typed_not_raw_sqlite_error():
+    """Regression: a byte-tampered ``store.sqlite3`` — the direct SQLite analog
+    of the file backend's ``run.json`` byte-tamper tests — used to raise a raw
+    ``sqlite3.DatabaseError`` ("file is not a database") straight out of the
+    constructor's ``PRAGMA journal_mode=WAL``, breaking the typed-error
+    contract this module's docstring promises.
+    """
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "runs"
+        root.mkdir()
+        (root / "store.sqlite3").write_bytes(b"this is not a sqlite database" * 20)
+
+        try:
+            SqliteScriptRunStore(root)
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_store"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for a byte-tampered database file")
+
 
 def test_corrupt_run_row_raises_typed():
     with TemporaryDirectory() as tmp:
@@ -223,6 +285,168 @@ def test_pending_writes_drift_abort_via_sqlite_native_tamper():
         )
         assert b.ok is False
         assert "replay drift" in b.error["message"]
+
+
+def test_load_cache_rejects_legacy_non_v2_prompt_fingerprint():
+    """The file backend's fingerprint backward-compat guard, ported: any stored
+    prompt-cache fingerprint that is not the current ``v2:...`` format must fail
+    closed rather than silently loading and never matching on replay."""
+    with TemporaryDirectory() as tmp:
+        store = SqliteScriptRunStore(Path(tmp) / "runs")
+        run_workflow_script(FULL_SCRIPT, args={"who": "world"}, store=store, run_id="src")
+
+        with store._lock:
+            store._conn.execute(
+                "INSERT INTO cache_prompts(run_id, fingerprint, method, args_hash, value_json) "
+                "VALUES ('src', 'v1:legacy-format', 'kanban_agent', 'h', '{}')"
+            )
+
+        try:
+            store.load_cache("src")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_cache"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for a legacy non-v2 fingerprint")
+
+
+def test_load_cache_rejects_failed_entry_with_null_code():
+    """Mirrors the file backend's "failed entry requires a non-empty 'code'"
+    guard: a raw-tampered ``ok=0`` row with no ``code`` must fail closed
+    instead of loading as a replayable failure with ``code=None`` (which
+    would silently rewrite to ``"runner_error"`` on replay)."""
+    with TemporaryDirectory() as tmp:
+        store = SqliteScriptRunStore(Path(tmp) / "runs")
+        store.begin("src", script="x", args=None, limits=None, deterministic_runner=True)
+        store.recorder("src").record_failure(1, "agent", "h", "dispatch_failed", True)
+
+        with store._lock:
+            store._conn.execute("UPDATE cache_calls SET code=NULL WHERE run_id='src' AND call_id=1")
+
+        try:
+            store.load_cache("src")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_cache"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for a failed entry with a NULL code")
+
+
+def test_load_cache_rejects_non_text_method_blob_tamper():
+    """SQLite's TEXT affinity silently coerces numeric tampers to text, so this
+    exercises the one raw-SQL tamper that actually survives as a non-``str``
+    Python value on read back: writing a BLOB into the ``method`` column."""
+    with TemporaryDirectory() as tmp:
+        store = SqliteScriptRunStore(Path(tmp) / "runs")
+        store.begin("src", script="x", args=None, limits=None, deterministic_runner=True)
+        store.recorder("src").record(1, "agent", "h", {"v": 1})
+
+        with store._lock:
+            store._conn.execute("UPDATE cache_calls SET method=X'6162' WHERE run_id='src' AND call_id=1")
+
+        try:
+            store.load_cache("src")
+        except CorruptScriptRunError as exc:
+            assert exc.reason == "corrupt_cache"
+        else:  # pragma: no cover
+            raise AssertionError("expected CorruptScriptRunError for a non-text method column")
+
+
+def test_done_journal_event_redacts_script_error_message_on_sqlite():
+    # SQLite counterpart of tests/test_script_store.py::
+    # test_done_journal_event_redacts_script_error_message — pins that the
+    # imported (not duplicated) ``_redact_error`` keeps working identically on
+    # this backend: a script-authored exception message must not reach the
+    # journal table's ``done`` event, though it remains on the run row.
+    with TemporaryDirectory() as tmp:
+        store = SqliteScriptRunStore(Path(tmp) / "runs")
+        res = run_workflow_script(
+            META + 'raise ValueError("super-secret-marker")\nreturn {}\n',
+            store=store, run_id="srcerr",
+        )
+        assert res.ok is False
+
+        with store._lock:
+            rows = store._conn.execute(
+                "SELECT data_json FROM journal WHERE run_id='srcerr'"
+            ).fetchall()
+        journal_text = "\n".join(row["data_json"] for row in rows)
+        assert "super-secret-marker" not in journal_text  # redacted from journal.
+        done = [e for e in store.journal("srcerr") if e["type"] == "done"][0]
+        assert "message" not in (done.get("error") or {})
+
+        # The full error is retained on the run row (operator-facing result surface).
+        assert "super-secret-marker" in store.load_run("srcerr").error["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-process concurrency: append_kanban_event seq assignment (issue #5)
+# --------------------------------------------------------------------------- #
+
+def test_locked_database_raises_typed_store_error_not_raw_operational_error():
+    """Cross-process write contention (a competing connection holding the
+    write lock) must surface as a generic typed :class:`ScriptRunStoreError`
+    — not corruption, just a busy/locked database — never a raw
+    ``sqlite3.OperationalError``."""
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "runs"
+        store = SqliteScriptRunStore(root)
+        store._conn.execute("PRAGMA busy_timeout=50")  # fail fast instead of the 5s default.
+
+        blocker = sqlite3.connect(str(root / "store.sqlite3"), timeout=5)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("INSERT INTO kanban_card_state(card_id, state_json) VALUES ('other', '{}')")
+
+            try:
+                store.append_kanban_event("card1", status="running")
+            except CorruptScriptRunError:  # pragma: no cover
+                raise AssertionError("lock contention must not be classified as corruption")
+            except ScriptRunStoreError:
+                pass
+            else:  # pragma: no cover
+                raise AssertionError("expected ScriptRunStoreError for a locked database")
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+
+def test_append_kanban_event_seq_is_atomic_across_two_store_connections():
+    """Regression: a read-MAX-then-INSERT race across two independent
+    connections (two ``SqliteScriptRunStore`` instances on the same root —
+    the worker/gateway-process + parent-process shape) used to let both
+    compute the same ``seq``, so the loser died with an untyped
+    ``UNIQUE constraint failed`` and its event was lost. ``append_kanban_event``
+    now serialises the read+insert inside one ``BEGIN IMMEDIATE`` transaction,
+    which SQLite enforces across connections/processes, not just this
+    instance's in-process lock.
+    """
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "runs"
+        store_a = SqliteScriptRunStore(root)
+        store_b = SqliteScriptRunStore(root)
+        card_id = "card-race"
+        n_per_thread = 40
+        errors: list[BaseException] = []
+
+        def worker(store: SqliteScriptRunStore) -> None:
+            for _ in range(n_per_thread):
+                try:
+                    store.append_kanban_event(card_id, status="running")
+                except BaseException as exc:  # noqa: BLE001 - want to see *any* failure.
+                    errors.append(exc)
+
+        t1 = threading.Thread(target=worker, args=(store_a,))
+        t2 = threading.Thread(target=worker, args=(store_b,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == []
+        events = store_a.read_kanban_events(card_id)
+        seqs = sorted(e["seq"] for e in events)
+        total = 2 * n_per_thread
+        assert len(events) == total  # no event lost to a colliding seq.
+        assert seqs == list(range(1, total + 1))  # unique and gap-free.
 
 
 # --------------------------------------------------------------------------- #
