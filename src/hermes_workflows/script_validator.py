@@ -420,23 +420,77 @@ def _walk_forbidden(entry: ast.AST, diags: list[Diagnostic]) -> None:
 _SCHEMA_CAPABILITY_CALLS: frozenset[str] = frozenset({"agent", "kanban_agent", "capability"})
 
 
+def _looks_like_legacy_agent_id(value: str) -> bool:
+    """Mirror ``vm_guest._looks_like_legacy_agent_id`` without importing it.
+
+    :mod:`hermes_workflows.vm_guest` (the trusted subprocess guest) already
+    imports *this* module, so importing it back here would be circular.
+    Duplicated on purpose; keep in sync with the guest's predicate — it
+    decides whether ``agent(target, {...})``'s second positional argument is
+    merged as an options dict (the shape checked by
+    :func:`_agent_opts_schema_literal`) or forwarded verbatim as ``input``.
+    """
+    return (
+        value.startswith("hermes.") or value.startswith("kanban.")
+    ) and len(value.split(".", 1)[1]) > 0 and not any(ch.isspace() for ch in value)
+
+
+def _agent_opts_schema_literal(node: ast.Call) -> tuple[bool, Any]:
+    """Return ``(found, schema_value)`` for ``agent(target, {"schema": ...})``.
+
+    The literal-opts-dict calling convention: ``agent()``'s second positional
+    argument is merged as an options dict (``label``/``schema``/...) whenever
+    the first argument is a free-text prompt rather than a legacy
+    ``hermes.``/``kanban.`` agent id (see :func:`_looks_like_legacy_agent_id`
+    and ``vm_guest.agent``). Only checked when both the target and the opts
+    dict are pure literals; a non-literal target's runtime identity is not
+    statically knowable, so that call is left to runtime enforcement exactly
+    like a non-literal ``schema=`` keyword.
+    """
+    if len(node.args) < 2:
+        return False, None
+    target_node = node.args[0]
+    if not (isinstance(target_node, ast.Constant) and isinstance(target_node.value, str)):
+        return False, None
+    if _looks_like_legacy_agent_id(target_node.value):
+        return False, None  # merged as raw ``input``, not opts; a "schema" key is inert.
+    try:
+        opts = ast.literal_eval(node.args[1])
+    except (ValueError, SyntaxError, TypeError):
+        return False, None  # not a pure literal; left to runtime enforcement.
+    if not isinstance(opts, dict) or "schema" not in opts:
+        return False, None
+    return True, opts["schema"]
+
+
 def _walk_schema_literals(entry: ast.AST, diags: list[Diagnostic]) -> None:
     """Reject a malformed literal ``schema=`` argument before launch.
 
     A workflow script is arbitrary Python, so a ``schema`` built from a
-    variable, a function call, or merged from an options dict positional
-    argument is not statically knowable here — those are left to the parent
-    broker's runtime enforcement, which validates every call's schema (however
-    it was constructed) against the same shared subset before ever trusting
-    its output. When the ``schema=`` keyword *is* a pure literal, though,
-    there is no reason to wait for a live run to reject an unsupported
-    keyword or a bad ``type``: catch it here, statically, so a broken schema
-    never reaches launch.
+    variable or a function call is not statically knowable here — those are
+    left to the parent broker's runtime enforcement, which validates every
+    ``agent``/``capability`` call's schema (however it was constructed)
+    against the shared :mod:`hermes_workflows.schema_subset` before ever
+    trusting its output. When the ``schema=`` keyword *is* a pure literal,
+    though, there is no reason to wait for a live run to reject an
+    unsupported keyword or a bad ``type``: catch it here, statically, so a
+    broken schema never reaches launch. The same applies to a pure-literal
+    ``agent(target, {"schema": ...})`` positional options dict — see
+    :func:`_agent_opts_schema_literal`.
+
+    ``kanban_agent`` is a special case: its ``workflow_result`` contract is
+    enforced at runtime by ``kanban.validate_workflow_result``, a flat-only
+    ``{field: type_hint}`` checker that does not understand the
+    ``schema_subset`` shape (nested ``type``/``properties``/``required``).
+    A subset-shaped literal schema on ``kanban_agent`` is therefore rejected
+    outright here, statically, rather than statically "checked out" only to
+    guarantee runtime failure (issue #107 review).
     """
     for node in ast.walk(entry):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
             continue
-        if node.func.id not in _SCHEMA_CAPABILITY_CALLS:
+        callee = node.func.id
+        if callee not in _SCHEMA_CAPABILITY_CALLS:
             continue
         for kw in node.keywords:
             if kw.arg != "schema" or kw.value is None:
@@ -445,11 +499,39 @@ def _walk_schema_literals(entry: ast.AST, diags: list[Diagnostic]) -> None:
                 schema_value = ast.literal_eval(kw.value)
             except (ValueError, SyntaxError, TypeError):
                 continue  # not a pure literal; the runtime enforces this call.
-            error = schema_subset.check_schema(schema_value)
-            if error is not None:
-                diags.append(
-                    _e(err.E_SCRIPT_BAD_SCHEMA, f"invalid 'schema' argument: {error}", _line(node))
-                )
+            _check_schema_literal(callee, schema_value, node, diags)
+        if callee == "agent":
+            found, opts_schema_value = _agent_opts_schema_literal(node)
+            if found:
+                _check_schema_literal(callee, opts_schema_value, node, diags)
+
+
+def _check_schema_literal(callee: str, schema_value: Any, node: ast.Call, diags: list[Diagnostic]) -> None:
+    """Validate one statically-known literal ``schema`` value and record a diagnostic."""
+    if callee == "kanban_agent" and schema_subset.is_declared_subset_schema(schema_value):
+        # kanban_agent's ``workflow_result`` contract is enforced at runtime
+        # by kanban.validate_workflow_result -- a flat-only {field: type_hint}
+        # checker, not schema_subset. A subset-shaped root (nested
+        # ``type``/``properties``/``required``) statically "checks out" here
+        # but is guaranteed to reinterpret every one of its keywords as
+        # literal required field names at runtime, so a perfectly-conforming
+        # payload would fail every completion. Reject it here instead of
+        # blessing a schema that can never validate.
+        diags.append(
+            _e(
+                err.E_SCRIPT_BAD_SCHEMA,
+                "invalid 'schema' argument: kanban_agent only supports legacy flat "
+                "{field: type} schemas (its workflow_result contract is checked by "
+                "kanban.validate_workflow_result, not the nested JSON-Schema subset); "
+                "a subset-shaped root such as {'type': 'object', 'properties': {...}} "
+                "would be misread as literal required fields named 'type'/'properties'",
+                _line(node),
+            )
+        )
+        return
+    error = schema_subset.check_schema(schema_value)
+    if error is not None:
+        diags.append(_e(err.E_SCRIPT_BAD_SCHEMA, f"invalid 'schema' argument: {error}", _line(node)))
 
 
 def _check_name(name: str, node: ast.AST, diags: list[Diagnostic]) -> None:

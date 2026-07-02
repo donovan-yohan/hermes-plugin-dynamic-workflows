@@ -876,6 +876,17 @@ class CapabilityBroker:
         """Invoke a prompt child agent, retrying schema-invalid structured output."""
 
         assert self._child_runner is not None
+        try:
+            schema_subset.normalize_schema(request.schema)
+        except schema_subset.SchemaError as exc:
+            # A malformed schema (e.g. a dynamically-built ``schema=`` that
+            # escaped script_validator's static literal check) is never the
+            # child agent's fault to fix by retrying -- no output can "pass" a
+            # schema that is itself broken. Reject once, before the first
+            # invocation, instead of burning max_schema_retries+1 real child
+            # agent calls on an unwinnable retry loop whose retry-context
+            # prompt would misleadingly tell the agent to fix its output.
+            raise CapabilityDenied(f"invalid 'schema' argument: {exc}", code="bad_request") from exc
         retry_limit = max(0, int(self._limits.max_schema_retries))
         attempts = retry_limit + 1
         base_context = dict(request.context)

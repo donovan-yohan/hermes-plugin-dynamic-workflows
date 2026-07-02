@@ -150,6 +150,65 @@ def test_additional_properties_defaults_permissive():
     schema_subset.validate({"plan": "x", "surprise": 1}, schema)
 
 
+def test_typeless_subset_root_is_read_as_subset_not_legacy_flat():
+    # A type-less, idiomatic subset root ("properties"/"required" at the top
+    # level, no "type") must not be silently misread as a legacy flat schema
+    # requiring literal fields named "properties"/"required".
+    schema = {"properties": {"plan": {"type": "string"}}, "required": ["plan"]}
+    assert schema_subset.is_declared_subset_schema(schema)
+    schema_subset.validate({"plan": "x"}, schema)
+    with pytest.raises(schema_subset.SchemaError, match="plan"):
+        schema_subset.validate({}, schema)
+
+
+def test_typeless_subset_root_with_only_a_list_valued_required_is_read_as_subset():
+    schema = {"required": ["plan"]}
+    assert schema_subset.is_declared_subset_schema(schema)
+    schema_subset.validate({"plan": "x"}, schema)
+    with pytest.raises(schema_subset.SchemaError, match="plan"):
+        schema_subset.validate({}, schema)
+
+
+def test_legacy_field_named_required_with_non_list_hint_stays_legacy_flat():
+    # A legacy field literally named "required" whose hint is not a list
+    # (the historical shape) must not be reinterpreted as the subset
+    # "required" keyword.
+    schema = {"required": "string"}
+    assert not schema_subset.is_declared_subset_schema(schema)
+    schema_subset.validate({"required": "x"}, schema)
+    with pytest.raises(schema_subset.SchemaError):
+        schema_subset.validate({}, schema)
+
+
+def test_legacy_any_hint_now_accepts_bool_matching_kanban_py_not_old_vm_py():
+    # Documented divergence: an unrecognized/"any" legacy hint is fully
+    # unconstrained here (matches kanban.py's ``(object,)`` "any" mapping),
+    # where the pre-#107 vm.py/runtime.py flat checkers special-cased "any"
+    # to still reject bool.
+    schema_subset.validate({"flag": True}, {"flag": "any"})
+
+
+def test_legacy_schema_with_field_named_type_and_valid_type_name_hint_flips_to_subset():
+    # Documented ambiguity: a legacy field literally named "type" whose hint
+    # is itself a valid subset type name reads as a declared subset root, not
+    # a legacy field declaration -- the verdict silently flips.
+    schema = {"type": "string"}
+    assert schema_subset.is_declared_subset_schema(schema)
+    schema_subset.validate("hello", schema)  # subset semantics: the payload itself is a string.
+    with pytest.raises(schema_subset.SchemaError):
+        schema_subset.validate({"type": "hello"}, schema)  # not legacy-field semantics anymore.
+
+
+def test_legacy_schema_with_field_named_type_and_extra_field_fails_closed():
+    # Documented divergence: {"type": "str", "value": "int"} was a valid
+    # legacy schema pre-#107 (both fields required); it now fails closed
+    # because "value" is not a subset keyword once "type" flips the root to
+    # subset semantics.
+    with pytest.raises(schema_subset.SchemaError, match="value"):
+        schema_subset.normalize_schema({"type": "str", "value": "int"})
+    assert schema_subset.check_schema({"type": "str", "value": "int"}) is not None
+
+
 @pytest.mark.parametrize(
     "bad_schema",
     [
@@ -321,8 +380,11 @@ def test_workflow_validate_rejects_bad_output_schema_type_value():
 
 
 def test_validate_script_accepts_a_well_formed_literal_schema_argument():
+    # ``agent`` -- not ``kanban_agent`` -- is the call site whose runtime
+    # enforcement (schema_subset._validate_output) actually understands a
+    # nested subset schema; kanban_agent's own contract is covered below.
     script = META + (
-        'r = await kanban_agent("planner", prompt="plan", '
+        'r = await agent("summarize", '
         'schema={"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]})\n'
         'return r\n'
     )
@@ -332,7 +394,7 @@ def test_validate_script_accepts_a_well_formed_literal_schema_argument():
 
 def test_validate_script_rejects_unknown_keyword_in_literal_schema_argument():
     script = META + (
-        'r = await kanban_agent("planner", prompt="plan", schema={"type": "object", "bogus": 1})\n'
+        'r = await agent("summarize", schema={"type": "object", "bogus": 1})\n'
         'return r\n'
     )
     result = validate_script(script)
@@ -346,6 +408,69 @@ def test_validate_script_leaves_a_non_literal_schema_to_runtime_enforcement():
     script = META + (
         'built_schema = {"type": "object", "bogus": 1}\n'
         'r = await kanban_agent("planner", prompt="plan", schema=built_schema)\n'
+        'return r\n'
+    )
+    result = validate_script(script)
+    assert result.ok, result.diagnostics
+
+
+def test_validate_script_rejects_subset_shaped_literal_schema_on_kanban_agent():
+    # kanban_agent's workflow_result contract is enforced at runtime by
+    # kanban.validate_workflow_result -- a flat-only {field: type_hint}
+    # checker. A nested subset-shaped root (declaring ``type``) would be
+    # misread there as literal required fields named "type"/"properties" and
+    # would fail every conforming completion, so it must be rejected here,
+    # statically, rather than blessed at launch (issue #107 review).
+    script = META + (
+        'r = await kanban_agent("planner", prompt="plan", '
+        'schema={"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]})\n'
+        'return r\n'
+    )
+    result = validate_script(script)
+    assert not result.ok
+    assert any(d.code == "E_SCRIPT_BAD_SCHEMA" for d in result.diagnostics)
+
+
+def test_validate_script_accepts_legacy_flat_literal_schema_on_kanban_agent():
+    # A legacy flat {field: type_hint} schema is exactly what
+    # kanban.validate_workflow_result understands, so it must keep validating.
+    script = META + (
+        'r = await kanban_agent("planner", prompt="plan", schema={"plan": "string"})\n'
+        'return r\n'
+    )
+    result = validate_script(script)
+    assert result.ok, result.diagnostics
+
+
+def test_validate_script_accepts_literal_schema_in_agent_opts_dict_argument():
+    # The other common calling convention: a pure-literal positional options
+    # dict, e.g. ``agent("summarize", {"schema": {...}})``. This is fully
+    # literal-evaluable, so it is checked statically too.
+    script = META + (
+        'r = await agent("summarize", {"schema": {"type": "object", "bogus": 1}})\n'
+        'return r\n'
+    )
+    result = validate_script(script)
+    assert not result.ok
+    assert any(d.code == "E_SCRIPT_BAD_SCHEMA" for d in result.diagnostics)
+
+
+def test_validate_script_accepts_well_formed_schema_in_agent_opts_dict_argument():
+    script = META + (
+        'r = await agent("summarize", {"schema": {"plan": "string"}})\n'
+        'return r\n'
+    )
+    result = validate_script(script)
+    assert result.ok, result.diagnostics
+
+
+def test_validate_script_leaves_agent_opts_dict_schema_alone_for_a_legacy_agent_id():
+    # ``hermes.``/``kanban.`` targets are legacy agent ids: the guest's
+    # ``agent()`` wrapper forwards the positional dict verbatim as ``input``,
+    # never merging it as opts, so a "schema" key inside it is inert -- must
+    # not be statically rejected.
+    script = META + (
+        'r = await agent("hermes.greeter", {"schema": {"type": "object", "bogus": 1}})\n'
         'return r\n'
     )
     result = validate_script(script)

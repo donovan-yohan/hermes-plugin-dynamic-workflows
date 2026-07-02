@@ -45,11 +45,39 @@ to the subset ``"number"`` (``int`` or ``float``) rather than the historical
 float-only check — the only intentional behavioural widening, and it was
 previously unused by any shipped schema.
 
-Two schema shapes are therefore ambiguous only when a legacy field happens to
-be named ``"type"`` *and* its hint value is itself one of the subset type
-names (e.g. ``{"type": "string"}``) — that reads as a declared subset-schema
-root, not a legacy field declaration. This is a documented, narrow trade-off;
-no shipped schema relies on a field named ``type``.
+Two schema shapes are therefore ambiguous whenever a legacy field happens to
+be named ``"type"``: **any** legacy schema containing a field named
+``"type"`` is reinterpreted as a declared subset-schema root (see
+:func:`_is_declared_subset`), not a legacy field declaration — this fails
+closed with a :class:`SchemaError` unless the hint value also happens to be a
+valid subset type name (e.g. ``{"type": "string"}``), in which case the
+verdict silently flips to subset semantics instead of failing closed. The
+same reinterpretation applies, more narrowly, to a legacy schema whose entire
+key set is drawn from :data:`ALLOWED_KEYWORDS` and that also declares one of
+``"properties"``/``"items"``/``"enum"``/``"additionalProperties"``, or a
+*list-valued* ``"required"`` — added so a type-less, idiomatic subset root
+such as ``{"properties": {...}, "required": [...]}`` is not silently misread
+as a legacy schema requiring literal fields named ``properties``/``required``.
+This is a documented, narrow trade-off; no shipped schema relies on a field
+named after a subset keyword.
+
+Two further, intentional divergences from the byte-for-byte pre-#107 flat
+checkers (both undisclosed until now; neither changes shipped behaviour
+because no shipped schema exercises them):
+
+* A legacy hint of ``"any"`` (or any other unrecognized hint) now accepts a
+  ``bool`` payload value. The pre-#107 ``vm.py``/``runtime.py`` flat checkers
+  special-cased ``"any"`` to still reject ``bool``; ``kanban.py``'s flat
+  checker never did (its ``"any"`` hint maps to ``(object,)``, which already
+  accepts everything including ``bool``). This module's "unrecognized hint is
+  fully unconstrained" rule (:func:`_legacy_property_schema`) matches the
+  ``kanban.py`` behaviour, not the ``vm.py``/``runtime.py`` behaviour.
+* ``{"type": "str", "value": "int"}`` — a legacy schema with a field
+  literally named ``"type"`` whose hint (``"str"``) happens to be a valid
+  subset type name — is *not* reinterpreted field-by-field as a subset root
+  (a subset root has no keyword named ``"value"``); it fails closed with an
+  ``unsupported schema keyword(s) ['value']`` :class:`SchemaError`, where the
+  pre-#107 checkers accepted it as a legacy schema requiring both fields.
 """
 
 from __future__ import annotations
@@ -63,6 +91,7 @@ __all__ = [
     "check_schema",
     "normalize_schema",
     "validate",
+    "is_declared_subset_schema",
 ]
 
 
@@ -181,6 +210,18 @@ def validate(payload: Any, schema: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Keywords whose mere presence at the root — absent ``"type"`` — is still
+# strong enough evidence of a hand-authored subset schema to reinterpret a
+# type-less root (e.g. ``{"properties": {...}, "required": [...]}``) as
+# subset rather than legacy flat. ``"required"`` is deliberately excluded
+# here: a legacy field literally named ``"required"`` is common enough (and
+# its hint is essentially never a list) that only a *list-valued* "required"
+# counts — checked separately below.
+_STRUCTURAL_SUBSET_KEYWORDS: frozenset[str] = frozenset(
+    {"properties", "items", "enum", "additionalProperties"}
+)
+
+
 def _is_declared_subset(schema: dict[str, Any]) -> bool:
     """Return ``True`` when ``schema`` reads as a hand-authored subset schema.
 
@@ -190,8 +231,36 @@ def _is_declared_subset(schema: dict[str, Any]) -> bool:
     field named ``"type"``. The only shape a legacy flat schema could produce
     that collides with this is a field literally named ``"type"`` whose hint
     happens to be a valid subset type name (see the module docstring).
+
+    Absent ``"type"``, a root is *also* read as a declared subset schema when
+    every one of its keys is drawn from :data:`ALLOWED_KEYWORDS` and it
+    declares a structural keyword (``properties``/``items``/``enum``/
+    ``additionalProperties``) or a list-valued ``required`` — otherwise a
+    type-less, idiomatic subset root like
+    ``{"properties": {...}, "required": [...]}`` would be silently misread as
+    a legacy schema requiring literal fields named ``properties``/``required``
+    (see the module docstring).
     """
-    return "type" in schema
+    if "type" in schema:
+        return True
+    if not set(schema).issubset(ALLOWED_KEYWORDS):
+        return False
+    if any(keyword in schema for keyword in _STRUCTURAL_SUBSET_KEYWORDS):
+        return True
+    return isinstance(schema.get("required"), list)
+
+
+def is_declared_subset_schema(schema: Any) -> bool:
+    """Public wrapper on :func:`_is_declared_subset` for static analyzers.
+
+    ``False`` for anything that is not a non-empty ``dict``. Exists so a
+    caller like :mod:`hermes_workflows.script_validator` can tell, ahead of
+    :func:`normalize_schema`, whether a literal schema *reads* as a subset
+    root — needed to reject a subset-shaped ``schema=`` literal passed to a
+    call site whose runtime enforcement only understands legacy flat schemas
+    (e.g. ``kanban_agent``'s ``workflow_result`` contract).
+    """
+    return isinstance(schema, dict) and bool(schema) and _is_declared_subset(schema)
 
 
 def _normalize_subset_node(node: Any, path: str) -> dict[str, Any]:
