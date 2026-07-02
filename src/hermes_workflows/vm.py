@@ -34,6 +34,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import errors as err, rpc
+from .agent_type_registry import (
+    AgentTypeDefinition,
+    AgentTypeRegistry,
+    AgentTypeRegistryError,
+    GENERAL_PURPOSE_AGENT_TYPE,
+)
 from .agents import (
     CHILD_AGENT_OPTION_KEYS,
     AgentRunner,
@@ -115,6 +121,19 @@ _ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "capability", "log", "pha
 # Sentinel: a replay consult that found no cache entry for a call id (a miss),
 # so the broker must fall through to a live dispatch.
 _MISS = object()
+
+# CapabilityDenied codes that, despite not touching an AgentRunner, are NOT
+# purely a function of the call's own arguments and the run's own in-memory
+# state -- they also read the on-disk AgentTypeRegistry (issue #104), which is
+# mutable host configuration that can change between a source run and a later
+# replay. Unlike every other CapabilityDenied code (an argument/limit/schema
+# contract violation that re-evaluates identically live), re-dispatching one
+# of these live on replay can silently diverge if the registry root has
+# gained/lost/changed a definition file since the source run -- so they are
+# buffered via _persist_failure exactly like a runner_error, ensuring replay
+# reproduces the denial the source run actually observed regardless of
+# registry drift.
+_REGISTRY_DEPENDENT_DENIAL_CODES = frozenset({"unknown_agent_type", "agent_type_invalid"})
 
 # Cap on how many distinct result-contract violations one kanban_agent call records
 # (journal marker + card comment). Under on_block="pause" a misbehaving worker can
@@ -270,6 +289,7 @@ class CapabilityBroker:
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
+        agent_type_registry: Optional[AgentTypeRegistry] = None,
     ) -> None:
         self._runner = agent_runner
         self._child_runner = child_agent_runner
@@ -305,6 +325,11 @@ class CapabilityBroker:
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy if capability_policy is not None else CapabilityPolicy()
         self._control_store = control_store
+        # File-based agent-type registry (issue #104) resolving ``agentType``
+        # (issue #92) at call time. Defaults to a registry with no configured
+        # roots -- the built-in ``general-purpose`` type is still resolvable,
+        # any other name is a deterministic ``unknown_agent_type`` denial.
+        self._agent_type_registry = agent_type_registry if agent_type_registry is not None else AgentTypeRegistry()
         # Absolute wall-clock deadline for this run, set at construction (a few ms
         # before the subprocess spawns and the _drive watchdog arms). A durable
         # Kanban await is bounded by *this* shared deadline rather than a fresh
@@ -565,6 +590,13 @@ class CapabilityBroker:
             self._emit(
                 self._call_event(call_id, method, params, ok=False, error=denied.code, retryable=denied.retryable)
             )
+            if denied.code in _REGISTRY_DEPENDENT_DENIAL_CODES:
+                # Buffer into the replay cache too, exactly like runner_error --
+                # see _REGISTRY_DEPENDENT_DENIAL_CODES / _persist_failure. Without
+                # this, a replay whose registry root has since gained (or lost) a
+                # definition file would re-resolve live and diverge from the
+                # denial the source run actually observed and handled.
+                self._persist_failure(call_id, method, params, code=denied.code, retryable=denied.retryable)
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
                 "error": {"code": denied.code, "message": str(denied), "retryable": denied.retryable},
@@ -691,18 +723,29 @@ class CapabilityBroker:
     def _persist_failure(
         self, call_id: Any, method: str, params: dict[str, Any], *, code: str, retryable: bool
     ) -> None:
-        """Buffer a *caught* retryable dispatch failure for the replay cache (issue #103).
+        """Buffer a *caught* dispatch failure for the replay cache (issue #103).
 
-        Only ``runner_error`` (``retryable=True``) failures are recorded: every
-        other :class:`CapabilityDenied` code is a contract violation over the
-        call's own arguments and the run's own state (unknown agent id, schema/
-        budget/limit exhaustion, replay drift) — re-evaluating it live on replay
-        reproduces the identical denial without help, since it never touches an
-        ``AgentRunner``. A ``runner_error`` is different: it is a property of one
-        live dispatch attempt, so without this the replayed attempt could
-        silently *succeed* (or fail differently) against a runner whose behavior
-        has since changed, diverging from the source run's outcome for a failure
-        the script already observed and handled.
+        Two shapes of failure are recorded here, both because live
+        re-evaluation on replay is not guaranteed to reproduce the source
+        run's outcome:
+
+        * ``runner_error`` (``retryable=True``): a property of one live
+          dispatch attempt against an ``AgentRunner``, so without this the
+          replayed attempt could silently *succeed* (or fail differently)
+          against a runner whose behavior has since changed.
+        * ``unknown_agent_type`` / ``agent_type_invalid`` (issue #104): a
+          property of the on-disk :class:`~hermes_workflows.agent_type_registry
+          .AgentTypeRegistry` state at resolve time, which is mutable host
+          configuration -- see :data:`_REGISTRY_DEPENDENT_DENIAL_CODES` --
+          so without this a replay whose registry root has since gained or
+          lost a definition file would re-resolve live and diverge.
+
+        Every *other* :class:`CapabilityDenied` code is a contract violation
+        purely over the call's own arguments and the run's own in-memory
+        state (unknown legacy agent id, schema/budget/limit exhaustion,
+        replay drift) — re-evaluating it live on replay reproduces the
+        identical denial without help, so those are intentionally not
+        buffered.
 
         Unlike a success, this does **not** write to the recorder immediately:
         the broker cannot tell, at the moment it catches the runner exception,
@@ -716,12 +759,25 @@ class CapabilityBroker:
         outcome proves the failure was truly handled, not fatal.
 
         Buffered metadata-only — call id, method, canonical args hash, code,
-        retryable — never a payload. Gated by the same :meth:`_is_cacheable`
-        predicate as a success: a live ``kanban_agent`` call is a durable
-        external effect, not a pure function, so it always re-dispatches on
-        replay regardless (cached failure or not).
+        retryable — never a payload. A ``runner_error`` is gated by
+        :meth:`_is_cacheable`, the same predicate a success uses: a live
+        ``kanban_agent`` call is a durable external effect, not a pure
+        function, so it always re-dispatches on replay regardless (cached
+        failure or not), and ``agent``/``kanban_agent`` results are only
+        replay-safe when the injected runner is a deterministic pure
+        function (``deterministic_runner``). A registry-dependent denial
+        (:data:`_REGISTRY_DEPENDENT_DENIAL_CODES`) is exempt from that
+        second, runner-determinism half of the gate: it is recorded
+        whenever a recorder is configured, regardless of
+        ``deterministic_runner``, because the value being frozen is never a
+        function of the (possibly non-deterministic) runner at all -- the
+        call never reached one -- only of the registry's on-disk state at
+        resolve time, which this buffering exists specifically to insulate
+        replay from.
         """
-        if self._recorder is None or not self._is_cacheable(method, params):
+        if self._recorder is None:
+            return
+        if code not in _REGISTRY_DEPENDENT_DENIAL_CODES and not self._is_cacheable(method, params):
             return
         self._pending_failures.append((call_id, method, replay_args_hash(method, params), code, retryable))
 
@@ -847,12 +903,14 @@ class CapabilityBroker:
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
 
-        Returns the ``ret`` frame on a hit — a success frame, or (issue #103) the
-        same error frame for a recorded ``runner_error`` failure the source run
-        caught and handled, so replay never silently re-dispatches a retryable
-        failure live and diverges. Raises :class:`CapabilityDenied`
-        (``replay_mismatch``, abort) on a method/args drift, or returns
-        :data:`_MISS` when there is no cached entry (the caller dispatches live).
+        Returns the ``ret`` frame on a hit — a success frame, or (issue #103,
+        and issue #104 for the registry-dependent denial codes -- see
+        :data:`_REGISTRY_DEPENDENT_DENIAL_CODES`) the same error frame for a
+        recorded failure the source run caught and handled, so replay never
+        silently re-dispatches a buffered failure live and diverges. Raises
+        :class:`CapabilityDenied` (``replay_mismatch``, abort) on a
+        method/args drift, or returns :data:`_MISS` when there is no cached
+        entry (the caller dispatches live).
         """
         entry = self._replay.get(call_id)  # type: ignore[union-attr]
         if entry is None:
@@ -889,8 +947,10 @@ class CapabilityBroker:
             self._replayed_calls += 1
             budget = self._budget_info()
         if not entry.ok:
-            # A recorded caught-and-handled runner_error: serve the identical
-            # denial without touching the runner at all (see _persist_failure).
+            # A recorded caught-and-handled failure (runner_error, or a
+            # registry-dependent denial -- see _REGISTRY_DEPENDENT_DENIAL_CODES):
+            # serve the identical denial without touching the runner or the
+            # agent-type registry at all (see _persist_failure).
             code = entry.code or "runner_error"
             self._emit(
                 self._call_event(call_id, method, params, ok=False, error=code, retryable=entry.retryable, replayed=True)
@@ -1164,6 +1224,10 @@ class CapabilityBroker:
         """Dispatch ``agent(prompt, opts)`` through an injected child-agent runner."""
 
         request = _prompt_agent_request(params)
+        # Resolve the agent type before spending budget/quota on this call --
+        # matches _handle_agent's legacy-agent-id validation, which also runs
+        # before the agent-call counter is incremented (issue #104).
+        definition = self._resolve_agent_type(request.agent_type)
         with self._lock:
             self._check_token_budget()
             # Count the script-visible prompt agent call once; schema retries below may
@@ -1176,18 +1240,39 @@ class CapabilityBroker:
                 "no child agent runner configured for prompt agent calls", code="child_agent_unavailable"
             )
 
-        # The v2: fingerprint is always minted over the pre-filter (script-supplied)
-        # context -- see _prompt_agent_cache_identity's docstring and DESIGN.md
-        # §5.7.5 (issue #102) -- so cache/replay identity never depends on which
-        # runner happens to be configured or what it declares. Only the copy
-        # that actually crosses the ChildAgentRunner boundary is quarantined.
+        # The v2: fingerprint is always minted over the *unresolved, pre-filter*
+        # (script-supplied) request -- see _prompt_agent_cache_identity's
+        # docstring, DESIGN.md §5.7.5 (issue #102) and §5.7.6 (issue #104) -- so
+        # cache/replay identity never depends on which runner is configured,
+        # what it declares, or what the registry resolves the type to. Only the
+        # dispatched copy carries the quarantined context and the resolved
+        # system prompt/model/effort defaults.
         fingerprint, _args_hash = _prompt_agent_cache_identity(request)
         filtered_context, dropped_keys = filter_child_visible_context(self._child_runner, request.context)
         self._emit_prompt_agent_event(
             "agent_started", call_id, request, fingerprint, ok=True, dropped_context_keys=dropped_keys
         )
         visible_request = dataclass_replace(request, context=filtered_context)
-        return self._invoke_prompt_agent_with_schema_retry(call_id, visible_request)
+        resolved_request = _apply_agent_type_defaults(visible_request, definition)
+        return self._invoke_prompt_agent_with_schema_retry(call_id, resolved_request)
+
+    def _resolve_agent_type(self, agent_type: Optional[str]) -> AgentTypeDefinition:
+        """Resolve ``agent_type`` (or the built-in default) against the registry.
+
+        A bare ``agent(prompt)`` call (``agent_type is None``) always resolves
+        the built-in :data:`GENERAL_PURPOSE_AGENT_TYPE` -- documented semantics
+        for issue #104's acceptance criteria ("bare prompt == general-purpose").
+        Converts a registry failure into the matching :class:`CapabilityDenied`:
+        ``unknown_agent_type`` for a name absent everywhere, ``agent_type_invalid``
+        for a path-unsafe name or a malformed on-disk definition -- both
+        deterministic, metadata-only, ``retryable=False`` (default) per the
+        #103 taxonomy.
+        """
+        lookup = agent_type if agent_type is not None else GENERAL_PURPOSE_AGENT_TYPE
+        try:
+            return self._agent_type_registry.resolve(lookup)
+        except AgentTypeRegistryError as exc:
+            raise CapabilityDenied(str(exc), code=exc.code) from exc
 
     def _invoke_prompt_agent_with_schema_retry(
         self, call_id: Any, request: ChildAgentRequest
@@ -1746,6 +1831,23 @@ def _optional_tools(params: dict[str, Any], key: str) -> Optional[tuple[str, ...
     return tuple(deduped)
 
 
+def _optional_agent_type(params: dict[str, Any], key: str) -> Optional[str]:
+    """Validate the ``agentType`` selector option (issue #92).
+
+    Unlike ``label``/``phase``/etc. (:func:`_optional_str`), an empty string is
+    rejected: ``agentType`` is a lookup key into the agent-type registry
+    (issue #104), and an empty key can never resolve to anything, so failing
+    fast here is a clearer deterministic ``bad_request`` denial than letting it
+    fall through to a confusing "unknown agentType: ''" from the registry.
+    """
+    value = params.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise CapabilityDenied(f"prompt agent option {key!r} must be a non-empty string", code="bad_request")
+
+
 def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
     """Validate and normalize the parent-side prompt-agent request."""
     prompt = params.get("prompt")
@@ -1772,6 +1874,7 @@ def _prompt_agent_request(params: dict[str, Any]) -> ChildAgentRequest:
         isolation=_optional_str(params, "isolation"),
         context=_optional_dict(params, "context") or {},
         tools=_optional_tools(params, "tools"),
+        agent_type=_optional_agent_type(params, "agentType"),
     )
 
 
@@ -1791,6 +1894,17 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     canonical JSON (and therefore the ``v2:`` hash) of every existing prompt-agent
     fingerprint, silently invalidating durable resume/replay caches recorded
     before this option existed.
+
+    ``agentType`` (issue #92/#104) follows the exact same "only when set"
+    rule, for the exact same reason: a bare ``agent(prompt)`` call always
+    resolves against the built-in ``general-purpose`` agent type (see
+    :mod:`hermes_workflows.agent_type_registry`), but that resolution is not a
+    script-supplied option, so it must stay invisible to the fingerprint --
+    every prompt-agent fingerprint minted before #92 stays byte-identical for
+    calls that never set ``agentType``. The resolved ``system_prompt`` is
+    never part of the payload at all (set or not): the agent-type *name*
+    already identifies the call, and the resolved prompt text is a
+    deterministic function of it for a given registry.
 
     ``context`` (issue #102) is always the *pre-filter*, script-supplied value,
     never the copy narrowed by a ``ChildAgentRunner``'s declared
@@ -1816,6 +1930,8 @@ def _prompt_agent_fingerprint_payload(request: ChildAgentRequest) -> dict[str, A
     }
     if request.tools is not None:
         payload["tools"] = list(request.tools)
+    if request.agent_type is not None:
+        payload["agentType"] = request.agent_type
     return payload
 
 
@@ -1854,6 +1970,33 @@ def _request_with_schema_retry_context(
         isolation=request.isolation,
         context=context,
         tools=request.tools,
+        agent_type=request.agent_type,
+        system_prompt=request.system_prompt,
+    )
+
+
+def _apply_agent_type_defaults(request: ChildAgentRequest, definition: AgentTypeDefinition) -> ChildAgentRequest:
+    """Return ``request`` carrying its resolved agent-type defaults (issue #104).
+
+    Stamps the resolved ``system_prompt`` unconditionally (there is no opt to
+    override it) and fills ``model``/``effort`` from the definition *only*
+    when the script did not already supply them -- an explicit per-call opt
+    always wins over the registry default. Never mutates the fingerprint
+    identity: this is applied to a copy dispatched to the child runner, after
+    the fingerprint has already been computed from the unresolved ``request``.
+    """
+    return ChildAgentRequest(
+        prompt=request.prompt,
+        label=request.label,
+        phase=request.phase,
+        schema=request.schema,
+        model=request.model if request.model is not None else definition.model,
+        effort=request.effort if request.effort is not None else definition.effort,
+        isolation=request.isolation,
+        context=request.context,
+        tools=request.tools,
+        agent_type=request.agent_type,
+        system_prompt=definition.system_prompt,
     )
 
 
@@ -1892,6 +2035,7 @@ class WorkflowVM:
         capability_registry: Optional[CapabilityRegistry] = None,
         capability_policy: Optional[CapabilityPolicy] = None,
         control_store: Optional[ControlStore] = None,
+        agent_type_registry: Optional[AgentTypeRegistry] = None,
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._child_runner = child_agent_runner
@@ -1915,6 +2059,10 @@ class WorkflowVM:
         self._capability_registry = capability_registry
         self._capability_policy = capability_policy
         self._control_store = control_store
+        # File-based agent-type registry (issue #104): forwarded to the broker,
+        # which resolves ``agentType`` (issue #92) at call time. Explicit roots
+        # only -- no implicit cwd discovery.
+        self._agent_type_registry = agent_type_registry
 
     def run(self, script: str, *, args: Any = None, validate: bool = True) -> ScriptRunResult:
         """Validate, launch, and drive a workflow script to completion.
@@ -1956,6 +2104,7 @@ class WorkflowVM:
             capability_registry=self._capability_registry,
             capability_policy=self._capability_policy,
             control_store=self._control_store,
+            agent_type_registry=self._agent_type_registry,
         )
         try:
             result = self._drive(script, args, broker, calls)
@@ -2504,6 +2653,7 @@ def run_script(
     capability_registry: Optional[CapabilityRegistry] = None,
     capability_policy: Optional[CapabilityPolicy] = None,
     control_store: Optional[ControlStore] = None,
+    agent_type_registry: Optional[AgentTypeRegistry] = None,
 ) -> ScriptRunResult:
     """Construct a :class:`WorkflowVM` and run one script, optionally durable.
 
@@ -2622,6 +2772,7 @@ def run_script(
             capability_registry=capability_registry,
             capability_policy=capability_policy,
             control_store=control_store,
+            agent_type_registry=agent_type_registry,
         )
         return vm.run(script, args=args, validate=validate)
 
@@ -2674,6 +2825,7 @@ def run_script(
         capability_registry=capability_registry,
         capability_policy=capability_policy,
         control_store=control_store,
+        agent_type_registry=agent_type_registry,
     )
     result = vm.run(script, args=args, validate=False)
     result.run_id = persist_run_id

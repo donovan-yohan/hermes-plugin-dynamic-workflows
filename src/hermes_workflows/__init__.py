@@ -139,6 +139,13 @@ from .agents import (
     kanban_runner_id,
     is_kanban_runner_id,
 )
+from .agent_type_registry import (
+    AgentTypeDefinition,
+    AgentTypeRegistry,
+    AgentTypeRegistryError,
+    GENERAL_PURPOSE_AGENT_TYPE,
+    safe_agent_type_name,
+)
 from .registry import (
     RunStore,
     InMemoryRunStore,
@@ -379,6 +386,12 @@ __all__ = [
     "registered_agent_ids",
     "kanban_runner_id",
     "is_kanban_runner_id",
+    # file-based agent-type registry (issue #104)
+    "AgentTypeDefinition",
+    "AgentTypeRegistry",
+    "AgentTypeRegistryError",
+    "GENERAL_PURPOSE_AGENT_TYPE",
+    "safe_agent_type_name",
     # registry
     "RunStore",
     "InMemoryRunStore",

@@ -11,6 +11,7 @@ from typing import Any
 
 from hermes_workflows import (
     REDACTED,
+    AgentTypeRegistry,
     CapabilityBroker,
     ChildAgentRequest,
     ScriptRunStore,
@@ -795,6 +796,282 @@ def test_prompt_agent_cache_drift_fails_closed():
         assert rep.ok is False
         assert "prompt replay drift" in rep.error["message"]
 
+
+# -- agentType option (issue #92) + file-based agent-type registry (issue #104) --
+
+REVIEWER_DEFINITION = (
+    "---\n"
+    "name: reviewer\n"
+    "description: Reviews code changes for correctness.\n"
+    "model: opus\n"
+    "effort: high\n"
+    "---\n"
+    "You are a meticulous code reviewer.\n"
+)
+
+
+def test_prompt_agent_bare_call_resolves_general_purpose_default_system_prompt():
+    runner = FakeChildRunner({"answer": "ok"})
+    res = run_workflow_script(META + 'return await agent("write a plan")\n', child_agent_runner=runner)
+    assert res.ok, res.error
+    assert len(runner.requests) == 1
+    request = runner.requests[0]
+    assert request.agent_type is None
+    assert request.system_prompt
+    assert request.model is None
+    assert request.effort is None
+
+
+def test_prompt_agent_agent_type_reaches_child_runner_with_type_set_and_composes_with_schema():
+    # Regression test named in issue #92's acceptance criteria: agentType composes
+    # with schema and is no longer rejected as an unsupported option.
+    runner = FakeChildRunner({"answer": "ok"})
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "agents"
+        root.mkdir()
+        (root / "reviewer.md").write_text(REVIEWER_DEFINITION, encoding="utf-8")
+        registry = AgentTypeRegistry(roots=[root])
+        script = META + (
+            'return await agent("review this diff", {\n'
+            '    "agentType": "reviewer",\n'
+            '    "schema": {"answer": "string"},\n'
+            '})\n'
+        )
+        res = run_workflow_script(script, child_agent_runner=runner, agent_type_registry=registry)
+        assert res.ok, res.error
+        assert len(runner.requests) == 1
+        request = runner.requests[0]
+        assert request.agent_type == "reviewer"
+        assert request.system_prompt == "You are a meticulous code reviewer."
+        assert request.model == "opus"
+        assert request.effort == "high"
+
+
+def test_prompt_agent_explicit_opts_win_over_agent_type_registry_defaults():
+    runner = FakeChildRunner({"answer": "ok"})
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "agents"
+        root.mkdir()
+        (root / "reviewer.md").write_text(REVIEWER_DEFINITION, encoding="utf-8")
+        registry = AgentTypeRegistry(roots=[root])
+        script = META + (
+            'return await agent("review this diff", {\n'
+            '    "agentType": "reviewer",\n'
+            '    "model": "haiku",\n'
+            '    "effort": "low",\n'
+            '})\n'
+        )
+        res = run_workflow_script(script, child_agent_runner=runner, agent_type_registry=registry)
+        assert res.ok, res.error
+        request = runner.requests[0]
+        assert request.model == "haiku"
+        assert request.effort == "low"
+        # system_prompt still resolves from the registry -- there is no opt to override it.
+        assert request.system_prompt == "You are a meticulous code reviewer."
+
+
+def test_prompt_agent_project_scope_shadows_user_scope_agent_type():
+    runner = FakeChildRunner({"answer": "ok"})
+    with TemporaryDirectory() as tmp:
+        project_root = Path(tmp) / "project-agents"
+        user_root = Path(tmp) / "user-agents"
+        project_root.mkdir()
+        user_root.mkdir()
+        (project_root / "reviewer.md").write_text(
+            "---\nname: reviewer\nmodel: opus\n---\nProject reviewer prompt.\n", encoding="utf-8"
+        )
+        (user_root / "reviewer.md").write_text(
+            "---\nname: reviewer\nmodel: sonnet\n---\nUser reviewer prompt.\n", encoding="utf-8"
+        )
+        registry = AgentTypeRegistry(roots=[project_root, user_root])
+        script = META + 'return await agent("review", {"agentType": "reviewer"})\n'
+        res = run_workflow_script(script, child_agent_runner=runner, agent_type_registry=registry)
+        assert res.ok, res.error
+        assert runner.requests[0].model == "opus"
+        assert runner.requests[0].system_prompt == "Project reviewer prompt."
+
+
+def test_prompt_agent_unknown_agent_type_rejected_deterministically_not_retryable():
+    runner = FakeChildRunner()
+    script = META + (
+        'try:\n'
+        '    await agent("write a plan", {"agentType": "nonexistent-type"})\n'
+        'except CapabilityError as e:\n'
+        '    return {"code": e.code, "retryable": e.retryable}\n'
+        'return {"code": "missing"}\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+    assert res.ok, res.error
+    assert res.value == {"code": "unknown_agent_type", "retryable": False}
+    assert runner.requests == []
+
+
+def test_prompt_agent_registry_denial_replays_deterministically_despite_registry_drift():
+    # Regression for a review finding: unknown_agent_type/agent_type_invalid
+    # depend on mutable on-disk AgentTypeRegistry state at resolve time,
+    # unlike every other CapabilityDenied code (a pure function of the call's
+    # own arguments and the run's own state). So they must be frozen into the
+    # replay cache exactly like a caught runner_error -- otherwise a replay
+    # whose registry root has since gained a definition file re-resolves live
+    # and diverges from what the source run actually observed and handled.
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "agents"
+        root.mkdir()
+        script = META + (
+            'try:\n'
+            '    await agent("write a plan", {"agentType": "reviewer"})\n'
+            '    branch = "resolved"\n'
+            'except CapabilityError as e:\n'
+            '    branch = "denied"\n'
+            'return {"branch": branch}\n'
+        )
+        with TemporaryDirectory() as tmp2:
+            store = ScriptRunStore(Path(tmp2) / "runs")
+            src_runner = FakeChildRunner({"answer": "ok"})
+            rec = run_workflow_script(
+                script,
+                store=store,
+                run_id="src",
+                child_agent_runner=src_runner,
+                agent_type_registry=AgentTypeRegistry(roots=[root]),
+            )
+            assert rec.ok, rec.error
+            assert rec.value == {"branch": "denied"}
+            assert src_runner.requests == []
+
+            # An unrelated later deploy adds a "reviewer" definition to the
+            # same root -- this must not retroactively change a *replay* of
+            # the earlier run.
+            (root / "reviewer.md").write_text(REVIEWER_DEFINITION, encoding="utf-8")
+
+            replay_runner = FakeChildRunner({"answer": "ok"})
+            rep = run_workflow_script(
+                script,
+                store=store,
+                run_id="replay",
+                replay_from="src",
+                child_agent_runner=replay_runner,
+                agent_type_registry=AgentTypeRegistry(roots=[root]),
+            )
+    assert rep.ok, rep.error
+    assert rep.value == {"branch": "denied"}
+    # Serving the recorded denial must never dispatch a live child agent.
+    assert replay_runner.requests == []
+
+
+def test_prompt_agent_agent_type_path_traversal_rejected_deterministically():
+    runner = FakeChildRunner()
+    script = META + (
+        'try:\n'
+        '    await agent("write a plan", {"agentType": "../../etc/passwd"})\n'
+        'except CapabilityError as e:\n'
+        '    return {"code": e.code, "retryable": e.retryable}\n'
+        'return {"code": "missing"}\n'
+    )
+    res = run_workflow_script(script, child_agent_runner=runner)
+    assert res.ok, res.error
+    assert res.value == {"code": "agent_type_invalid", "retryable": False}
+    assert runner.requests == []
+
+
+def test_prompt_agent_malformed_agent_type_rejected_deterministically_not_retryable():
+    runner = FakeChildRunner()
+    for bad_agent_type in ('""', "123", "True"):
+        script = META + (
+            'try:\n'
+            f'    await agent("write a plan", {{"agentType": {bad_agent_type}}})\n'
+            'except CapabilityError as e:\n'
+            '    return {"code": e.code, "retryable": e.retryable}\n'
+            'return {"code": "missing"}\n'
+        )
+        res = run_workflow_script(script, child_agent_runner=runner)
+        assert res.ok, res.error
+        assert res.value == {"code": "bad_request", "retryable": False}
+    assert runner.requests == []
+
+    # agentType: None is the same as omitting it -- resolves general-purpose,
+    # not a malformed-option denial.
+    ok_runner = FakeChildRunner({"answer": "ok"})
+    res = run_workflow_script(
+        META + 'return await agent("write a plan", {"agentType": None})\n', child_agent_runner=ok_runner
+    )
+    assert res.ok, res.error
+    assert ok_runner.requests[0].agent_type is None
+
+
+def test_prompt_agent_agent_type_changes_fingerprint():
+    runner = FakeChildRunner({"answer": "ok"})
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp) / "agents"
+        root.mkdir()
+        (root / "reviewer.md").write_text(REVIEWER_DEFINITION, encoding="utf-8")
+        (root / "explainer.md").write_text(
+            "---\nname: explainer\n---\nExplain things simply.\n", encoding="utf-8"
+        )
+        registry = AgentTypeRegistry(roots=[root])
+        script = META + (
+            'await agent("same prompt", {"schema": {"answer": "string"}, "agentType": "reviewer"})\n'
+            'await agent("same prompt", {"schema": {"answer": "string"}, "agentType": "explainer"})\n'
+            'await agent("same prompt", {"schema": {"answer": "string"}})\n'
+            'return {}\n'
+        )
+        with TemporaryDirectory() as tmp2:
+            store = ScriptRunStore(Path(tmp2) / "runs")
+            res = run_workflow_script(
+                script, store=store, run_id="agent_type_fp", child_agent_runner=runner, agent_type_registry=registry
+            )
+            assert res.ok, res.error
+            assert len(runner.requests) == 3
+            fingerprints = [
+                e["fingerprint"] for e in store.journal("agent_type_fp") if e["type"] == "agent_started"
+            ]
+            assert len(fingerprints) == 3
+            assert len(set(fingerprints)) == 3
+
+
+def test_prompt_agent_fingerprint_without_agent_type_matches_pre_agent_type_baseline():
+    # Regression pin (issue #92/#104): omitting `agentType` must fingerprint
+    # identically to how it did before the option existed, mirroring the #101
+    # `tools` baseline pin -- a bare call resolving the built-in general-purpose
+    # default must not perturb the fingerprint or invalidate pre-existing
+    # durable resume/replay caches.
+    from hermes_workflows.script_store import canonical_hash
+    from hermes_workflows.vm import _prompt_agent_cache_identity
+
+    request = ChildAgentRequest(
+        prompt="summarize", label="x", schema={"answer": "string"}, model="sonnet"
+    )
+    fingerprint, args_hash = _prompt_agent_cache_identity(request)
+
+    pre_agent_type_payload = {
+        "prompt": "summarize",
+        "label": "x",
+        "phase": None,
+        "schema": {"answer": "string"},
+        "model": "sonnet",
+        "effort": None,
+        "isolation": None,
+        "context": {},
+    }
+    expected = "v2:" + canonical_hash(
+        {"kind": "agent(prompt,opts)", "version": 2, "request": pre_agent_type_payload}
+    )
+    assert fingerprint == expected
+
+    expected_args_hash = canonical_hash(
+        {"method": "agent", "fingerprint": expected, "request": pre_agent_type_payload}
+    )
+    assert args_hash == expected_args_hash
+
+
+def test_prompt_agent_agent_type_without_registry_configured_still_resolves_general_purpose():
+    # No agent_type_registry supplied at all -- the broker defaults to a
+    # registry with no roots; the built-in general-purpose default must still
+    # resolve for a bare call, and an explicit unknown type must still deny.
+    runner = FakeChildRunner({"answer": "ok"})
+    res = run_workflow_script(META + 'return await agent("write a plan")\n', child_agent_runner=runner)
+    assert res.ok, res.error
+    assert runner.requests[0].system_prompt
 
 # --------------------------------------------------------------------------- #
 # Host-declared child-visible-context quarantine (issue #102).
