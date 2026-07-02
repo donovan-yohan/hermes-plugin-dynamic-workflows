@@ -21,6 +21,7 @@ and testable without a live Hermes. This module is pure stdlib.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -43,6 +44,8 @@ from .agent_type_registry import (
 from .agents import (
     CHILD_AGENT_OPTION_KEYS,
     AgentRunner,
+    AsyncChildAgentRequest,
+    AsyncChildAgentRunner,
     ChildAgentRequest,
     ChildAgentRunner,
     StubAgentRunner,
@@ -115,8 +118,21 @@ __all__ = [
 JournalSink = Callable[[dict[str, Any]], None]
 
 # Capability methods the broker is willing to dispatch. Anything else is denied
-# regardless of what the (untrusted) subprocess sends.
-_ALLOWED_METHODS = frozenset({"agent", "kanban_agent", "capability", "log", "phase", "workflow"})
+# regardless of what the (untrusted) subprocess sends. ``agent_start`` /
+# ``agent_check`` / ``agent_cancel`` / ``agent_list`` (issue #112) are the
+# non-blocking async child-agent lifecycle -- see ``_handle_agent_start`` etc.
+_ALLOWED_METHODS = frozenset(
+    {
+        "agent", "kanban_agent", "capability", "log", "phase", "workflow",
+        "agent_start", "agent_check", "agent_cancel", "agent_list",
+    }
+)
+
+# Terminal states for one async child-agent handle (issue #112): once reached,
+# ``agent_check``/``agent_cancel`` report the cached record instead of polling
+# the runner again.
+_ASYNC_TERMINAL_STATES = frozenset({"done", "cancelled", "failed"})
+_ASYNC_STATES = frozenset({"pending"} | _ASYNC_TERMINAL_STATES)
 
 # Sentinel: a replay consult that found no cache entry for a call id (a miss),
 # so the broker must fall through to a live dispatch.
@@ -276,6 +292,7 @@ class CapabilityBroker:
         limits: VMLimits,
         *,
         child_agent_runner: Optional[ChildAgentRunner] = None,
+        async_child_runner: Optional[AsyncChildAgentRunner] = None,
         journal: Optional[JournalSink] = None,
         redact: bool = True,
         recorder: Optional[CallRecorder] = None,
@@ -293,6 +310,7 @@ class CapabilityBroker:
     ) -> None:
         self._runner = agent_runner
         self._child_runner = child_agent_runner
+        self._async_runner = async_child_runner
         self._limits = limits
         self._journal = journal
         self._redact = redact
@@ -353,6 +371,18 @@ class CapabilityBroker:
         # twice for identical prompt/options within one live run.
         self._prompt_results: dict[str, tuple[str, dict[str, Any]]] = {}
         self._recorded_prompt_fingerprints: set[str] = set()
+        # Async child-agent lifecycle state for this process/run (issue #112):
+        # handle -> {"token", "target", "state", "result", "error", "call_id"}.
+        # Populated only by a *live* dispatch of agent_start (never by a replay
+        # cache hit, which serves a call's whole ret frame without touching this
+        # dict) -- see the module-level note on _ASYNC_LIFECYCLE_METHODS in
+        # script_store.py for why that is safe for a fully-replayed prefix and
+        # what it costs for a call live-dispatched past that prefix.
+        self._async_agents: dict[str, dict[str, Any]] = {}
+        # Handles whose replay-served terminal result already re-applied its
+        # recorded token spend (issue #112 / Copilot review PR #131) -- keeps
+        # the once-per-handle credit idempotent across multiple cached checks.
+        self._replay_async_credited: set[str] = set()
         # Interactive approval decisions (issue #111): when a ``decide_call``
         # "edit" decision governs a capability call, the operator-modified
         # arguments — not the script's original ones — must feed the replay
@@ -561,7 +591,7 @@ class CapabilityBroker:
                 transcript_start = time.monotonic()
                 self._transcript_started(call_id, method, params, transcript_started_at)
             value = self._dispatch(call_id, method, params)
-            if method in ("agent", "kanban_agent"):
+            if method in ("agent", "kanban_agent", "agent_check", "agent_cancel"):
                 self._check_result_size(call_id, method, value)
             # An interactive "edit" decision (issue #111) may have substituted
             # operator-modified arguments for this call; persistence below must
@@ -934,7 +964,10 @@ class CapabilityBroker:
         #    value is ignored — the hard cap is not re-enforced on a faithful
         #    replay, so a tampered _tokens must not skew the budget downward).
         with self._lock:
-            if method == "agent":
+            if method in ("agent", "agent_start"):
+                # agent_start counts against the same max_agent_calls ceiling as a
+                # live dispatch (see _handle_agent_start) -- a cache hit must trip
+                # the cap at the identical point a partially-replayed run would.
                 self._agent_calls += 1
             elif method == "kanban_agent":
                 self._kanban_calls += 1
@@ -944,6 +977,26 @@ class CapabilityBroker:
                 usage = _non_negative_token_usage(entry.value)
                 if usage is not None:
                     self._tokens += usage
+            elif (
+                entry.ok
+                and method in ("agent_check", "agent_cancel")
+                and isinstance(entry.value, dict)
+                and entry.value.get("state") == "done"
+                and isinstance(entry.value.get("result"), dict)
+            ):
+                # Mirror _apply_async_status's once-per-handle token credit for a
+                # replay-served done result, so token_budget-gated control flow
+                # reproduces the recorded run instead of the async path silently
+                # bypassing the budget on replay. The live path credits exactly
+                # once (terminal states are sticky); the handle set gives the
+                # same idempotency across the several cached checks that may all
+                # carry the terminal state.
+                handle = params.get("handle") if isinstance(params, dict) else None
+                if isinstance(handle, str) and handle not in self._replay_async_credited:
+                    self._replay_async_credited.add(handle)
+                    usage = _non_negative_token_usage(entry.value["result"])
+                    if usage is not None:
+                        self._tokens += usage
             self._replayed_calls += 1
             budget = self._budget_info()
         if not entry.ok:
@@ -984,6 +1037,14 @@ class CapabilityBroker:
             if not self._limits.allow_nested_workflows:
                 raise CapabilityDenied("nested workflows are not permitted", code="nested_denied")
             raise CapabilityDenied("nested workflows are not implemented in this slice", code="nested_unsupported")
+        if method == "agent_start":
+            return self._handle_agent_start(call_id, params)
+        if method == "agent_check":
+            return self._handle_agent_check(call_id, params)
+        if method == "agent_cancel":
+            return self._handle_agent_cancel(call_id, params)
+        if method == "agent_list":
+            return self._handle_agent_list(call_id, params)
         raise CapabilityDenied(f"method {method!r} is not allowed", code="unknown_method")
 
     def _handle_capability(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -1626,6 +1687,174 @@ class CapabilityBroker:
             except Exception:  # noqa: BLE001 — card comments are best-effort.
                 pass
 
+    # -- async child-agent lifecycle (issue #112) --------------------------
+    #
+    # Non-blocking counterpart to ``_handle_agent``/``_handle_kanban_durable``:
+    # ``agent_start`` fires the request through the injected
+    # ``AsyncChildAgentRunner`` and returns immediately with a deterministic
+    # handle; ``agent_check``/``agent_cancel`` poll/cancel it later.
+    # ``_ASYNC_LIFECYCLE_METHODS`` (script_store.py) makes all four calls
+    # unconditionally replay-cacheable, so a replay of a call already recorded
+    # in this run's cache never touches ``self._async_agents`` or the runner at
+    # all -- it is served straight from the ``ret`` frame like any other cached
+    # call. That dict only matters for a *live* dispatch (a fresh run, or one
+    # continuing live past the cached prefix).
+
+    def _async_agent_handle(self, call_id: Any) -> str:
+        """Deterministic, content-addressed handle for one ``agent_start`` call.
+
+        Mirrors :func:`kanban.kanban_card_id`: derived from the logical run id
+        and the stable call id -- never randomness/wall-clock -- so a replay
+        that serves this call from the cache reports the identical handle
+        without ever calling :meth:`_async_agent_handle` again.
+        """
+        key = f"{self._idempotency_root}:agent_start:{call_id}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return f"ah_{digest}"
+
+    def _handle_agent_start(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        target = params.get("target")
+        if not isinstance(target, str) or not target:
+            raise CapabilityDenied("agent_start requires a non-empty 'target'", code="bad_request")
+        input_payload = params.get("input")
+        if input_payload is None:
+            input_payload = {}
+        elif not isinstance(input_payload, dict):
+            raise CapabilityDenied("agent_start option 'input' must be an object", code="bad_request")
+        opts = params.get("opts")
+        if opts is None:
+            opts = {}
+        elif not isinstance(opts, dict):
+            raise CapabilityDenied("agent_start option 'opts' must be an object", code="bad_request")
+
+        self._check_start_control(call_id, "agent_start", params)
+        if self._async_runner is None:
+            raise CapabilityDenied(
+                "no async child agent runner configured for agent_start", code="async_child_agent_unavailable"
+            )
+        handle = self._async_agent_handle(call_id)
+        with self._lock:
+            self._check_token_budget()
+            # Count against the same soft ceiling as agent()/kanban_agent() --
+            # agent_start launches a real background child-agent run through the
+            # host runner and must not be a free, uncounted fan-out path (a
+            # script could otherwise start far more background children than
+            # the blocking path's own max_agent_calls would ever allow). See the
+            # matching accounting in _maybe_replay for cache-hit parity.
+            self._agent_calls += 1
+            if self._agent_calls > self._limits.max_agent_calls:
+                raise CapabilityDenied(f"max_agent_calls ({self._limits.max_agent_calls}) exceeded", code="limit_agent")
+        request = AsyncChildAgentRequest(target=target, input=input_payload, opts=opts, idempotency_key=handle)
+        token = self._async_runner.start(request)
+        with self._lock:
+            self._async_agents[handle] = {
+                "token": token,
+                "target": target,
+                "state": "pending",
+                "result": None,
+                "error": None,
+                "call_id": call_id,
+            }
+        return {"handle": handle, "state": "pending"}
+
+    def _require_async_record(self, handle: Any) -> dict[str, Any]:
+        """Return a lock-consistent snapshot of one async agent record.
+
+        A *copy*, not the live dict -- callers that branch on ``state`` and
+        then read ``result``/``error`` must see all three fields as of one
+        atomic instant, never a torn read where ``state`` reflects a write
+        that has started but ``result``/``error`` do not yet (or vice versa).
+        """
+        if not isinstance(handle, str) or not handle:
+            raise CapabilityDenied("call requires a non-empty 'handle'", code="bad_request")
+        with self._lock:
+            record = self._async_agents.get(handle)
+            if record is None:
+                # Either the handle never existed, or (see the module note above)
+                # this call was live-dispatched past a replayed prefix whose
+                # agent_start was itself served from the cache without populating
+                # self._async_agents -- the documented durable-suspend boundary.
+                raise CapabilityDenied(f"unknown async agent handle {handle!r}", code="unknown_handle")
+            return dict(record)
+
+    def _handle_agent_check(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        record = self._require_async_record(params.get("handle"))
+        if record["state"] in _ASYNC_TERMINAL_STATES:
+            return self._async_state_view(record)
+        if self._async_runner is None:
+            raise CapabilityDenied(
+                "no async child agent runner configured for agent_check", code="async_child_agent_unavailable"
+            )
+        polled = self._async_runner.poll(record["token"])
+        self._apply_async_status(params["handle"], polled, context="agent_check")
+        return self._async_state_view(self._require_async_record(params["handle"]))
+
+    def _handle_agent_cancel(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        record = self._require_async_record(params.get("handle"))
+        if record["state"] in _ASYNC_TERMINAL_STATES:
+            return self._async_state_view(record)
+        if self._async_runner is None:
+            raise CapabilityDenied(
+                "no async child agent runner configured for agent_cancel", code="async_child_agent_unavailable"
+            )
+        cancelled = self._async_runner.cancel(record["token"])
+        self._apply_async_status(params["handle"], cancelled, context="agent_cancel")
+        return self._async_state_view(self._require_async_record(params["handle"]))
+
+    def _handle_agent_list(self, call_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            items = [
+                {"handle": handle, "target": record["target"], "state": record["state"], "_call_id": record["call_id"]}
+                for handle, record in self._async_agents.items()
+            ]
+        # Sort by the originating agent_start call id -- never dict insertion
+        # order, which can vary run-to-run when concurrent agent_start calls
+        # (via parallel()) complete on the parent's thread pool in a different
+        # order than they were issued in. The call id is assigned by the guest
+        # before the frame is even sent, so it is race-free and deterministic.
+        items.sort(key=lambda item: item["_call_id"])
+        for item in items:
+            del item["_call_id"]
+        return {"handles": items}
+
+    def _apply_async_status(self, handle: str, status: Any, *, context: str) -> None:
+        """Commit one poll()/cancel() status, unless the record is already terminal.
+
+        Terminal states are sticky: once ``record["state"]`` lands in
+        ``_ASYNC_TERMINAL_STATES`` it never changes again, no matter what a
+        *later-arriving* status says. Without this, a check-then-act race
+        between a concurrent ``agent_check`` (poll) and ``agent_cancel`` --
+        both of which read the pre-call state, release the lock, call the
+        runner, and only then reach here -- can resurrect a cancelled handle
+        back to "done" (or clobber a completed result to "cancelled" with a
+        null result) depending on which call's runner round-trip finishes
+        last. Discarding a stale update here instead makes the terminal state
+        idempotent, matching the documented "idempotent once terminal"
+        contract, regardless of dispatch order.
+        """
+        state, result, error = _parse_async_status(status, context=context)
+        with self._lock:
+            record = self._async_agents.get(handle)
+            if record is None or record["state"] in _ASYNC_TERMINAL_STATES:
+                return
+            record["state"] = state
+            record["result"] = result
+            record["error"] = error
+            if state == "done" and result is not None:
+                usage = _non_negative_token_usage(result)
+                if usage is not None:
+                    self._tokens += usage
+
+    def _async_state_view(self, record: dict[str, Any]) -> dict[str, Any]:
+        view: dict[str, Any] = {"state": record["state"]}
+        if record["state"] == "done":
+            view["result"] = record.get("result") or {}
+        elif record["state"] == "failed":
+            view["error"] = record.get("error") or {
+                "type": "AsyncChildAgentError", "message": "async child agent run failed",
+            }
+        return view
+
     def _invoke(self, agent_id: str, payload: dict[str, Any], schema: Any) -> dict[str, Any]:
         output = self._runner(agent_id, payload)
         if not isinstance(output, dict):
@@ -1702,6 +1931,15 @@ class CapabilityBroker:
             event["profile"] = params.get("profile")
         if method in ("capability",):
             event["capability"] = safe_capability_metadata_value(params.get("name"))
+        if method in ("agent_check", "agent_cancel"):
+            # A live agent_start's handle is a content-addressed id (never raw
+            # target/input), safe on the metadata-only journal like a Kanban
+            # card id. But this event is emitted on every path -- including
+            # bad_request/unknown_handle denials -- so the guest-supplied
+            # ``handle`` here has not necessarily gone through that broker
+            # derivation; route it through the same redaction/size guard as
+            # phase_title/label rather than trusting it verbatim.
+            event["handle"] = safe_capability_metadata_value(params.get("handle"))
         if method in ("phase",):
             event["phase_title"] = safe_capability_metadata_value(params.get("title"))
         if params.get("label"):
@@ -1744,6 +1982,49 @@ def _validate_output(output: dict[str, Any], schema: Any) -> None:
         schema_subset.validate(output, schema)
     except schema_subset.SchemaError as exc:
         raise CapabilityDenied(str(exc), code="schema") from exc
+
+
+def _parse_async_status(status: Any, *, context: str) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Validate one ``AsyncChildAgentRunner.poll()``/``cancel()`` return value.
+
+    Fails closed (``CapabilityDenied``, ``code="async_runner_invalid"``) on any
+    shape the host runner is not allowed to hand back -- an unknown ``state``,
+    or a ``"done"``/``"failed"`` status missing its required payload -- rather
+    than letting a misbehaving runner corrupt the broker's async agent state.
+    Returns ``(state, result, error)`` where ``result``/``error`` are ``None``
+    unless ``state`` is ``"done"``/``"failed"`` respectively.
+    """
+    if not isinstance(status, dict):
+        raise CapabilityDenied(
+            f"{context}: async runner returned {type(status).__name__}, expected dict",
+            code="async_runner_invalid",
+        )
+    state = status.get("state")
+    if state not in _ASYNC_STATES:
+        raise CapabilityDenied(f"{context}: async runner returned unknown state {state!r}", code="async_runner_invalid")
+    if state == "done":
+        result = status.get("result")
+        if not isinstance(result, dict):
+            raise CapabilityDenied(f"{context}: 'done' state requires a dict 'result'", code="async_runner_invalid")
+        return state, _json_safe(result), None
+    if state == "failed":
+        return state, None, _async_error_payload(status.get("error"))
+    return state, None, None
+
+
+def _async_error_payload(raw: Any) -> dict[str, Any]:
+    """Metadata-only error shape for a ``"failed"`` async agent status.
+
+    Mirrors the rest of the runtime's error contract (type/message/code only,
+    never a raw payload/traceback): keeps only string-valued ``type`` /
+    ``message`` / ``code`` fields from the runner's error, and falls back to a
+    generic marker when the runner supplied nothing usable.
+    """
+    if isinstance(raw, dict):
+        payload = {key: raw[key] for key in ("type", "message", "code") if isinstance(raw.get(key), str) and raw[key]}
+        if payload:
+            return payload
+    return {"type": "AsyncChildAgentError", "message": "async child agent run failed"}
 
 
 def _non_negative_token_usage(output: dict[str, Any]) -> Optional[int]:
@@ -2021,6 +2302,7 @@ class WorkflowVM:
         *,
         agent_runner: Optional[AgentRunner] = None,
         child_agent_runner: Optional[ChildAgentRunner] = None,
+        async_child_runner: Optional[AsyncChildAgentRunner] = None,
         limits: Optional[VMLimits] = None,
         journal: Optional[JournalSink] = None,
         python_executable: Optional[str] = None,
@@ -2039,6 +2321,7 @@ class WorkflowVM:
     ) -> None:
         self._runner = agent_runner if agent_runner is not None else StubAgentRunner()
         self._child_runner = child_agent_runner
+        self._async_runner = async_child_runner
         self._limits = limits if limits is not None else VMLimits()
         self._journal = journal
         self._python = python_executable or sys.executable
@@ -2092,6 +2375,7 @@ class WorkflowVM:
             self._runner,
             self._limits,
             child_agent_runner=self._child_runner,
+            async_child_runner=self._async_runner,
             journal=_collect,
             recorder=self._recorder,
             transcripts=self._transcripts,
@@ -2180,6 +2464,8 @@ class WorkflowVM:
                 info["profile"] = params.get("profile")
             elif frame.get("method") == "capability":
                 info["capability"] = safe_capability_metadata_value(params.get("name"))
+            elif frame.get("method") in ("agent_check", "agent_cancel"):
+                info["handle"] = safe_capability_metadata_value(params.get("handle"))
             return info
 
         def _set_protocol_error(message: str) -> None:
@@ -2642,6 +2928,7 @@ def run_script(
     args: Any = None,
     agent_runner: Optional[AgentRunner] = None,
     child_agent_runner: Optional[ChildAgentRunner] = None,
+    async_child_runner: Optional[AsyncChildAgentRunner] = None,
     limits: Optional[VMLimits] = None,
     journal: Optional[JournalSink] = None,
     validate: bool = True,
@@ -2668,7 +2955,9 @@ def run_script(
     cache is loaded up front so a corrupt/missing cache raises a typed
     :class:`~hermes_workflows.errors.ScriptRunStoreError` *before* any subprocess
     is spawned). A replay *reproduces the recorded run*: the cache only ever holds
-    the source run's deterministic calls (``log``/``phase`` always, ``agent``/
+    the source run's deterministic calls (``log``/``phase`` and the async
+    child-agent lifecycle globals -- ``agent_start``/``agent_check``/
+    ``agent_cancel``/``agent_list``, issue #112 -- always, ``agent``/
     ``kanban_agent`` only if the source's runner was deterministic), and those are
     served by call id irrespective of the runner passed to this replay invocation
     — the replay's own ``deterministic_runner`` does not re-gate them. Omit
@@ -2677,6 +2966,15 @@ def run_script(
     (``isinstance(runner, StubAgentRunner)``); set it ``True`` only when the
     injected runner is a pure function of its inputs, or agent/kanban results
     will not be cached.
+
+    ``async_child_runner`` (issue #112) wires an :class:`AsyncChildAgentRunner`
+    for the script's ``agent_start``/``agent_check``/``agent_cancel``/
+    ``agent_list`` globals -- the non-blocking counterpart to ``agent()``.
+    Without it those calls are denied (``async_child_agent_unavailable``),
+    matching ``child_agent_runner``'s prior-behaviour default. See DESIGN.md
+    for the durable-suspend boundary this slice leaves as a follow-up: an
+    unresolved handle at script end does **not** suspend the run the way an
+    unresolved paused Kanban await does (§5.10) -- it simply ends unresolved.
     """
     runner = agent_runner if agent_runner is not None else StubAgentRunner()
     deterministic = (
@@ -2762,6 +3060,7 @@ def run_script(
         vm = WorkflowVM(
             agent_runner=runner,
             child_agent_runner=child_agent_runner,
+            async_child_runner=async_child_runner,
             limits=effective_limits,
             journal=journal,
             replay=replay_cache,
@@ -2812,6 +3111,7 @@ def run_script(
     vm = WorkflowVM(
         agent_runner=runner,
         child_agent_runner=child_agent_runner,
+        async_child_runner=async_child_runner,
         limits=effective_limits,
         journal=_store_journal,
         recorder=recorder,
