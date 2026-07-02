@@ -216,6 +216,27 @@ class ScriptRunResult:
         }
 
 
+def _final_run_status(result: "ScriptRunResult") -> str:
+    """Map a :class:`ScriptRunResult` to its durable terminal ``run.json`` status.
+
+    ``stopped``/``paused``/``suspended`` all carry ``ok=False`` (see their
+    construction sites in :meth:`CapabilityBroker._drive`) but are not a
+    *failure* — they are a deliberate, resumable interruption. Only the
+    remaining ``ok=False`` case is a genuine failed/crashed run. Shared between
+    :meth:`WorkflowVM.run` (deciding whether to flush buffered retryable-failure
+    cache records, issue #103) and :func:`run_script` (the persisted status).
+    """
+    if result.stopped:
+        return "stopped"
+    if result.paused:
+        return "paused"
+    if result.suspended:
+        return "suspended"
+    if result.ok:
+        return "succeeded"
+    return "failed"
+
+
 class CapabilityBroker:
     """Parent-owned validator/dispatcher for one run's RPC capability calls.
 
@@ -286,6 +307,10 @@ class CapabilityBroker:
         self._capability_calls = 0
         self._tokens = 0
         self._replayed_calls = 0
+        # Buffered runner_error cache-failure records (issue #103), flushed to the
+        # recorder only once the run's *final* outcome is known — see
+        # :meth:`_persist_failure` / :meth:`flush_pending_failures`.
+        self._pending_failures: list[tuple[Any, str, str, str, bool]] = []
         self._lock = threading.Lock()
         # Prompt-agent result cache for this process/run. Durable replays load the
         # same shape from ReplayCache; this in-memory map avoids respawning a child
@@ -508,22 +533,40 @@ class CapabilityBroker:
         except CapabilityDenied as denied:
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, denied.code)
-            self._emit(self._call_event(call_id, method, params, ok=False, error=denied.code))
+            self._emit(
+                self._call_event(call_id, method, params, ok=False, error=denied.code, retryable=denied.retryable)
+            )
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
-                "error": {"code": denied.code, "message": str(denied)}, "budget": self._budget_info(),
+                "error": {"code": denied.code, "message": str(denied), "retryable": denied.retryable},
+                "budget": self._budget_info(),
             }
         except KeyboardInterrupt:
             raise  # let a genuine operator interrupt propagate.
         except BaseException as exc:  # noqa: BLE001 — an AgentRunner (even one raising
             # SystemExit/CancelledError) must NOT escape and crash the parent run; it is
-            # contained here and reported to the script as a structured error.
+            # contained here and reported to the script as a structured error. Unlike a
+            # CapabilityDenied contract violation, this is a property of one dispatch
+            # attempt against a live runner, not of the call's arguments — retryable=True
+            # (issue #103) so a script may catch it and choose to retry or degrade.
             if transcript_started_at is not None:
                 self._transcript_error(call_id, method, params, transcript_started_at, transcript_start, "runner_error")
-            self._emit(self._call_event(call_id, method, params, ok=False, error="runner_error"))
+            self._emit(
+                self._call_event(call_id, method, params, ok=False, error="runner_error", retryable=True)
+            )
+            # Journal the classification into the replay cache too (not just the
+            # metadata journal), so a replay of a run that caught this failure and
+            # continued reproduces the identical CapabilityDenied instead of
+            # silently re-dispatching live against a runner that may now behave
+            # differently — see :meth:`_persist_failure`.
+            self._persist_failure(call_id, method, params, code="runner_error", retryable=True)
             return {
                 "t": rpc.T_RET, "id": call_id, "ok": False,
-                "error": {"code": "runner_error", "message": f"{type(exc).__name__} raised while dispatching brokered call"},
+                "error": {
+                    "code": "runner_error",
+                    "message": f"{type(exc).__name__} raised while dispatching brokered call",
+                    "retryable": True,
+                },
                 "budget": self._budget_info(),
             }
 
@@ -613,6 +656,60 @@ class CapabilityBroker:
             self._emit(self._call_event(call_id, method, params, ok=True))
         except Exception:  # noqa: BLE001 — journaling is best-effort.
             pass
+
+    def _persist_failure(
+        self, call_id: Any, method: str, params: dict[str, Any], *, code: str, retryable: bool
+    ) -> None:
+        """Buffer a *caught* retryable dispatch failure for the replay cache (issue #103).
+
+        Only ``runner_error`` (``retryable=True``) failures are recorded: every
+        other :class:`CapabilityDenied` code is a contract violation over the
+        call's own arguments and the run's own state (unknown agent id, schema/
+        budget/limit exhaustion, replay drift) — re-evaluating it live on replay
+        reproduces the identical denial without help, since it never touches an
+        ``AgentRunner``. A ``runner_error`` is different: it is a property of one
+        live dispatch attempt, so without this the replayed attempt could
+        silently *succeed* (or fail differently) against a runner whose behavior
+        has since changed, diverging from the source run's outcome for a failure
+        the script already observed and handled.
+
+        Unlike a success, this does **not** write to the recorder immediately:
+        the broker cannot tell, at the moment it catches the runner exception,
+        whether the script will go on to catch and handle it (this issue's
+        target) or whether the failure is about to crash the whole run
+        uncaught — the *same* mid-``parallel()``/``pipeline()`` crash the
+        pending-writes resume contract (issue #109) deliberately re-dispatches
+        fresh on ``replay_from`` rather than replaying a stale failure for a
+        branch that never actually completed. So the record is only buffered
+        here; :meth:`flush_pending_failures` commits it once the run's final
+        outcome proves the failure was truly handled, not fatal.
+
+        Buffered metadata-only — call id, method, canonical args hash, code,
+        retryable — never a payload. Gated by the same :meth:`_is_cacheable`
+        predicate as a success: a live ``kanban_agent`` call is a durable
+        external effect, not a pure function, so it always re-dispatches on
+        replay regardless (cached failure or not).
+        """
+        if self._recorder is None or not self._is_cacheable(method, params):
+            return
+        self._pending_failures.append((call_id, method, replay_args_hash(method, params), code, retryable))
+
+    def flush_pending_failures(self) -> None:
+        """Commit buffered retryable-failure cache records (issue #103).
+
+        Called by the run's owner once the final outcome is known — see
+        :meth:`_persist_failure` for why the write is deferred this far. Never
+        called at all on a genuine ``"failed"`` terminal status, so the buffer is
+        simply discarded there (mirroring the pending-writes contract: a branch
+        that never truly completed re-dispatches fresh on resume).
+        """
+        if self._recorder is None:
+            return
+        for call_id, method, args_hash, code, retryable in self._pending_failures:
+            try:
+                self._recorder.record_failure(call_id, method, args_hash, code, retryable)
+            except Exception:  # noqa: BLE001 — persistence is best-effort.
+                pass
 
     def _is_cacheable(self, method: str, params: dict[str, Any]) -> bool:
         """Whether a call's result may be written to the #3 replay cache.
@@ -719,7 +816,10 @@ class CapabilityBroker:
     def _maybe_replay(self, call_id: Any, method: Any, params: dict[str, Any]) -> Any:
         """Consult the replay cache for ``call_id``.
 
-        Returns the ``ret`` frame on a hit, raises :class:`CapabilityDenied`
+        Returns the ``ret`` frame on a hit — a success frame, or (issue #103) the
+        same error frame for a recorded ``runner_error`` failure the source run
+        caught and handled, so replay never silently re-dispatches a retryable
+        failure live and diverges. Raises :class:`CapabilityDenied`
         (``replay_mismatch``, abort) on a method/args drift, or returns
         :data:`_MISS` when there is no cached entry (the caller dispatches live).
         """
@@ -751,12 +851,28 @@ class CapabilityBroker:
                 self._kanban_calls += 1
             elif method == "capability":
                 self._capability_calls += 1
-            if method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
+            if entry.ok and method in ("agent", "kanban_agent", "capability") and isinstance(entry.value, dict):
                 usage = _non_negative_token_usage(entry.value)
                 if usage is not None:
                     self._tokens += usage
             self._replayed_calls += 1
             budget = self._budget_info()
+        if not entry.ok:
+            # A recorded caught-and-handled runner_error: serve the identical
+            # denial without touching the runner at all (see _persist_failure).
+            code = entry.code or "runner_error"
+            self._emit(
+                self._call_event(call_id, method, params, ok=False, error=code, retryable=entry.retryable, replayed=True)
+            )
+            return {
+                "t": rpc.T_RET, "id": call_id, "ok": False,
+                "error": {
+                    "code": code,
+                    "message": f"replayed {code} dispatch failure for call {call_id!r}",
+                    "retryable": entry.retryable,
+                },
+                "budget": budget,
+            }
         if self._should_transcribe(method, params):
             self._transcript_cache_hit(call_id, method, params, entry.value)
         self._emit(self._call_event(call_id, method, params, ok=True, replayed=True))
@@ -1267,6 +1383,7 @@ class CapabilityBroker:
         *,
         ok: bool,
         error: Optional[str] = None,
+        retryable: Optional[bool] = None,
         replayed: bool = False,
         event_type: str = "rpc_call",
     ) -> dict[str, Any]:
@@ -1297,6 +1414,11 @@ class CapabilityBroker:
             event["phase"] = safe_capability_metadata_value(params.get("phase"))
         if error:
             event["error"] = error
+            # retryable is call-classification metadata (issue #103), journaled
+            # alongside the error code so replay/audit consumers see the same
+            # classification a script observed via ``CapabilityError.retryable``.
+            if retryable is not None:
+                event["retryable"] = retryable
         if replayed:
             event["replayed"] = True
         if not self._redact:
@@ -1531,6 +1653,14 @@ class WorkflowVM:
         try:
             result = self._drive(script, args, broker, calls)
             result.replayed_calls = broker.replayed_calls
+            # Only commit buffered retryable-failure cache records (issue #103)
+            # once the run's final outcome proves the failure was truly caught
+            # and handled rather than fatal — see _persist_failure /
+            # flush_pending_failures. A genuine "failed" status leaves them
+            # unflushed (discarded), matching the pending-writes contract
+            # (issue #109): a branch that never completed re-dispatches fresh.
+            if _final_run_status(result) != "failed":
+                broker.flush_pending_failures()
             return result
         except Exception as exc:  # noqa: BLE001 - keep unexpected VM bugs contained.
             return ScriptRunResult(
@@ -2229,16 +2359,7 @@ def run_script(
     # an operator/resumer can discover it (store.suspended_runs) and resume it with
     # replay_from once the awaited card produces an event. It is neither succeeded
     # nor failed.
-    if result.stopped:
-        status = "stopped"
-    elif result.paused:
-        status = "paused"
-    elif result.suspended:
-        status = "suspended"
-    elif result.ok:
-        status = "succeeded"
-    else:
-        status = "failed"
+    status = _final_run_status(result)
     store.finish(
         persist_run_id,
         status=status,

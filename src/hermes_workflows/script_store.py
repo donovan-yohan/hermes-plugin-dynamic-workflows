@@ -189,11 +189,12 @@ def _redact_error(error: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
     Drops the free-text ``message`` (which a workflow script controls and could
     fill with input/output-derived data) and keeps the structural ``type`` /
-    ``code`` / ``line``, honoring the journal's metadata-only contract.
+    ``code`` / ``line`` / ``retryable`` (issue #103), honoring the journal's
+    metadata-only contract.
     """
     if not isinstance(error, dict):
         return error
-    return {k: error[k] for k in ("type", "code", "line") if k in error}
+    return {k: error[k] for k in ("type", "code", "line", "retryable") if k in error}
 
 
 def _fsync_dir(path: Path) -> None:
@@ -266,12 +267,26 @@ class ScriptRunMeta:
 
 @dataclass(frozen=True)
 class ReplayEntry:
-    """One cached deterministic call result, addressed by its stable call id."""
+    """One cached deterministic call outcome, addressed by its stable call id.
+
+    ``ok=True`` (the default, and the only shape written before issue #103) is a
+    successful result cached for replay. ``ok=False`` (issue #103) is a
+    *retryable* dispatch failure (``code="runner_error"``) that a script caught
+    and handled on the source run: recorded metadata-only (``code``/
+    ``retryable``, never a payload — ``value`` is unused) so replay reproduces
+    the identical :class:`~hermes_workflows.errors.CapabilityDenied` instead of
+    silently re-dispatching live against a runner that may now behave
+    differently, which would let the replayed run's outcome diverge from the
+    source run's for a failure the script had already observed and handled.
+    """
 
     call_id: int
     method: str
     args_hash: str
-    value: Any
+    value: Any = None
+    ok: bool = True
+    code: Optional[str] = None
+    retryable: bool = False
 
 
 @dataclass(frozen=True)
@@ -339,6 +354,30 @@ class CallRecorder:
     def record(self, call_id: Any, method: str, args_hash: str, value: Any) -> None:
         line = json.dumps(
             {"call_id": call_id, "method": method, "args_hash": args_hash, "value": value},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def record_failure(self, call_id: Any, method: str, args_hash: str, code: str, retryable: bool) -> None:
+        """Append one cached *retryable* dispatch-failure outcome (issue #103).
+
+        Metadata-only — ``call_id``/``method``/``args_hash``/``code``/
+        ``retryable``, never a payload — so a caught-and-handled transient
+        runner failure replays to the identical classification instead of
+        silently re-dispatching live. Mirrors :meth:`record`'s durability
+        (append + fsync).
+        """
+        line = json.dumps(
+            {
+                "call_id": call_id, "method": method, "args_hash": args_hash,
+                "ok": False, "code": code, "retryable": retryable,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
             default=str,
@@ -711,7 +750,7 @@ class ScriptRunStore:
         for key in (
             "agent_id", "profile", "capability", "label", "phase", "phase_title", "parallel_index",
             "pipeline_item_index", "pipeline_stage_index",
-            "fingerprint", "error", "replayed", "cache", "has_value", "attempt", "max_retries",
+            "fingerprint", "error", "retryable", "replayed", "cache", "has_value", "attempt", "max_retries",
         ):
             if event.get(key) is not None:
                 data[key] = event.get(key)
@@ -847,11 +886,37 @@ class ScriptRunStore:
                         raise CorruptScriptRunError(
                             run_id, "corrupt_cache", f"duplicate cached call id {call_id}"
                         )
+                    # "ok" is absent on every line written before issue #103 (all of
+                    # which are successful results) and on every success line since,
+                    # so absence means True — a fail-closed reader would reject the
+                    # entire pre-existing on-disk format.
+                    ok = obj.get("ok", True)
+                    if not isinstance(ok, bool):
+                        raise CorruptScriptRunError(
+                            run_id, "corrupt_cache", f"cache.jsonl line {lineno}: ok must be a bool"
+                        )
+                    code: Optional[str] = None
+                    retryable = False
+                    if not ok:
+                        code = obj.get("code")
+                        retryable = obj.get("retryable", False)
+                        if not isinstance(code, str) or not code:
+                            raise CorruptScriptRunError(
+                                run_id, "corrupt_cache",
+                                f"cache.jsonl line {lineno}: failed entry requires a non-empty 'code'",
+                            )
+                        if not isinstance(retryable, bool):
+                            raise CorruptScriptRunError(
+                                run_id, "corrupt_cache", f"cache.jsonl line {lineno}: retryable must be a bool"
+                            )
                     entries[call_id] = ReplayEntry(
                         call_id=call_id,
                         method=method,
                         args_hash=args_hash,
                         value=obj.get("value"),
+                        ok=ok,
+                        code=code,
+                        retryable=retryable,
                     )
                     continue
                 fingerprint = obj.get("fingerprint")
