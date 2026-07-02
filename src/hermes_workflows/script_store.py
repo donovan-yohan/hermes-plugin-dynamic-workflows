@@ -101,6 +101,22 @@ _ALWAYS_REPLAYABLE = frozenset({"log", "phase"})
 # Methods that cross the AgentRunner boundary: replayable only when the runner
 # is declared deterministic for the run.
 _RUNNER_METHODS = frozenset({"agent", "kanban_agent"})
+# The async child-agent lifecycle globals (issue #112: ``agent_start`` /
+# ``agent_check`` / ``agent_cancel`` / ``agent_list``) are unconditionally
+# replayable -- like ``_ALWAYS_REPLAYABLE`` but for a different reason. Each
+# call's recorded value is a *snapshot at that call id* (the run's own current
+# handle/state at that exact point in its deterministic sequence), not a
+# fresh live read the way a plain ``agent``/``kanban_agent`` call is; serving
+# it from the cache is exactly what "resume without re-polling the async
+# runner" (and "cancel is replay-deterministic") mean. Unlike ``agent``/
+# ``kanban_agent`` this does **not** gate on ``deterministic_runner``: the
+# production case -- a real, non-deterministic host ``AsyncChildAgentRunner``
+# -- is precisely the one that most needs its completed handles to replay
+# from cache rather than re-dispatch against a runner with no memory of the
+# original token (see DESIGN.md's async-lifecycle section for the boundary
+# this leaves: a call made *after* the recorded prefix ends still re-dispatches
+# live and requires the handle to already be attached in this process).
+_ASYNC_LIFECYCLE_METHODS = frozenset({"agent_start", "agent_check", "agent_cancel", "agent_list"})
 
 # Run-journal (``journal.jsonl``) durability policy (issue #108). ``sync`` fsyncs
 # every event (today's behavior, and the default — zero change unless an
@@ -165,11 +181,16 @@ def replay_args_hash(method: str, params: dict[str, Any]) -> str:
 def is_replayable(method: str, *, deterministic_runner: bool) -> bool:
     """Whether a call of ``method`` may be cached/served from the replay cache.
 
-    ``log`` / ``phase`` always (constant ``None`` result). ``agent`` /
-    ``kanban_agent`` only when ``deterministic_runner`` is true. ``workflow`` and
-    anything else are never replayable.
+    ``log`` / ``phase`` always (constant ``None`` result). The async lifecycle
+    globals (``agent_start`` / ``agent_check`` / ``agent_cancel`` /
+    ``agent_list``, issue #112) always too -- see
+    :data:`_ASYNC_LIFECYCLE_METHODS`. ``agent`` / ``kanban_agent`` only when
+    ``deterministic_runner`` is true. ``workflow`` and anything else are never
+    replayable.
     """
     if method in _ALWAYS_REPLAYABLE:
+        return True
+    if method in _ASYNC_LIFECYCLE_METHODS:
         return True
     if method in _RUNNER_METHODS:
         return deterministic_runner

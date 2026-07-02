@@ -15,9 +15,13 @@ What a script may do
 * Use deterministic control flow: ``if`` / ``for`` / ``while`` / ``try`` /
   function defs / comprehensions / ``async``/``await``.
 * Call the RPC-backed capability globals (``agent``, ``kanban_agent``,
-  ``capability``, ``parallel``, ``pipeline``, ``phase``, ``log``, ``workflow``)
+  ``capability``, ``agent_start``, ``agent_check``, ``agent_cancel``,
+  ``agent_list``, ``parallel``, ``pipeline``, ``phase``, ``log``, ``workflow``)
   and read ``args`` / ``budget`` plus the injected-safe ``json`` / ``math``
-  helpers.
+  helpers. ``agent_start``/``agent_check``/``agent_cancel``/``agent_list``
+  (issue #112) are the non-blocking counterpart to ``agent``/``kanban_agent``:
+  start a background child-agent run once, keep orchestrating, and poll it
+  later instead of holding an await open.
 * Use ``return`` and top-level ``await`` (the body is wrapped into a private
   async entrypoint before execution — see :func:`wrap_source`).
 
@@ -73,7 +77,11 @@ MAX_AST_NODES = 20_000
 # context. Referencing them is always allowed; the parent broker decides at call
 # time whether a specific request is permitted.
 CAPABILITY_GLOBALS: frozenset[str] = frozenset(
-    {"agent", "kanban_agent", "capability", "parallel", "pipeline", "phase", "log", "workflow", "args", "budget"}
+    {
+        "agent", "kanban_agent", "capability",
+        "agent_start", "agent_check", "agent_cancel", "agent_list",
+        "parallel", "pipeline", "phase", "log", "workflow", "args", "budget",
+    }
 )
 
 # Deterministic, side-effect-free helpers the guest pre-binds so a script never

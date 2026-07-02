@@ -1741,6 +1741,101 @@ Known, accepted limitations (not security escapes):
   is the current backstop. A `resource.setrlimit` guard in the guest is future
   hardening.
 
+### 5.14 Async child-agent lifecycle: `agent_start`/`agent_check`/`agent_cancel`/`agent_list` (issue #112)
+
+§5.8's `kanban_agent` is a *blocking* durable awaitable: one call, one (possibly
+long, possibly suspending) wait, one result. Some background work does not fit
+that shape — a script wants to start several long-running child agents, keep
+orchestrating other work (or return control to the caller entirely), and only
+later ask "is it done yet?". This slice generalizes the RPC/broker/replay
+machinery `kanban_agent` established into four non-blocking script globals,
+modeled on deepagents' `AsyncSubAgentMiddleware`:
+
+- `agent_start(target, input, opts) -> {"handle": <str>, "state": "pending"}`
+  fires the request through a new, separate `AsyncChildAgentRunner` seam
+  (`agents.py`: `start(request) -> token` / `poll(token) -> status` /
+  `cancel(token) -> status`) and returns immediately — it never waits for the
+  run to finish.
+- `agent_check(handle) -> {"state": ..., "result"?: {...}, "error"?: {...}}`
+  polls once, non-blocking. `state` is one of `pending` / `done` / `cancelled`
+  / `failed`.
+- `agent_cancel(handle) -> {"state": ...}` requests cancellation and returns
+  the acknowledged resulting state; idempotent once terminal.
+- `agent_list() -> {"handles": [{"handle", "target", "state"}, ...]}` lists
+  every handle this run has started, in the deterministic order they were
+  started (sorted by the originating `agent_start` call id, never dict
+  insertion order — concurrent `agent_start`s issued via `parallel()` can
+  *finish* dispatching in a different order than they were issued, since they
+  run on the parent's thread pool, but their call ids are assigned by the
+  guest before the frame is even sent and so are race-free).
+
+**Handles are deterministic, not random.** `CapabilityBroker._async_agent_handle`
+derives the handle the same way `kanban.kanban_card_id` derives a card id: a
+content-addressed hash of `<idempotency_root>:agent_start:<call_id>`. No
+`uuid`/wall-clock is ever involved, so the same script+args always mints the
+same handle for the same logical `agent_start` call.
+
+**Replay is unconditional, unlike `agent`/`kanban_agent`.** §5.7's
+`is_replayable` gates `agent`/`kanban_agent` caching on `deterministic_runner`
+— a live, non-deterministic Hermes runner's result is deliberately *not*
+cached, so a replay re-dispatches it fresh rather than serving a possibly-stale
+value. The four async lifecycle globals are the opposite: they are *always*
+cacheable (`script_store._ASYNC_LIFECYCLE_METHODS`), regardless of
+`deterministic_runner`. This is deliberate, not an oversight: a recorded call
+here is a snapshot of this run's own handle/state at one exact point in its
+deterministic sequence, not a fresh external read, and the production case —
+a real, non-deterministic `AsyncChildAgentRunner` — is precisely the one that
+most needs a completed handle to replay from cache instead of re-dispatching
+against a runner with no memory of the original token. This satisfies "start N
+background children, `parallel()` other work, then collect via `agent_check`"
+surviving an ordinary replay/resume of a *fully-recorded* run untouched by the
+boundary below.
+
+**Boundary this slice leaves for a follow-up: no durable suspend on an
+unresolved handle.** §5.10 made an unresolved *paused Kanban await* suspend the
+run durably (`ScriptRunResult(suspended=True)`, `store.suspended_runs()`,
+resumable via `replay_from`) by reusing the existing card/event-log plumbing —
+the await already knew how to block-then-give-up. The async lifecycle globals
+never block at all (`agent_check` is a single non-blocking poll), so there is
+no analogous "give up and suspend" moment to hook into, and unlike a Kanban
+card there is no durable, host-external store of the async run's identity this
+slice can reattach to from a fresh process. Landing that properly needs its own
+durable async-run store (a `token`/`handle` -> host-run-id index a fresh
+process can query), which is deliberately out of scope here per the issue's own
+"land start/check/cancel/list + journaling + replay + in-process completion
+first" cut. Concretely, today:
+
+- A script that ends with an unresolved (`pending`) handle just ends unresolved
+  — the run is **not** suspended; it reports its ordinary terminal status.
+  Nothing observes or acts on the pending handle after the script returns.
+- A `replay_from` reproduces every call already in the source run's cache
+  (§ above) untouched. A call *live-dispatched past that cached prefix* --
+  e.g. a resumed run's `agent_check` for a handle whose `agent_start` was
+  itself served from the cache -- finds `self._async_agents` unpopulated (that
+  dict is only ever written by a *live* dispatch of `agent_start`, never by a
+  cache hit) and fails closed with a typed, deterministic `unknown_handle`
+  denial rather than crashing or guessing. A script that depends on checking a
+  handle across a resume boundary is not yet supported; only "the whole
+  relevant prefix stayed within the replay cache" is.
+
+A future slice can close this the same way §5.10 closed the Kanban gap: add a
+durable async-run index alongside `ScriptRunStore`, make an unresolved handle
+at script end request the same `should_suspend`/`suspend_info` teardown the
+broker already exposes for Kanban (`CapabilityBroker._begin_suspend` and
+`WorkflowVM._drive`'s handling of it), and have a resumed run's live
+`agent_check`/`agent_cancel` reattach through that index instead of requiring
+`self._async_agents` to already hold the token.
+
+**Runner seam and deterministic test stub.** `agents.AsyncChildAgentRunner` is
+the `Protocol` a host implements (`start`/`poll`/`cancel`); `run_workflow_script`
+wires it in as `async_child_runner=`, mirroring `child_agent_runner=`'s existing
+pattern — omit it and `agent_start`/`agent_check`/`agent_cancel` deny with
+`async_child_agent_unavailable`. `agents.StubAsyncAgentRunner` is the
+deterministic, network-free default for tests: it completes a given request
+after a fixed number of `poll()` calls derived only from a stable hash of the
+request (never wall-clock/randomness), so the same call always takes the same
+number of polls to resolve and every test is reproducible.
+
 ## 6. GitHub issue lifecycle hygiene template
 
 `examples/github_issue_lifecycle_hygiene.workflow.json` is the first saved template

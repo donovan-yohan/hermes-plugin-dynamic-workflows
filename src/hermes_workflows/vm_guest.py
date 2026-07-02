@@ -14,7 +14,10 @@ no Hermes credentials. It:
    restricted ``__builtins__`` and only RPC-backed capability globals;
 5. routes every ``agent`` / ``kanban_agent`` / ``capability`` / ``log`` /
    ``phase`` / ``workflow`` call back to the parent broker and blocks for the
-   structured response;
+   structured response; ``agent_start`` / ``agent_check`` / ``agent_cancel`` /
+   ``agent_list`` (issue #112) are the non-blocking counterpart -- each still
+   round-trips to the parent, but ``agent_start`` returns immediately with a
+   handle instead of waiting for the background run to finish;
 6. reports the final return value (or the script's exception) in a ``done``
    frame and exits.
 
@@ -354,6 +357,33 @@ def _build_script_globals(
     async def workflow(name: str, args: Any = None) -> Any:  # nested workflows (parent decides support)
         return await conn.acall("workflow", _annotate_call({"name": name, "args": args}))
 
+    async def agent_start(target: str, input: Optional[dict[str, Any]] = None,
+                           opts: Optional[dict[str, Any]] = None) -> Any:
+        # Non-blocking counterpart to ``agent()`` (issue #112): the parent broker
+        # starts a background child-agent run through the injected
+        # AsyncChildAgentRunner and returns immediately with a deterministic
+        # handle -- it never waits for the run to finish. Poll it later with
+        # ``agent_check(handle)``.
+        params: dict[str, Any] = {"target": target, "input": input or {}, "opts": opts or {}}
+        return await conn.acall("agent_start", _annotate_call(params))
+
+    async def agent_check(handle: Any) -> Any:
+        # Non-blocking poll of a run started by ``agent_start``: returns
+        # {"state": "pending"} immediately, or the terminal shape once resolved.
+        # Polling a completed handle again (including after a durable replay)
+        # returns the same resolved state rather than re-dispatching.
+        return await conn.acall("agent_check", _annotate_call({"handle": handle}))
+
+    async def agent_cancel(handle: Any) -> Any:
+        # Request cancellation of a run started by ``agent_start``; returns the
+        # resulting (acknowledged) state. Idempotent once the handle is terminal.
+        return await conn.acall("agent_cancel", _annotate_call({"handle": handle}))
+
+    async def agent_list() -> Any:
+        # Every ``agent_start`` handle known to this run and its current state,
+        # in the deterministic order the handles were started.
+        return await conn.acall("agent_list", _annotate_call({}))
+
     async def capability(name: str, input: Optional[dict[str, Any]] = None, *, label: Optional[str] = None,
                          approval_id: Optional[str] = None, schema: Optional[dict[str, Any]] = None) -> Any:
         return await conn.acall(
@@ -457,6 +487,10 @@ def _build_script_globals(
         "kanban_agent": kanban_agent,
         "capability": capability,
         "workflow": workflow,
+        "agent_start": agent_start,
+        "agent_check": agent_check,
+        "agent_cancel": agent_cancel,
+        "agent_list": agent_list,
         "log": log,
         "phase": phase,
         "parallel": parallel,

@@ -26,6 +26,11 @@ __all__ = [
     "ChildAgentRunner",
     "CHILD_AGENT_OPTION_KEYS",
     "StubAgentRunner",
+    "AsyncChildAgentRequest",
+    "AsyncChildAgentRunner",
+    "AsyncAgentState",
+    "ASYNC_AGENT_STATES",
+    "StubAsyncAgentRunner",
     "KNOWN_AGENTS",
     "is_known_agent",
     "register_known_agent",
@@ -269,3 +274,142 @@ class StubAgentRunner:
             default=str,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# -- async child-agent lifecycle (issue #112) --------------------------------
+#
+# ``agent()``/``kanban_agent()`` above are both *blocking*: one call crosses the
+# runner boundary and the script waits for a single structured result (kanban's
+# durable await, #5, hides a long wait behind that same one-call shape). This
+# section adds the complementary *non-blocking* lifecycle a script uses to fan
+# out long-running background work without holding an await open: start once,
+# keep orchestrating, poll many times. See ``vm.py``'s ``agent_start`` /
+# ``agent_check`` / ``agent_cancel`` / ``agent_list`` broker handlers and
+# ``vm_guest.py``'s globals of the same names for the RPC surface this seam
+# feeds; DESIGN.md documents the durable-suspend boundary this slice leaves for
+# a follow-up (the #5 Kanban await machinery this generalizes suspends the run
+# on an *unresolved* handle at script end -- this seam does not, yet).
+
+ASYNC_AGENT_STATES: frozenset[str] = frozenset({"pending", "done", "cancelled", "failed"})
+AsyncAgentState = str  # one of ASYNC_AGENT_STATES; kept as a plain str for JSON-safety.
+
+
+@dataclass(frozen=True)
+class AsyncChildAgentRequest:
+    """Host-facing request describing one background async child-agent run.
+
+    Mirrors :class:`ChildAgentRequest`'s role for the blocking ``agent()``
+    global, but for the async lifecycle: ``target`` names the agent/prompt to
+    run (its interpretation -- a known agent id vs. free-text prompt -- is
+    host-defined, exactly like ``agent()``'s own ``target``), ``input`` is the
+    structured payload, and ``opts`` is an open, host-defined options bag
+    (forwarded verbatim; unlike ``ChildAgentRequest`` this slice does not
+    validate it against a fixed key allowlist -- see DESIGN.md).
+    """
+
+    target: str
+    input: dict[str, Any] = field(default_factory=dict)
+    opts: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the runner contract as a plain JSON-friendly dict."""
+        return {
+            "target": self.target,
+            "input": copy.deepcopy(self.input),
+            "opts": copy.deepcopy(self.opts),
+        }
+
+
+@runtime_checkable
+class AsyncChildAgentRunner(Protocol):
+    """Protocol for a host-owned background child-agent lifecycle (issue #112).
+
+    Unlike :class:`ChildAgentRunner` (blocking: one call, one result) this
+    models a remote run the parent broker starts once and polls many times:
+
+    * ``start(request)`` begins the run and returns an opaque, JSON-safe
+      ``token`` the broker persists alongside the script-visible handle. Must
+      not block on completion.
+    * ``poll(token)`` returns the run's current status without blocking:
+      ``{"state": "pending"}``, ``{"state": "done", "result": {...}}``, or
+      ``{"state": "failed", "error": {...}}``. ``result``/``error`` follow the
+      same metadata-only error contract as every other brokered call.
+    * ``cancel(token)`` requests cancellation and returns the resulting status
+      in the same shape as ``poll`` (typically ``{"state": "cancelled"}``);
+      idempotent when the token is already terminal.
+    """
+
+    def start(self, request: AsyncChildAgentRequest) -> Any:
+        """Begin one background run for ``request``; return an opaque token."""
+        ...
+
+    def poll(self, token: Any) -> dict[str, Any]:
+        """Return ``token``'s current status without blocking."""
+        ...
+
+    def cancel(self, token: Any) -> dict[str, Any]:
+        """Request cancellation of ``token``; return its resulting status."""
+        ...
+
+
+class StubAsyncAgentRunner:
+    """Deterministic, network-free default :class:`AsyncChildAgentRunner`.
+
+    Completes after a fixed number of ``poll()`` calls derived only from a
+    stable hash of the request (never wall-clock/randomness), so the same
+    ``(target, input, opts)`` always takes the same number of polls to
+    resolve and every test using it is reproducible. ``cancel()`` is terminal
+    and idempotent; a cancelled token stays cancelled even if polled again.
+    """
+
+    def __init__(self) -> None:
+        self._requests: dict[str, AsyncChildAgentRequest] = {}
+        self._poll_counts: dict[str, int] = {}
+        self._cancelled: set[str] = set()
+
+    def start(self, request: AsyncChildAgentRequest) -> Any:
+        token = self._digest(request)
+        self._requests[token] = request
+        self._poll_counts.setdefault(token, 0)
+        return token
+
+    def poll(self, token: Any) -> dict[str, Any]:
+        key = str(token)
+        if key in self._cancelled:
+            return {"state": "cancelled"}
+        request = self._requests.get(key)
+        if request is None:
+            return {
+                "state": "failed",
+                "error": {"type": "UnknownAsyncToken", "message": f"unknown async token {key!r}"},
+            }
+        self._poll_counts[key] = self._poll_counts.get(key, 0) + 1
+        if self._poll_counts[key] < self._required_polls(request):
+            return {"state": "pending"}
+        return {
+            "state": "done",
+            "result": {"echo": dict(request.input), "target": request.target, "digest": key},
+        }
+
+    def cancel(self, token: Any) -> dict[str, Any]:
+        key = str(token)
+        self._cancelled.add(key)
+        return {"state": "cancelled"}
+
+    @staticmethod
+    def _required_polls(request: AsyncChildAgentRequest) -> int:
+        """Deterministic 1..4 poll count derived from the request's own hash."""
+        digest = StubAsyncAgentRunner._digest(request)
+        return 1 + (int(digest[:8], 16) % 4)
+
+    @staticmethod
+    def _digest(request: AsyncChildAgentRequest) -> str:
+        import json
+
+        payload = json.dumps(
+            {"target": request.target, "input": request.input, "opts": request.opts},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
