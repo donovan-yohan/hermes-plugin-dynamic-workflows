@@ -410,21 +410,37 @@ WORKFLOW_CONTROL_SCHEMA = {
     "description": (
         "Operator controls and status for dynamic workflow runs. action=overview "
         "lists active/recent runs and blocked waits; action=status returns one "
-        "run's compact control state, current phase, waits, child task refs, "
-        "links, and the run-level enforcement decisions (may new work start / may "
-        "the run continue) an adapter would consult; pause/resume/stop/task_stop/"
-        "retry record an append-only control intent (the audit trail is never "
-        "deleted). Retry is idempotent per target_ref with explicit replacement "
-        "lineage. The workflow runtime and script broker enforce these decisions "
-        "at child dispatch boundaries; backend adapters still own any external "
-        "process kill/replay mechanics."
+        "run's compact control state, current phase, waits (including a pending "
+        "approval-gated capability call's method/name/redacted params summary/"
+        "call id), child task refs, links, and the run-level enforcement "
+        "decisions (may new work start / may the run continue) an adapter would "
+        "consult; pause/resume/stop/task_stop/retry record an append-only "
+        "control intent (the audit trail is never deleted). Retry is idempotent "
+        "per target_ref with explicit replacement lineage. decide_call resolves "
+        "one pending approval-gated call named by target_ref (the call id from "
+        "status' waits): decision=approve runs it as-is, decision=edit runs it "
+        "with the operator-supplied input (authoritative for the replay "
+        "fingerprint/journal), decision=reject denies it deterministically "
+        "(catchable, non-retryable), decision=respond returns the "
+        "operator-supplied value without running it. The workflow runtime and "
+        "script broker enforce these decisions at child dispatch boundaries; "
+        "backend adapters still own any external process kill/replay mechanics."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["overview", "status", "pause", "resume", "stop", "task_stop", "retry"],
+                "enum": [
+                    "overview",
+                    "status",
+                    "pause",
+                    "resume",
+                    "stop",
+                    "task_stop",
+                    "retry",
+                    "decide_call",
+                ],
                 "description": "Operator operation to perform.",
             },
             "run_id": {
@@ -434,7 +450,7 @@ WORKFLOW_CONTROL_SCHEMA = {
             },
             "target_ref": {
                 "type": ["string", "null"],
-                "description": "Child call/task id for task_stop and retry.",
+                "description": "Child call/task id for task_stop, retry, and decide_call.",
                 "default": None,
             },
             "replacement_ref": {
@@ -447,6 +463,29 @@ WORKFLOW_CONTROL_SCHEMA = {
                 "description": "Force a new retry attempt instead of returning the existing one.",
                 "default": False,
             },
+            "decision": {
+                "type": ["string", "null"],
+                "enum": ["approve", "edit", "reject", "respond", None],
+                "description": "Decision kind for action=decide_call.",
+                "default": None,
+            },
+            "input": {
+                "type": ["object", "null"],
+                "description": "Operator-modified capability arguments for decision=edit.",
+                "default": None,
+            },
+            "value": {
+                "description": "Operator-supplied result for decision=respond.",
+                "oneOf": [
+                    {"type": "object"},
+                    {"type": "array"},
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                ],
+                "default": None,
+            },
             "actor": {
                 "type": ["string", "null"],
                 "description": "Who is issuing the control (recorded for audit).",
@@ -454,7 +493,7 @@ WORKFLOW_CONTROL_SCHEMA = {
             },
             "reason": {
                 "type": ["string", "null"],
-                "description": "Why the control is being issued (recorded for audit).",
+                "description": "Why the control is being issued (recorded for audit); the denial message for decision=reject.",
                 "default": None,
             },
             "limit": {
@@ -513,6 +552,50 @@ def _kanban_waits(script_store: Optional[ScriptRunStore], *, run_id: Optional[st
     except Exception:  # pragma: no cover - defensive; durable read is best-effort
         return []
     return _controls.waits_from_kanban_states(states, run_id=run_id or "")
+
+
+def _approval_waits(script_store: Optional[ScriptRunStore], *, run_id: Optional[str] = None) -> list:
+    """Pending approval-gated capability calls (issue #111), as :class:`WaitSummary` rows.
+
+    Mirrors :func:`_kanban_waits`: for one ``run_id`` it inspects that run's own
+    metadata; without one it scans every durably suspended run.
+    """
+    if script_store is None:
+        return []
+    try:
+        if run_id:
+            if not _is_safe_segment(run_id):
+                return []
+            records = [script_store.load_run(run_id)]
+        else:
+            records = script_store.suspended_runs()
+    except Exception:  # pragma: no cover - defensive; durable read is best-effort
+        return []
+    waits: list = []
+    for record in records:
+        waits.extend(_controls.waits_from_suspended_run(record))
+    return waits
+
+
+def _decide_call(control_store: FileControlStore, run_id: str, params: dict[str, Any]):
+    """Wire ``action=decide_call`` to :func:`hermes_workflows.controls.decide_call`.
+
+    ``target_ref`` doubles as the pending call id (the same field task_stop/retry
+    already use for a child call/task id). ``value``/``input`` forwarding is
+    keyed off the *decision kind*, not a non-null check: a ``respond`` decision
+    forwards ``value`` whenever the key is present — including a literal JSON
+    ``null``, which is a legitimate operator-supplied result
+    (``controls.decide_call(..., value=None)`` supports it directly) — and an
+    ``edit`` decision likewise forwards a present ``input``.
+    """
+    call_id = params.get("target_ref") or ""
+    decision = params.get("decision")
+    kwargs: dict[str, Any] = {"actor": params.get("actor"), "reason": params.get("reason")}
+    if decision == "edit" and "input" in params:
+        kwargs["input"] = params.get("input")
+    if decision == "respond" and "value" in params:
+        kwargs["value"] = params.get("value")
+    return _controls.decide_call(control_store, run_id, call_id, decision, **kwargs)
 
 
 def _loop_waits(*, run_id: Optional[str] = None) -> list:
@@ -608,7 +691,11 @@ def _inspect_script_run(
     progress_events = script_store.journal(run_id, limit=200)
     waits = [
         w
-        for w in _kanban_waits(script_store, run_id=run_id) + _loop_waits(run_id=run_id)
+        for w in (
+            _kanban_waits(script_store, run_id=run_id)
+            + _loop_waits(run_id=run_id)
+            + _approval_waits(script_store, run_id=run_id)
+        )
         if w.run_id == run_id
     ]
     return _controls.inspect_run(
@@ -723,7 +810,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
         if action == "overview":
             run_store = _plugin_store(session_id=session_id)
             script_store = _plugin_script_store(session_id=session_id)
-            waits = _kanban_waits(script_store) + _loop_waits()
+            waits = _kanban_waits(script_store) + _loop_waits() + _approval_waits(script_store)
             limit = params.get("limit", 20)
             records = [*run_store.list(), *_plugin_background_store(session_id=session_id).list()]
             overview = _controls.list_runs(
@@ -826,6 +913,7 @@ def _handle_control(params: dict[str, Any], **kwargs: Any) -> str:
                 actor=params.get("actor"),
                 reason=params.get("reason"),
             ),
+            "decide_call": lambda: _decide_call(control_store, run_id, params),
         }
         if action not in verbs:
             raise ControlError(f"unknown workflow_control action: {action!r}")
